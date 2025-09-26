@@ -1,3 +1,30 @@
+//! # Plexify - Media Transcoding CLI
+//!
+//! A simple, distributed media transcoding CLI tool that converts .webm and .mkv files 
+//! to .mp4 format with subtitle support, optimized for Plex media servers.
+//!
+//! ## Features
+//!
+//! - **Distributed Processing**: Queue-based system allows multiple workers to process jobs concurrently
+//! - **Subtitle Support**: Handles external .vtt subtitles for .webm files and embedded subtitles for .mkv files
+//! - **Background Processing**: Run workers in low-priority background mode
+//! - **Configurable**: Customizable FFmpeg settings via environment variables
+//! - **Atomic Job Processing**: Race condition-free job claiming for multiple workers
+//! - **Signal Handling**: Graceful shutdown on SIGINT/SIGTERM
+//!
+//! ## Usage
+//!
+//! ```bash
+//! # Scan a directory for media files
+//! plexify scan /path/to/media
+//!
+//! # Process jobs from the queue
+//! plexify work /path/to/media
+//!
+//! # Clean up temporary files
+//! plexify clean /path/to/media
+//! ```
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -13,17 +40,20 @@ mod ffmpeg;
 
 use commands::{scan::ScanCommand, work::WorkCommand, clean::CleanCommand};
 
+/// Plexify - A simple, distributed media transcoding CLI
 #[derive(Parser)]
 #[command(
     name = "plexify",
     about = "A simple, distributed media transcoding CLI tool",
-    long_about = "Converts .webm and .mkv files to .mp4 format with subtitle support, optimized for Plex media servers."
+    long_about = "Converts .webm and .mkv files to .mp4 format with subtitle support, optimized for Plex media servers.",
+    version
 )]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
 }
 
+/// Available commands
 #[derive(Subcommand)]
 enum Commands {
     /// Scan a directory for media files and create transcoding jobs

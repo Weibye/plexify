@@ -2,6 +2,8 @@
 
 A simple, distributed media transcoding CLI tool that converts .webm and .mkv files to .mp4 format with subtitle support, optimized for Plex media servers.
 
+**⚠️ This project has been rewritten in Rust!** The new implementation provides the same functionality with improved performance, better error handling, and enhanced cross-platform compatibility.
+
 ## Features
 
 - **Distributed Processing**: Queue-based system allows multiple workers to process jobs concurrently
@@ -10,12 +12,13 @@ A simple, distributed media transcoding CLI tool that converts .webm and .mkv fi
 - **Configurable**: Customizable FFmpeg settings via environment variables
 - **Atomic Job Processing**: Race condition-free job claiming for multiple workers
 - **Signal Handling**: Graceful shutdown on SIGINT/SIGTERM
+- **Cross-Platform**: Works on Linux, macOS, and Windows
+- **Modern Architecture**: Built with Rust for safety, performance, and maintainability
 
 ## Requirements
 
 - **FFmpeg**: Required for media transcoding
-- **Bash**: Version 4.0+ (for array support)
-- **Standard Unix utilities**: `nice`, `ionice` (optional, for background processing)
+- **Rust**: Version 1.70+ (for compilation) - pre-built binaries available
 
 ### Installing FFmpeg
 
@@ -30,6 +33,11 @@ sudo apt install ffmpeg
 brew install ffmpeg
 ```
 
+**Windows:**
+```bash
+winget install ffmpeg
+```
+
 **CentOS/RHEL:**
 ```bash
 sudo yum install epel-release
@@ -38,21 +46,29 @@ sudo yum install ffmpeg
 
 ## Installation
 
+### Option 1: From Source
+
 1. Clone the repository:
 ```bash
 git clone https://github.com/Weibye/plexify.git
 cd plexify
 ```
 
-2. Make the script executable:
+2. Build with Cargo:
 ```bash
-chmod +x plexify.sh
+cargo build --release
 ```
 
-3. Optionally, add to your PATH:
+3. The binary will be available at `./target/release/plexify`
+
+4. Optionally, install to system PATH:
 ```bash
-sudo ln -s $(pwd)/plexify.sh /usr/local/bin/plexify
+cargo install --path .
 ```
+
+### Option 2: Pre-built Binaries (Coming Soon)
+
+Pre-built binaries for Linux, macOS, and Windows will be available in the GitHub releases.
 
 ## Usage
 
@@ -60,39 +76,39 @@ sudo ln -s $(pwd)/plexify.sh /usr/local/bin/plexify
 
 ```bash
 # Scan a directory for media files and create transcoding jobs
-./plexify.sh scan /path/to/media
+plexify scan /path/to/media
 
 # Process jobs from the queue (foreground)
-./plexify.sh work /path/to/media
+plexify work /path/to/media
 
 # Process jobs in background with low priority
-./plexify.sh work /path/to/media --background
+plexify work /path/to/media --background
 
 # Clean up temporary files
-./plexify.sh clean /path/to/media
+plexify clean /path/to/media
 ```
 
 ### Typical Workflow
 
 1. **Scan**: Create jobs for all .webm and .mkv files in your media directory
 ```bash
-./plexify.sh scan /home/user/Videos
+plexify scan /home/user/Videos
 ```
 
 2. **Work**: Start processing the queue (you can run multiple workers)
 ```bash
 # Terminal 1 - High priority worker
-./plexify.sh work /home/user/Videos
+plexify work /home/user/Videos
 
 # Terminal 2 - Background worker
-./plexify.sh work /home/user/Videos --background
+plexify work /home/user/Videos --background
 ```
 
-3. **Monitor**: Check the `_worker.log` file for background worker progress
+3. **Monitor**: Check logs for progress (logs output to stdout)
 
 4. **Clean**: Remove temporary files when done
 ```bash
-./plexify.sh clean /home/user/Videos
+plexify clean /home/user/Videos
 ```
 
 ## Configuration
@@ -109,7 +125,7 @@ export SLEEP_INTERVAL="60"          # Sleep between job checks in seconds (defau
 
 ### Example with custom settings:
 ```bash
-FFMPEG_PRESET="medium" FFMPEG_CRF="20" ./plexify.sh work /path/to/media
+FFMPEG_PRESET="medium" FFMPEG_CRF="20" plexify work /path/to/media
 ```
 
 ## File Processing
@@ -135,8 +151,7 @@ Plexify creates temporary directories in your media root:
 ├── video2.mkv
 ├── _queue/           # Pending jobs
 ├── _in_progress/     # Currently processing
-├── _completed/       # Finished jobs
-└── _worker.log       # Background worker log
+└── _completed/       # Finished jobs
 ```
 
 ## FFmpeg Processing Details
@@ -169,13 +184,13 @@ Multiple workers can safely process the same queue:
 
 ```bash
 # Worker 1 (high priority)
-./plexify.sh work /media/videos
+plexify work /media/videos
 
 # Worker 2 (background, low priority)
-./plexify.sh work /media/videos --background
+plexify work /media/videos --background
 
 # Worker 3 (on another machine with shared storage)
-./plexify.sh work /shared/media/videos
+plexify work /shared/media/videos
 ```
 
 Each worker atomically claims jobs to prevent conflicts.
@@ -186,6 +201,48 @@ Workers handle `SIGINT` (Ctrl+C) and `SIGTERM` gracefully:
 - Completes current job before shutting down
 - Returns job to queue if interrupted mid-processing
 - Immediate shutdown if no job is currently running
+
+## Logging
+
+The Rust version uses structured logging. Control log levels with the `RUST_LOG` environment variable:
+
+```bash
+# Default: info level
+plexify work /path/to/media
+
+# Debug level for troubleshooting
+RUST_LOG=debug plexify work /path/to/media
+
+# Only warnings and errors
+RUST_LOG=warn plexify work /path/to/media
+```
+
+## Development
+
+### Building from Source
+
+```bash
+git clone https://github.com/Weibye/plexify.git
+cd plexify
+cargo build
+```
+
+### Running Tests
+
+```bash
+cargo test
+```
+
+### Code Structure
+
+The project is organized into modules:
+
+- `commands/` - CLI command implementations (scan, work, clean)
+- `config/` - Configuration management
+- `job/` - Job definitions and processing logic
+- `queue/` - Job queue management with atomic operations
+- `ffmpeg/` - FFmpeg integration
+- `worker/` - Worker coordination (extensible for future features)
 
 ## Troubleshooting
 
@@ -198,20 +255,34 @@ Workers handle `SIGINT` (Ctrl+C) and `SIGTERM` gracefully:
 2. **FFmpeg errors**:
    - Verify FFmpeg is installed and in PATH
    - Check file permissions and disk space
+   - Enable debug logging: `RUST_LOG=debug plexify work /path`
 
 3. **Permission errors**:
    - Ensure write permissions to media directory
    - Check that temporary directories can be created
 
-4. **Background worker not starting**:
-   - Check `_worker.log` for error messages
-   - Verify `nohup` is available
-
 ### Debug Mode
 
-Enable debug output by modifying the script:
+Enable debug output:
 ```bash
-# Uncomment this line at the top of plexify.sh
-set -euo pipefail
+RUST_LOG=debug plexify scan /path/to/media
 ```
+
+## Migration from Bash Version
+
+The Rust version maintains full compatibility with the bash version:
+
+- Same command-line interface
+- Same directory structure
+- Same configuration via environment variables
+- Jobs created by either version can be processed by the other
+
+You can seamlessly migrate by:
+1. Install the Rust version
+2. Replace `./plexify.sh` calls with `plexify`
+3. Optionally remove the old `plexify.sh` file
+
+## Legacy Bash Version
+
+The original bash implementation (`plexify.sh`) is still available in this repository for reference, but the Rust version is recommended for new deployments.
 
