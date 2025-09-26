@@ -215,18 +215,3 @@ Enable debug output by modifying the script:
 set -euo pipefail
 ```
 
-## License
-
-This project is open source. Please check the repository for license details.
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Test thoroughly
-5. Submit a pull request
-
-## Support
-
-For issues and questions, please use the GitHub issue tracker.
