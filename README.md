@@ -233,6 +233,27 @@ cargo build
 cargo test
 ```
 
+### Code Quality
+
+The project includes comprehensive CI/CD with:
+
+- **Build & Test**: Automated testing on every PR and push to main
+- **Code Formatting**: Enforced via `cargo fmt` 
+- **Linting**: Code quality checks via `cargo clippy`
+- **Security Audit**: Dependency vulnerability scanning via `cargo audit`
+
+To run quality checks locally:
+```bash
+# Format code
+cargo fmt
+
+# Run linter 
+cargo clippy --all-targets --all-features
+
+# Check formatting
+cargo fmt --all -- --check
+```
+
 ### Code Structure
 
 The project is organized into modules:
