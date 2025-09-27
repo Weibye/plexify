@@ -2,8 +2,6 @@
 
 A simple, distributed media transcoding CLI tool that converts .webm and .mkv files to .mp4 format with subtitle support, optimized for Plex media servers.
 
-**⚠️ This project has been rewritten in Rust!** The new implementation provides the same functionality with improved performance, better error handling, and enhanced cross-platform compatibility.
-
 ## Features
 
 - **Distributed Processing**: Queue-based system allows multiple workers to process jobs concurrently
@@ -267,22 +265,4 @@ Enable debug output:
 ```bash
 RUST_LOG=debug plexify scan /path/to/media
 ```
-
-## Migration from Bash Version
-
-The Rust version maintains full compatibility with the bash version:
-
-- Same command-line interface
-- Same directory structure
-- Same configuration via environment variables
-- Jobs created by either version can be processed by the other
-
-You can seamlessly migrate by:
-1. Install the Rust version
-2. Replace `./plexify.sh` calls with `plexify`
-3. Optionally remove the old `plexify.sh` file
-
-## Legacy Bash Version
-
-The original bash implementation (`plexify.sh`) is still available in this repository for reference, but the Rust version is recommended for new deployments.
 
