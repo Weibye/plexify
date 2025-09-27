@@ -1,8 +1,8 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::path::Path;
 use std::process::Stdio;
 use tokio::process::Command;
-use tracing::{info, error, debug};
+use tracing::{debug, error, info};
 
 use crate::config::Config;
 use crate::job::{Job, MediaFileType};
@@ -38,17 +38,14 @@ impl FFmpegProcessor {
         };
 
         // Add common FFmpeg flags
-        cmd.args([
-            "-fflags", "+genpts",
-            "-avoid_negative_ts", "make_zero",
-        ]);
+        cmd.args(["-fflags", "+genpts", "-avoid_negative_ts", "make_zero"]);
 
         // Add format-specific flags and inputs
         match job.file_type {
             MediaFileType::WebM => {
                 if let Some(subtitle_path) = job.subtitle_path() {
                     let vtt_path = media_root.join(subtitle_path);
-                    
+
                     // Check if subtitle file exists
                     if !vtt_path.exists() {
                         return Err(anyhow!("Required subtitle file not found: {:?}", vtt_path));
@@ -70,12 +67,18 @@ impl FFmpegProcessor {
 
         // Add encoding settings
         cmd.args([
-            "-c:v", "libx264",
-            "-preset", &self.config.ffmpeg_preset,
-            "-crf", &self.config.ffmpeg_crf,
-            "-c:a", "aac",
-            "-b:a", &self.config.ffmpeg_audio_bitrate,
-            "-c:s", "mov_text",
+            "-c:v",
+            "libx264",
+            "-preset",
+            &self.config.ffmpeg_preset,
+            "-crf",
+            &self.config.ffmpeg_crf,
+            "-c:a",
+            "aac",
+            "-b:a",
+            &self.config.ffmpeg_audio_bitrate,
+            "-c:s",
+            "mov_text",
             "-y", // Overwrite output files
         ]);
 
@@ -96,20 +99,31 @@ impl FFmpegProcessor {
             return Err(anyhow!("FFmpeg conversion failed: {}", stderr));
         }
 
-        info!("✅ Conversion successful: {:?} -> {:?}", input_path, output_path);
+        info!(
+            "✅ Conversion successful: {:?} -> {:?}",
+            input_path, output_path
+        );
         Ok(())
     }
 
     /// Rename original files to .disabled after successful conversion
     pub async fn disable_source_files(&self, job: &Job, media_root: &Path) -> Result<()> {
         let input_path = media_root.join(&job.relative_path);
-        let disabled_input = input_path.with_extension(
-            format!("{}.disabled", input_path.extension().unwrap_or_default().to_str().unwrap_or(""))
-        );
+        let disabled_input = input_path.with_extension(format!(
+            "{}.disabled",
+            input_path
+                .extension()
+                .unwrap_or_default()
+                .to_str()
+                .unwrap_or("")
+        ));
 
         // Rename input file
         tokio::fs::rename(&input_path, &disabled_input).await?;
-        debug!("Renamed input file: {:?} -> {:?}", input_path, disabled_input);
+        debug!(
+            "Renamed input file: {:?} -> {:?}",
+            input_path, disabled_input
+        );
 
         // Rename subtitle file if it exists (WebM)
         if let Some(subtitle_path) = job.subtitle_path() {
@@ -117,7 +131,10 @@ impl FFmpegProcessor {
             if vtt_path.exists() {
                 let disabled_vtt = vtt_path.with_extension("vtt.disabled");
                 tokio::fs::rename(&vtt_path, &disabled_vtt).await?;
-                debug!("Renamed subtitle file: {:?} -> {:?}", vtt_path, disabled_vtt);
+                debug!(
+                    "Renamed subtitle file: {:?} -> {:?}",
+                    vtt_path, disabled_vtt
+                );
             }
         }
 
@@ -128,8 +145,8 @@ impl FFmpegProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use crate::job::{Job, MediaFileType};
+    use tempfile::TempDir;
 
     #[tokio::test]
     async fn test_ffmpeg_processor_creation() {

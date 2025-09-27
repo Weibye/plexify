@@ -1,8 +1,8 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::signal;
-use tracing::{info, warn, error, debug};
+use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::ffmpeg::FFmpegProcessor;
@@ -25,7 +25,10 @@ impl WorkCommand {
 
     pub async fn execute(&self) -> Result<()> {
         if !self.media_root.exists() {
-            return Err(anyhow!("Media directory does not exist: {:?}", self.media_root));
+            return Err(anyhow!(
+                "Media directory does not exist: {:?}",
+                self.media_root
+            ));
         }
 
         if !self.media_root.is_dir() {
@@ -59,7 +62,7 @@ impl WorkCommand {
                     info!("🛑 Shutdown signal received. Exiting gracefully.");
                     break;
                 }
-                
+
                 // Try to claim and process a job
                 job_result = self.process_next_job(&queue, &processor) => {
                     match job_result {
@@ -100,7 +103,10 @@ impl WorkCommand {
                 Some("webm") => MediaFileType::WebM,
                 Some("mkv") => MediaFileType::MKV,
                 _ => {
-                    error!("❌ Unknown file extension for job: {:?}", claimed_job.relative_path);
+                    error!(
+                        "❌ Unknown file extension for job: {:?}",
+                        claimed_job.relative_path
+                    );
                     claimed_job.return_to_queue().await?;
                     return Ok(true); // We processed something (even if it failed)
                 }
@@ -125,7 +131,7 @@ impl WorkCommand {
                 Err(e) => {
                     error!("❌ Conversion FAILED: {}", e);
                     claimed_job.return_to_queue().await?;
-                    
+
                     // Sleep a bit to avoid rapid retries of problematic jobs
                     tokio::time::sleep(Duration::from_secs(10)).await;
                 }
@@ -147,7 +153,7 @@ mod tests {
     async fn test_work_command_creation() {
         let temp_dir = TempDir::new().unwrap();
         let work_cmd = WorkCommand::new(temp_dir.path().to_path_buf(), false);
-        
+
         assert_eq!(work_cmd.media_root, temp_dir.path());
         assert!(!work_cmd.background_mode);
     }
@@ -155,7 +161,7 @@ mod tests {
     #[tokio::test]
     async fn test_work_nonexistent_directory() {
         let work_cmd = WorkCommand::new(PathBuf::from("/nonexistent/path"), false);
-        
+
         let result = work_cmd.execute().await;
         assert!(result.is_err());
     }

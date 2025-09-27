@@ -1,5 +1,7 @@
 # Plexify
 
+[![CI](https://github.com/Weibye/plexify/workflows/CI/badge.svg)](https://github.com/Weibye/plexify/actions/workflows/ci.yml)
+
 A simple, distributed media transcoding CLI tool that converts .webm and .mkv files to .mp4 format with subtitle support, optimized for Plex media servers.
 
 ## Features
@@ -229,6 +231,27 @@ cargo build
 
 ```bash
 cargo test
+```
+
+### Code Quality
+
+The project includes comprehensive CI/CD with:
+
+- **Build & Test**: Automated testing on every PR and push to main
+- **Code Formatting**: Enforced via `cargo fmt` 
+- **Linting**: Code quality checks via `cargo clippy`
+- **Security Audit**: Dependency vulnerability scanning via `cargo audit`
+
+To run quality checks locally:
+```bash
+# Format code
+cargo fmt
+
+# Run linter 
+cargo clippy --all-targets --all-features
+
+# Check formatting
+cargo fmt --all -- --check
 ```
 
 ### Code Structure

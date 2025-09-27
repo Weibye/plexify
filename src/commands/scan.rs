@@ -1,6 +1,6 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::path::PathBuf;
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
 use crate::job::{Job, MediaFileType};
@@ -18,7 +18,10 @@ impl ScanCommand {
 
     pub async fn execute(&self) -> Result<()> {
         if !self.media_root.exists() {
-            return Err(anyhow!("Media directory does not exist: {:?}", self.media_root));
+            return Err(anyhow!(
+                "Media directory does not exist: {:?}",
+                self.media_root
+            ));
         }
 
         if !self.media_root.is_dir() {
@@ -60,8 +63,11 @@ impl ScanCommand {
             }
         }
 
-        info!("Found {} .webm files and {} .mkv files. Now creating jobs...", 
-              webm_files.len(), mkv_files.len());
+        info!(
+            "Found {} .webm files and {} .mkv files. Now creating jobs...",
+            webm_files.len(),
+            mkv_files.len()
+        );
 
         let mut job_count = 0;
 
@@ -111,11 +117,17 @@ impl ScanCommand {
 
             // Create the job
             queue.enqueue_job(&job).await?;
-            info!("➕ Queueing job for: {:?} (embedded subs assumed)", mkv_path);
+            info!(
+                "➕ Queueing job for: {:?} (embedded subs assumed)",
+                mkv_path
+            );
             job_count += 1;
         }
 
-        info!("✅ Scan complete. Added {} new jobs to the queue.", job_count);
+        info!(
+            "✅ Scan complete. Added {} new jobs to the queue.",
+            job_count
+        );
         Ok(())
     }
 }
@@ -130,7 +142,7 @@ mod tests {
     async fn test_scan_empty_directory() {
         let temp_dir = TempDir::new().unwrap();
         let scan_cmd = ScanCommand::new(temp_dir.path().to_path_buf());
-        
+
         let result = scan_cmd.execute().await;
         assert!(result.is_ok());
     }
@@ -138,7 +150,7 @@ mod tests {
     #[tokio::test]
     async fn test_scan_nonexistent_directory() {
         let scan_cmd = ScanCommand::new(PathBuf::from("/nonexistent/path"));
-        
+
         let result = scan_cmd.execute().await;
         assert!(result.is_err());
     }

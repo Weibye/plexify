@@ -15,7 +15,8 @@ impl Config {
         Self {
             ffmpeg_preset: env::var("FFMPEG_PRESET").unwrap_or_else(|_| "veryfast".to_string()),
             ffmpeg_crf: env::var("FFMPEG_CRF").unwrap_or_else(|_| "23".to_string()),
-            ffmpeg_audio_bitrate: env::var("FFMPEG_AUDIO_BITRATE").unwrap_or_else(|_| "128k".to_string()),
+            ffmpeg_audio_bitrate: env::var("FFMPEG_AUDIO_BITRATE")
+                .unwrap_or_else(|_| "128k".to_string()),
             sleep_interval: env::var("SLEEP_INTERVAL")
                 .unwrap_or_else(|_| "60".to_string())
                 .parse()

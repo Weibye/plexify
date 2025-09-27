@@ -1,6 +1,6 @@
 //! # Plexify - Media Transcoding CLI
 //!
-//! A simple, distributed media transcoding CLI tool that converts .webm and .mkv files 
+//! A simple, distributed media transcoding CLI tool that converts .webm and .mkv files
 //! to .mp4 format with subtitle support, optimized for Plex media servers.
 //!
 //! ## Features
@@ -28,17 +28,17 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use tracing::{info, error};
+use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod commands;
 mod config;
+mod ffmpeg;
 mod job;
 mod queue;
 mod worker;
-mod ffmpeg;
 
-use commands::{scan::ScanCommand, work::WorkCommand, clean::CleanCommand};
+use commands::{clean::CleanCommand, scan::ScanCommand, work::WorkCommand};
 
 /// Plexify - A simple, distributed media transcoding CLI
 #[derive(Parser)]
@@ -95,7 +95,10 @@ async fn main() -> Result<()> {
             ScanCommand::new(path).execute().await
         }
         Commands::Work { path, background } => {
-            info!("Starting work command for path: {:?}, background: {}", path, background);
+            info!(
+                "Starting work command for path: {:?}, background: {}",
+                path, background
+            );
             WorkCommand::new(path, background).execute().await
         }
         Commands::Clean { path } => {
