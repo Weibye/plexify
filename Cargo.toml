@@ -1,0 +1,31 @@
+[package]
+name = "plexify"
+version = "0.1.0"
+edition = "2021"
+description = "A simple, distributed media transcoding CLI tool"
+license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/Weibye/plexify"
+repository = "https://github.com/Weibye/plexify"
+keywords = ["media", "transcoding", "ffmpeg", "cli", "plex"]
+categories = ["command-line-utilities", "multimedia"]
+
+[dependencies]
+clap = { version = "4.4", features = ["derive", "env"] }
+tokio = { version = "1.0", features = ["full"] }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+walkdir = "2.4"
+uuid = { version = "1.6", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.8"
+
+[profile.release]
+# Optimize for performance and small binary size
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
