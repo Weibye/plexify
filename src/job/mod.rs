@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -72,7 +72,9 @@ impl Job {
 
     /// Create a job filename based on the source file (for compatibility)
     pub fn job_filename_from_source(&self) -> String {
-        let stem = self.relative_path.file_stem()
+        let stem = self
+            .relative_path
+            .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");
         format!("{}.job", stem)

@@ -1,7 +1,7 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::path::PathBuf;
-use tracing::{debug, warn};
 use tokio::fs as async_fs;
+use tracing::{debug, warn};
 
 use crate::job::Job;
 
@@ -68,26 +68,27 @@ impl JobQueue {
     /// Atomically claim a job from the queue
     pub async fn claim_job(&self) -> Result<Option<ClaimedJob>> {
         let mut entries = async_fs::read_dir(&self.queue_dir).await?;
-        
+
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
             if let Some(extension) = path.extension() {
                 if extension == "job" {
-                    let job_name = path.file_name()
+                    let job_name = path
+                        .file_name()
                         .and_then(|n| n.to_str())
                         .ok_or_else(|| anyhow!("Invalid job filename"))?;
-                    
+
                     let in_progress_path = self.in_progress_dir.join(job_name);
-                    
+
                     // Atomically move job from queue to in_progress
                     match async_fs::rename(&path, &in_progress_path).await {
                         Ok(_) => {
                             debug!("Claimed job: {}", job_name);
-                            
+
                             // Read job content
                             let content = async_fs::read_to_string(&in_progress_path).await?;
                             let relative_path = PathBuf::from(content.trim());
-                            
+
                             return Ok(Some(ClaimedJob {
                                 queue: self,
                                 job_name: job_name.to_string(),
@@ -103,7 +104,7 @@ impl JobQueue {
                 }
             }
         }
-        
+
         Ok(None)
     }
 
@@ -132,7 +133,7 @@ impl JobQueue {
     pub async fn pending_count(&self) -> Result<usize> {
         let mut count = 0;
         let mut entries = async_fs::read_dir(&self.queue_dir).await?;
-        
+
         while let Some(entry) = entries.next_entry().await? {
             if let Some(extension) = entry.path().extension() {
                 if extension == "job" {
@@ -140,7 +141,7 @@ impl JobQueue {
                 }
             }
         }
-        
+
         Ok(count)
     }
 }
@@ -191,9 +192,9 @@ mod tests {
     async fn test_queue_initialization() {
         let temp_dir = TempDir::new().unwrap();
         let queue = JobQueue::new(temp_dir.path().to_path_buf());
-        
+
         queue.init().await.unwrap();
-        
+
         assert!(queue.queue_dir.exists());
         assert!(queue.in_progress_dir.exists());
         assert!(queue.completed_dir.exists());

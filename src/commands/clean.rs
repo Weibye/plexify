@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 use tracing::info;
 
@@ -16,7 +16,10 @@ impl CleanCommand {
 
     pub async fn execute(&self) -> Result<()> {
         if !self.media_root.exists() {
-            return Err(anyhow!("Media directory does not exist: {:?}", self.media_root));
+            return Err(anyhow!(
+                "Media directory does not exist: {:?}",
+                self.media_root
+            ));
         }
 
         if !self.media_root.is_dir() {
@@ -49,7 +52,7 @@ mod tests {
     async fn test_clean_empty_directory() {
         let temp_dir = TempDir::new().unwrap();
         let clean_cmd = CleanCommand::new(temp_dir.path().to_path_buf());
-        
+
         let result = clean_cmd.execute().await;
         assert!(result.is_ok());
     }
@@ -57,7 +60,7 @@ mod tests {
     #[tokio::test]
     async fn test_clean_nonexistent_directory() {
         let clean_cmd = CleanCommand::new(PathBuf::from("/nonexistent/path"));
-        
+
         let result = clean_cmd.execute().await;
         assert!(result.is_err());
     }
