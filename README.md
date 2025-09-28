@@ -76,6 +76,7 @@ Pre-built binaries for Linux, macOS, and Windows will be available in the GitHub
 
 ```bash
 # Scan a directory for media files and create transcoding jobs
+# Recursively scans all subdirectories for .webm and .mkv files
 plexify scan /path/to/media
 
 # Process jobs from the queue (foreground)
@@ -88,11 +89,41 @@ plexify work /path/to/media --background
 plexify clean /path/to/media
 ```
 
+### Hierarchical Directory Support
+
+Plexify automatically scans through your entire media directory hierarchy, finding media files in any subdirectory structure:
+
+```
+/media/
+├── Movies/
+│   ├── Action/
+│   │   └── movie1.mkv
+│   └── Comedy/
+│       └── movie2.webm
+│       └── movie2.vtt
+├── TV Shows/
+│   ├── Show1/
+│   │   ├── Season 1/
+│   │   │   └── episode1.webm
+│   │   │   └── episode1.vtt
+│   │   └── Season 2/
+│   │       └── episode2.mkv
+│   └── Show2/
+│       └── episode.mkv
+└── Documentaries/
+    └── doc1.mkv
+```
+
+Running `plexify scan /media` will find and queue jobs for **all** media files regardless of their depth in the directory structure.
+
 ### Typical Workflow
 
-1. **Scan**: Create jobs for all .webm and .mkv files in your media directory
+1. **Scan**: Create jobs for all .webm and .mkv files in your media directory and all subdirectories
 ```bash
 plexify scan /home/user/Videos
+# Output: 📁 Recursively scanning all subdirectories...
+#         📊 Scanned 15 directories and found 8 .webm files and 12 .mkv files
+#         ✅ Scan complete. Added 20 new jobs to the queue.
 ```
 
 2. **Work**: Start processing the queue (you can run multiple workers)
