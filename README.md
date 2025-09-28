@@ -79,6 +79,9 @@ Pre-built binaries for Linux, macOS, and Windows will be available in the GitHub
 # Recursively scans all subdirectories for .webm and .mkv files
 plexify scan /path/to/media
 
+# Scan with a quality preset for consistent encoding settings
+plexify scan --preset quality /path/to/media
+
 # Process jobs from the queue (foreground)
 plexify work /path/to/media
 
@@ -116,14 +119,43 @@ Plexify automatically scans through your entire media directory hierarchy, findi
 
 Running `plexify scan /media` will find and queue jobs for **all** media files regardless of their depth in the directory structure.
 
+### Quality Presets
+
+Plexify includes predefined quality presets for different use cases:
+
+- **`fast`** - Fast encoding with good quality (veryfast/23/128k) - Default behavior
+- **`balanced`** - Balanced encoding speed and quality (medium/20/192k) - Recommended
+- **`quality`** - High quality, slower encoding (slow/18/256k) - Best for archival
+- **`ultrafast`** - Ultra-fast encoding for quick previews (ultrafast/28/96k)
+- **`archive`** - Archive quality for long-term storage (veryslow/15/320k)
+
+Examples:
+```bash
+# Scan with balanced preset (recommended for most users)
+plexify scan --preset balanced /path/to/media
+
+# Scan with quality preset for best results
+plexify scan --preset quality /path/to/media
+
+# Scan with fast preset for quick transcoding
+plexify scan --preset fast /path/to/media
+```
+
+Environment variables can override preset values:
+```bash
+# Use quality preset but override CRF to 20
+FFMPEG_CRF=20 plexify scan --preset quality /path/to/media
+```
+
 ### Typical Workflow
 
-1. **Scan**: Create jobs for all .webm and .mkv files in your media directory and all subdirectories
+1. **Scan**: Create jobs for all .webm and .mkv files with your preferred quality preset
 ```bash
-plexify scan /home/user/Videos
-# Output: 📁 Recursively scanning all subdirectories...
-#         📊 Scanned 15 directories and found 8 .webm files and 12 .mkv files
-#         ✅ Scan complete. Added 20 new jobs to the queue.
+# Scan with balanced preset (recommended)
+plexify scan --preset balanced /home/user/Videos
+
+# Or scan with custom settings via environment variables
+FFMPEG_PRESET=medium plexify scan /home/user/Videos
 ```
 
 2. **Work**: Start processing the queue (you can run multiple workers)
@@ -144,9 +176,18 @@ plexify clean /home/user/Videos
 
 ## Configuration
 
-Configure FFmpeg settings and behavior using environment variables:
+Plexify offers two ways to configure encoding settings:
 
-### FFmpeg Settings
+### 1. Quality Presets (Recommended)
+Use predefined presets for consistent, tested settings:
+```bash
+plexify scan --preset balanced /path/to/media  # Recommended for most users
+plexify scan --preset quality /path/to/media   # Best quality
+plexify scan --preset fast /path/to/media      # Fastest encoding
+```
+
+### 2. Environment Variables
+Override individual settings or customize presets:
 ```bash
 export FFMPEG_PRESET="veryfast"     # FFmpeg preset (default: veryfast)
 export FFMPEG_CRF="23"              # Constant Rate Factor (default: 23)
@@ -154,9 +195,14 @@ export FFMPEG_AUDIO_BITRATE="128k"  # Audio bitrate (default: 128k)
 export SLEEP_INTERVAL="60"          # Sleep between job checks in seconds (default: 60)
 ```
 
-### Example with custom settings:
+### Combining Presets and Environment Variables
+Environment variables override preset values:
 ```bash
-FFMPEG_PRESET="medium" FFMPEG_CRF="20" plexify work /path/to/media
+# Use quality preset but with faster encoding preset
+FFMPEG_PRESET="medium" plexify scan --preset quality /path/to/media
+
+# Use balanced preset but with higher quality CRF
+FFMPEG_CRF="18" plexify scan --preset balanced /path/to/media
 ```
 
 ## File Processing
