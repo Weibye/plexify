@@ -44,6 +44,10 @@ src/
 4. **Performance**: Consider memory usage for large media file operations
 5. **Safety**: Use `PathBuf` for all file system operations
 
+### Pull Request Standards
+1. Any transient information, like feature x is now faster, feature y has changed, etc. belongs to the PR description and the changelog, and only those two placed. Code, documentation, and tests must be self-explanatory and not contain any transient information. They should be valid for the lifetime of the code and reflect the current state of the code.
+2. Pull requests should be short, succinct, and focused. No need to repeat unnecessary information.
+
 ### Media Processing Specifics
 
 1. **FFmpeg Integration**: 
