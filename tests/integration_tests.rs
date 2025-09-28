@@ -309,7 +309,7 @@ fn test_hierarchical_directory_scanning() {
         .args([
             "scan",
             temp_path.to_str().unwrap(),
-            "--queue-dir", 
+            "--queue-dir",
             temp_path.to_str().unwrap(),
         ])
         .output()
@@ -327,14 +327,16 @@ fn test_hierarchical_directory_scanning() {
         "Should mention recursive scanning, got: {scan_output_text}"
     );
 
-    // Verify that it found files in subdirectories  
+    // Verify that it found files in subdirectories
     assert!(
-        scan_output_text.contains("Action/action1.mkv") || scan_output_text.contains("Movies/Action/action1.mkv"),
+        scan_output_text.contains("Action/action1.mkv")
+            || scan_output_text.contains("Movies/Action/action1.mkv"),
         "Should find files in Movies/Action subdirectory, got: {scan_output_text}"
     );
 
     assert!(
-        scan_output_text.contains("Show1/Season 1/episode1.webm") || scan_output_text.contains("TV Shows/Show1/Season 1/episode1.webm"),
+        scan_output_text.contains("Show1/Season 1/episode1.webm")
+            || scan_output_text.contains("TV Shows/Show1/Season 1/episode1.webm"),
         "Should find files in nested TV show subdirectory, got: {scan_output_text}"
     );
 
@@ -350,9 +352,7 @@ fn test_hierarchical_directory_scanning() {
 
     let job_count = std::fs::read_dir(&queue_dir)
         .unwrap()
-        .filter(|entry| {
-            entry.as_ref().unwrap().path().extension() == Some("job".as_ref())
-        })
+        .filter(|entry| entry.as_ref().unwrap().path().extension() == Some("job".as_ref()))
         .count();
 
     assert_eq!(job_count, 5);

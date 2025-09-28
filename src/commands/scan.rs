@@ -49,7 +49,7 @@ impl ScanCommand {
             .filter_map(|e| e.ok())
         {
             let path = entry.path();
-            
+
             // Track directories being scanned for better user feedback
             if path.is_dir() && path != self.media_root {
                 if let Ok(relative_dir) = path.strip_prefix(&self.media_root) {
@@ -59,7 +59,7 @@ impl ScanCommand {
                     }
                 }
             }
-            
+
             if path.is_file() {
                 if let Some(extension) = path.extension() {
                     let ext_str = extension.to_string_lossy().to_lowercase();
@@ -86,12 +86,14 @@ impl ScanCommand {
             webm_files.len(),
             mkv_files.len()
         );
-        
+
         if !directories_scanned.is_empty() {
-            debug!("📋 Scanned subdirectories: {:?}", 
-                directories_scanned.iter().collect::<Vec<_>>());
+            debug!(
+                "📋 Scanned subdirectories: {:?}",
+                directories_scanned.iter().collect::<Vec<_>>()
+            );
         }
-        
+
         info!("🔄 Now creating transcoding jobs...");
 
         let mut job_count = 0;
@@ -174,8 +176,8 @@ impl ScanCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use std::fs;
+    use tempfile::TempDir;
 
     #[tokio::test]
     async fn test_scan_empty_directory() {
@@ -266,9 +268,7 @@ mod tests {
         // Should find all 3 mkv files regardless of nesting depth
         let job_count = fs::read_dir(&queue_dir)
             .unwrap()
-            .filter(|entry| {
-                entry.as_ref().unwrap().path().extension() == Some("job".as_ref())
-            })
+            .filter(|entry| entry.as_ref().unwrap().path().extension() == Some("job".as_ref()))
             .count();
 
         assert_eq!(job_count, 3);
@@ -306,9 +306,7 @@ mod tests {
         let queue_dir = temp_dir.path().join("_queue");
         let job_count = fs::read_dir(&queue_dir)
             .unwrap()
-            .filter(|entry| {
-                entry.as_ref().unwrap().path().extension() == Some("job".as_ref())
-            })
+            .filter(|entry| entry.as_ref().unwrap().path().extension() == Some("job".as_ref()))
             .count();
 
         // Should create jobs for: 2 webm files with VTT + 3 mkv files = 5 jobs
