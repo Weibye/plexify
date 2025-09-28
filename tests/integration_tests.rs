@@ -281,3 +281,92 @@ fn test_job_files_contain_complete_details() {
     std::env::remove_var("FFMPEG_CRF");
     std::env::remove_var("FFMPEG_AUDIO_BITRATE");
 }
+
+/// Test hierarchical directory scanning functionality
+#[test]
+fn test_hierarchical_directory_scanning() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+
+    // Create hierarchical directory structure
+    fs::create_dir_all(temp_path.join("Movies/Action")).unwrap();
+    fs::create_dir_all(temp_path.join("Movies/Comedy")).unwrap();
+    fs::create_dir_all(temp_path.join("TV Shows/Show1/Season 1")).unwrap();
+    fs::create_dir_all(temp_path.join("TV Shows/Show1/Season 2")).unwrap();
+    fs::create_dir_all(temp_path.join("TV Shows/Show2")).unwrap();
+
+    // Create media files in different subdirectories
+    fs::write(temp_path.join("Movies/Action/action1.mkv"), "").unwrap();
+    fs::write(temp_path.join("Movies/Comedy/comedy1.webm"), "").unwrap();
+    fs::write(temp_path.join("Movies/Comedy/comedy1.vtt"), "").unwrap();
+    fs::write(temp_path.join("TV Shows/Show1/Season 1/episode1.webm"), "").unwrap();
+    fs::write(temp_path.join("TV Shows/Show1/Season 1/episode1.vtt"), "").unwrap();
+    fs::write(temp_path.join("TV Shows/Show1/Season 2/episode2.mkv"), "").unwrap();
+    fs::write(temp_path.join("TV Shows/Show2/episode.mkv"), "").unwrap();
+
+    // Run scan command
+    let scan_output = Command::new("./target/debug/plexify")
+        .args([
+            "scan",
+            temp_path.to_str().unwrap(),
+            "--queue-dir", 
+            temp_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute scan command");
+
+    assert!(scan_output.status.success(), "Scan command failed");
+
+    let scan_stdout = String::from_utf8_lossy(&scan_output.stdout);
+    let scan_stderr = String::from_utf8_lossy(&scan_output.stderr);
+    let scan_output_text = format!("{scan_stdout}{scan_stderr}");
+
+    // Verify that it mentions recursive scanning
+    assert!(
+        scan_output_text.contains("Recursively scanning all subdirectories"),
+        "Should mention recursive scanning, got: {scan_output_text}"
+    );
+
+    // Verify that it found files in subdirectories  
+    assert!(
+        scan_output_text.contains("Action/action1.mkv") || scan_output_text.contains("Movies/Action/action1.mkv"),
+        "Should find files in Movies/Action subdirectory, got: {scan_output_text}"
+    );
+
+    assert!(
+        scan_output_text.contains("Show1/Season 1/episode1.webm") || scan_output_text.contains("TV Shows/Show1/Season 1/episode1.webm"),
+        "Should find files in nested TV show subdirectory, got: {scan_output_text}"
+    );
+
+    // Verify job count - should create 5 jobs (2 webm with vtt + 3 mkv)
+    assert!(
+        scan_output_text.contains("Added 5 new jobs"),
+        "Expected 5 jobs to be created, got: {scan_output_text}"
+    );
+
+    // Verify queue files were created
+    let queue_dir = temp_path.join("_queue");
+    assert!(queue_dir.exists());
+
+    let job_count = std::fs::read_dir(&queue_dir)
+        .unwrap()
+        .filter(|entry| {
+            entry.as_ref().unwrap().path().extension() == Some("job".as_ref())
+        })
+        .count();
+
+    assert_eq!(job_count, 5);
+
+    // Clean up
+    let clean_output = Command::new("./target/debug/plexify")
+        .args([
+            "clean",
+            temp_path.to_str().unwrap(),
+            "--queue-dir",
+            temp_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute clean command");
+
+    assert!(clean_output.status.success(), "Clean command failed");
+}

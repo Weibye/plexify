@@ -33,12 +33,14 @@ impl ScanCommand {
         }
 
         info!("🔎 Scanning directory: {:?}", self.media_root);
+        info!("📁 Recursively scanning all subdirectories...");
 
         let queue = JobQueue::new(self.media_root.clone(), self.queue_root.clone());
         queue.init().await?;
 
         let mut webm_files = Vec::new();
         let mut mkv_files = Vec::new();
+        let mut directories_scanned = std::collections::HashSet::new();
 
         // Walk through the directory to find media files
         for entry in WalkDir::new(&self.media_root)
@@ -47,6 +49,17 @@ impl ScanCommand {
             .filter_map(|e| e.ok())
         {
             let path = entry.path();
+            
+            // Track directories being scanned for better user feedback
+            if path.is_dir() && path != self.media_root {
+                if let Ok(relative_dir) = path.strip_prefix(&self.media_root) {
+                    if !directories_scanned.contains(relative_dir) {
+                        directories_scanned.insert(relative_dir.to_path_buf());
+                        debug!("📂 Scanning subdirectory: {:?}", relative_dir);
+                    }
+                }
+            }
+            
             if path.is_file() {
                 if let Some(extension) = path.extension() {
                     let ext_str = extension.to_string_lossy().to_lowercase();
@@ -68,10 +81,18 @@ impl ScanCommand {
         }
 
         info!(
-            "Found {} .webm files and {} .mkv files. Now creating jobs...",
+            "📊 Scanned {} directories and found {} .webm files and {} .mkv files",
+            directories_scanned.len(),
             webm_files.len(),
             mkv_files.len()
         );
+        
+        if !directories_scanned.is_empty() {
+            debug!("📋 Scanned subdirectories: {:?}", 
+                directories_scanned.iter().collect::<Vec<_>>());
+        }
+        
+        info!("🔄 Now creating transcoding jobs...");
 
         let mut job_count = 0;
 
@@ -154,6 +175,7 @@ impl ScanCommand {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use std::fs;
 
     #[tokio::test]
     async fn test_scan_empty_directory() {
@@ -171,5 +193,126 @@ mod tests {
 
         let result = scan_cmd.execute().await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_scan_hierarchical_directories() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        // Create hierarchical directory structure
+        fs::create_dir_all(media_root.join("show1/season1")).unwrap();
+        fs::create_dir_all(media_root.join("show2/season2")).unwrap();
+        fs::create_dir_all(media_root.join("movies")).unwrap();
+        fs::create_dir_all(media_root.join("very/deep/nested/folder")).unwrap();
+
+        // Create media files in different subdirectories
+        fs::write(media_root.join("show1/season1/episode1.webm"), "").unwrap();
+        fs::write(media_root.join("show1/season1/episode1.vtt"), "").unwrap();
+        fs::write(media_root.join("show2/season2/episode2.mkv"), "").unwrap();
+        fs::write(media_root.join("movies/movie1.mkv"), "").unwrap();
+        fs::write(media_root.join("very/deep/nested/folder/deep.webm"), "").unwrap();
+        fs::write(media_root.join("very/deep/nested/folder/deep.vtt"), "").unwrap();
+
+        let scan_cmd = ScanCommand::new(media_root.to_path_buf(), temp_dir.path().to_path_buf());
+        let result = scan_cmd.execute().await;
+
+        assert!(result.is_ok());
+
+        // Verify queue directory was created and contains job files
+        let queue_dir = temp_dir.path().join("_queue");
+        assert!(queue_dir.exists());
+
+        // Count job files - should have created jobs for all media files with proper subtitles
+        let job_files: Vec<_> = fs::read_dir(&queue_dir)
+            .unwrap()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let path = entry.path();
+                if path.extension()? == "job" {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Should have 4 jobs: 2 webm files with subtitles + 2 mkv files
+        assert_eq!(job_files.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_scan_finds_nested_media_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        // Create a deep nested structure
+        let deep_path = media_root.join("level1/level2/level3/level4");
+        fs::create_dir_all(&deep_path).unwrap();
+
+        // Create media file at different depths
+        fs::write(media_root.join("root.mkv"), "").unwrap();
+        fs::write(media_root.join("level1/l1.mkv"), "").unwrap();
+        fs::write(deep_path.join("deep.mkv"), "").unwrap();
+
+        let scan_cmd = ScanCommand::new(media_root.to_path_buf(), temp_dir.path().to_path_buf());
+        let result = scan_cmd.execute().await;
+
+        assert!(result.is_ok());
+
+        let queue_dir = temp_dir.path().join("_queue");
+        assert!(queue_dir.exists());
+
+        // Should find all 3 mkv files regardless of nesting depth
+        let job_count = fs::read_dir(&queue_dir)
+            .unwrap()
+            .filter(|entry| {
+                entry.as_ref().unwrap().path().extension() == Some("job".as_ref())
+            })
+            .count();
+
+        assert_eq!(job_count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_scan_mixed_media_types_in_hierarchy() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        // Create different media types in different folders
+        fs::create_dir_all(media_root.join("webm_folder")).unwrap();
+        fs::create_dir_all(media_root.join("mkv_folder")).unwrap();
+        fs::create_dir_all(media_root.join("mixed_folder")).unwrap();
+
+        // WebM files (need matching VTT)
+        fs::write(media_root.join("webm_folder/video1.webm"), "").unwrap();
+        fs::write(media_root.join("webm_folder/video1.vtt"), "").unwrap();
+        fs::write(media_root.join("webm_folder/video2.webm"), "").unwrap(); // No VTT - should be skipped
+
+        // MKV files
+        fs::write(media_root.join("mkv_folder/video1.mkv"), "").unwrap();
+        fs::write(media_root.join("mkv_folder/video2.mkv"), "").unwrap();
+
+        // Mixed folder
+        fs::write(media_root.join("mixed_folder/mixed1.webm"), "").unwrap();
+        fs::write(media_root.join("mixed_folder/mixed1.vtt"), "").unwrap();
+        fs::write(media_root.join("mixed_folder/mixed2.mkv"), "").unwrap();
+
+        let scan_cmd = ScanCommand::new(media_root.to_path_buf(), temp_dir.path().to_path_buf());
+        let result = scan_cmd.execute().await;
+
+        assert!(result.is_ok());
+
+        let queue_dir = temp_dir.path().join("_queue");
+        let job_count = fs::read_dir(&queue_dir)
+            .unwrap()
+            .filter(|entry| {
+                entry.as_ref().unwrap().path().extension() == Some("job".as_ref())
+            })
+            .count();
+
+        // Should create jobs for: 2 webm files with VTT + 3 mkv files = 5 jobs
+        // (video2.webm without VTT should be skipped)
+        assert_eq!(job_count, 5);
     }
 }
