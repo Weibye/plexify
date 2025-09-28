@@ -40,17 +40,15 @@ fn test_scan_and_clean_workflow() {
 
     let scan_stdout = String::from_utf8_lossy(&scan_output.stdout);
     let scan_stderr = String::from_utf8_lossy(&scan_output.stderr);
-    let scan_output_text = format!("{}{}", scan_stdout, scan_stderr);
+    let scan_output_text = format!("{scan_stdout}{scan_stderr}");
 
     assert!(
         scan_output_text.contains("Added 2 new jobs"),
-        "Expected 2 jobs to be created, got: {}",
-        scan_output_text
+        "Expected 2 jobs to be created, got: {scan_output_text}"
     );
     assert!(
         scan_output_text.contains("SKIPPING: Missing subtitle file"),
-        "Expected video3.webm to be skipped, got: {}",
-        scan_output_text
+        "Expected video3.webm to be skipped, got: {scan_output_text}"
     );
 
     // Verify queue files were created
@@ -76,8 +74,7 @@ fn test_scan_and_clean_workflow() {
     // Check that video3.webm was not processed (no matching .vtt file)
     assert!(
         scan_output_text.contains("SKIPPING: Missing subtitle file"),
-        "Expected video3.webm to be skipped, got: {}",
-        scan_output_text
+        "Expected video3.webm to be skipped, got: {scan_output_text}"
     );
 
     // Test clean command

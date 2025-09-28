@@ -30,7 +30,7 @@ impl FFmpegProcessor {
 
         // Ensure input file exists
         if !input_path.exists() {
-            return Err(anyhow!("Input file does not exist: {:?}", input_path));
+            return Err(anyhow!("Input file does not exist: {input_path:?}"));
         }
 
         // Create output directory if it doesn't exist
@@ -56,7 +56,7 @@ impl FFmpegProcessor {
                 if let Some(vtt_path) = job.full_subtitle_path(media_root) {
                     // Check if subtitle file exists
                     if !vtt_path.exists() {
-                        return Err(anyhow!("Required subtitle file not found: {:?}", vtt_path));
+                        return Err(anyhow!("Required subtitle file not found: {vtt_path:?}"));
                     }
 
                     cmd.args(["-i", input_path.to_str().unwrap()]);
@@ -104,7 +104,7 @@ impl FFmpegProcessor {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             error!("FFmpeg failed: {}", stderr);
-            return Err(anyhow!("FFmpeg conversion failed: {}", stderr));
+            return Err(anyhow!("FFmpeg conversion failed: {stderr}"));
         }
 
         info!(

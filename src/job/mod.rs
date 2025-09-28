@@ -152,7 +152,7 @@ impl Job {
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");
-        format!("{}.job", stem)
+        format!("{stem}.job")
     }
 }
 

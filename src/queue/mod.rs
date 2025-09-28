@@ -41,7 +41,7 @@ impl JobQueue {
         let job_content = serde_json::to_string_pretty(job)?;
         let job_filename = job.job_filename();
         let job_path = self.queue_dir.join(&job_filename);
-        let lock_dir = self.queue_dir.join(format!("{}.lock", job_filename));
+        let lock_dir = self.queue_dir.join(format!("{job_filename}.lock"));
 
         // Use a lock directory for atomic job creation
         if let Err(_) = async_fs::create_dir(&lock_dir).await {
@@ -60,7 +60,7 @@ impl JobQueue {
             Err(e) => {
                 // Clean up lock directory on error
                 let _ = async_fs::remove_dir(&lock_dir).await;
-                Err(anyhow!("Failed to create job file: {}", e))
+                Err(anyhow!("Failed to create job file: {e}"))
             }
         }
     }
@@ -202,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    async fn test_queue_initialization() {
+    async fn test_remote_queue_initialization() {
         let media_dir = TempDir::new().unwrap();
         let queue_dir = TempDir::new().unwrap();
         let queue = JobQueue::new(
