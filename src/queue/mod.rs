@@ -202,7 +202,7 @@ mod tests {
     }
 
     #[test]
-    async fn test_detached_queue_initialization() {
+    async fn test_queue_initialization() {
         let media_dir = TempDir::new().unwrap();
         let queue_dir = TempDir::new().unwrap();
         let queue = JobQueue::new(
