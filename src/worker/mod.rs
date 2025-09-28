@@ -6,6 +6,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 
 /// Worker configuration and management
+#[allow(dead_code)]
 pub struct Worker {
     pub id: String,
     pub media_root: PathBuf,
@@ -13,6 +14,7 @@ pub struct Worker {
 }
 
 impl Worker {
+    #[allow(dead_code)]
     pub fn new(id: String, media_root: PathBuf, background_mode: bool) -> Self {
         Self {
             id,
@@ -22,12 +24,14 @@ impl Worker {
     }
 
     /// Future: Could implement worker registration, heartbeat, etc.
+    #[allow(dead_code)]
     pub async fn register(&self) -> Result<()> {
         // Placeholder for worker registration logic
         Ok(())
     }
 
     /// Future: Could implement worker status reporting
+    #[allow(dead_code)]
     pub async fn report_status(&self) -> Result<()> {
         // Placeholder for status reporting logic
         Ok(())

@@ -150,7 +150,7 @@ impl ScanCommand {
         for mkv_path in mkv_files {
             let job = Job::new(
                 mkv_path.clone(),
-                MediaFileType::MKV,
+                MediaFileType::Mkv,
                 quality_settings.clone(),
                 post_processing.clone(),
             );
@@ -193,8 +193,11 @@ mod tests {
     #[tokio::test]
     async fn test_scan_empty_directory() {
         let temp_dir = TempDir::new().unwrap();
-        let scan_cmd =
-            ScanCommand::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf(), None);
+        let scan_cmd = ScanCommand::new(
+            temp_dir.path().to_path_buf(),
+            temp_dir.path().to_path_buf(),
+            None,
+        );
 
         let result = scan_cmd.execute().await;
         assert!(result.is_ok());
@@ -202,7 +205,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_nonexistent_directory() {
-        let scan_cmd = ScanCommand::new(PathBuf::from("/nonexistent/path"), PathBuf::from("/tmp"), None);
+        let scan_cmd = ScanCommand::new(
+            PathBuf::from("/nonexistent/path"),
+            PathBuf::from("/tmp"),
+            None,
+        );
 
         let result = scan_cmd.execute().await;
         assert!(result.is_err());

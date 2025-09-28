@@ -102,7 +102,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Scan { path, queue_dir, preset } => {
+        Commands::Scan {
+            path,
+            queue_dir,
+            preset,
+        } => {
             let queue_root = queue_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
             info!(
                 "Starting scan command for path: {:?}, queue: {:?}, preset: {:?}",

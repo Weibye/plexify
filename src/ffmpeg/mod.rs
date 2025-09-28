@@ -9,6 +9,7 @@ use crate::job::{Job, MediaFileType};
 
 /// FFmpeg wrapper for media transcoding
 pub struct FFmpegProcessor {
+    #[allow(dead_code)]
     config: Config,
     background_mode: bool,
 }
@@ -66,7 +67,7 @@ impl FFmpegProcessor {
                     return Err(anyhow!("WebM job missing subtitle path"));
                 }
             }
-            MediaFileType::MKV => {
+            MediaFileType::Mkv => {
                 cmd.args(["-fix_sub_duration"]);
                 cmd.args(["-i", input_path.to_str().unwrap()]);
                 cmd.args(["-map", "0:v:0", "-map", "0:a:0", "-map", "0:s:0"]);

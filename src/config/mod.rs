@@ -2,6 +2,7 @@ use std::env;
 
 /// Configuration for FFmpeg and application behavior
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Config {
     pub ffmpeg_preset: String,
     pub ffmpeg_crf: String,
