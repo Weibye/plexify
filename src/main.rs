@@ -60,19 +60,28 @@ enum Commands {
     Scan {
         /// Path to the media directory to scan
         path: PathBuf,
+        /// Path to the queue directory (defaults to current working directory)
+        #[arg(long, short = 'q')]
+        queue_dir: Option<PathBuf>,
     },
     /// Process jobs from the queue
     Work {
-        /// Path to the media directory containing the job queue
+        /// Path to the media directory containing the media files
         path: PathBuf,
+        /// Path to the queue directory (defaults to current working directory)
+        #[arg(long, short = 'q')]
+        queue_dir: Option<PathBuf>,
         /// Run worker in background with low priority
         #[arg(long, short)]
         background: bool,
     },
     /// Remove all temporary files and directories
     Clean {
-        /// Path to the media directory to clean
+        /// Path to the media directory
         path: PathBuf,
+        /// Path to the queue directory (defaults to current working directory)
+        #[arg(long, short = 'q')]
+        queue_dir: Option<PathBuf>,
     },
 }
 
@@ -90,20 +99,23 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Scan { path } => {
-            info!("Starting scan command for path: {:?}", path);
-            ScanCommand::new(path).execute().await
+        Commands::Scan { path, queue_dir } => {
+            let queue_root = queue_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
+            info!("Starting scan command for path: {:?}, queue: {:?}", path, queue_root);
+            ScanCommand::new(path, queue_root).execute().await
         }
-        Commands::Work { path, background } => {
+        Commands::Work { path, queue_dir, background } => {
+            let queue_root = queue_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
             info!(
-                "Starting work command for path: {:?}, background: {}",
-                path, background
+                "Starting work command for path: {:?}, queue: {:?}, background: {}",
+                path, queue_root, background
             );
-            WorkCommand::new(path, background).execute().await
+            WorkCommand::new(path, queue_root, background).execute().await
         }
-        Commands::Clean { path } => {
-            info!("Starting clean command for path: {:?}", path);
-            CleanCommand::new(path).execute().await
+        Commands::Clean { path, queue_dir } => {
+            let queue_root = queue_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
+            info!("Starting clean command for path: {:?}, queue: {:?}", path, queue_root);
+            CleanCommand::new(path, queue_root).execute().await
         }
     };
 

@@ -14,22 +14,8 @@ pub struct JobQueue {
 }
 
 impl JobQueue {
-    /// Create a new job queue for the given media directory
-    pub fn new(media_root: PathBuf) -> Self {
-        let queue_dir = media_root.join("_queue");
-        let in_progress_dir = media_root.join("_in_progress");
-        let completed_dir = media_root.join("_completed");
-
-        Self {
-            media_root,
-            queue_dir,
-            in_progress_dir,
-            completed_dir,
-        }
-    }
-
-    /// Create a new job queue with custom queue directory (detached from media directory)
-    pub fn new_detached(media_root: PathBuf, queue_root: PathBuf) -> Self {
+    /// Create a new job queue with queue directory separate from media directory
+    pub fn new(media_root: PathBuf, queue_root: PathBuf) -> Self {
         let queue_dir = queue_root.join("_queue");
         let in_progress_dir = queue_root.join("_in_progress");
         let completed_dir = queue_root.join("_completed");
@@ -206,7 +192,7 @@ mod tests {
     #[test]
     async fn test_queue_initialization() {
         let temp_dir = TempDir::new().unwrap();
-        let queue = JobQueue::new(temp_dir.path().to_path_buf());
+        let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
 
         queue.init().await.unwrap();
 
@@ -219,7 +205,7 @@ mod tests {
     async fn test_detached_queue_initialization() {
         let media_dir = TempDir::new().unwrap();
         let queue_dir = TempDir::new().unwrap();
-        let queue = JobQueue::new_detached(
+        let queue = JobQueue::new(
             media_dir.path().to_path_buf(),
             queue_dir.path().to_path_buf(),
         );
@@ -238,12 +224,12 @@ mod tests {
     #[test]
     async fn test_job_enqueue_and_claim() {
         let temp_dir = TempDir::new().unwrap();
-        let queue = JobQueue::new(temp_dir.path().to_path_buf());
+        let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
         queue.init().await.unwrap();
 
         let quality = QualitySettings::default();
         let post_processing = PostProcessingSettings::default();
-        let job = Job::new_relative(
+        let job = Job::new(
             PathBuf::from("test.webm"),
             MediaFileType::WebM,
             quality,

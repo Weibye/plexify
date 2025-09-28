@@ -1,0 +1,15 @@
+{
+  "id": "7f6d7aff-7d9f-43e3-b843-cbf3f3eb7b0b",
+  "input_path": "video1.webm",
+  "output_path": "video1.mp4",
+  "subtitle_path": "video1.vtt",
+  "file_type": "WebM",
+  "quality_settings": {
+    "ffmpeg_preset": "veryfast",
+    "ffmpeg_crf": "23",
+    "ffmpeg_audio_bitrate": "128k"
+  },
+  "post_processing": {
+    "disable_source_files": true
+  }
+}

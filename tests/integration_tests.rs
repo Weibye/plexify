@@ -25,9 +25,9 @@ fn test_scan_and_clean_workflow() {
         "Failed to build plexify binary"
     );
 
-    // Test scan command
+    // Test scan command (use temp_path as both media dir and queue dir)
     let scan_output = Command::new("./target/debug/plexify")
-        .args(["scan", temp_path.to_str().unwrap()])
+        .args(["scan", temp_path.to_str().unwrap(), "--queue-dir", temp_path.to_str().unwrap()])
         .output()
         .expect("Failed to execute scan command");
 
@@ -77,7 +77,7 @@ fn test_scan_and_clean_workflow() {
 
     // Test clean command
     let clean_output = Command::new("./target/debug/plexify")
-        .args(["clean", temp_path.to_str().unwrap()])
+        .args(["clean", temp_path.to_str().unwrap(), "--queue-dir", temp_path.to_str().unwrap()])
         .output()
         .expect("Failed to execute clean command");
 
@@ -182,9 +182,9 @@ fn test_job_files_contain_complete_details() {
     std::env::set_var("FFMPEG_CRF", "20");
     std::env::set_var("FFMPEG_AUDIO_BITRATE", "192k");
 
-    // Run scan command
+    // Run scan command (use temp_path as both media dir and queue dir)
     let scan_output = Command::new("./target/debug/plexify")
-        .args(["scan", temp_path.to_str().unwrap()])
+        .args(["scan", temp_path.to_str().unwrap(), "--queue-dir", temp_path.to_str().unwrap()])
         .output()
         .expect("Failed to execute scan command");
 

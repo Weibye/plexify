@@ -11,13 +11,15 @@ use crate::queue::JobQueue;
 /// Command to process jobs from the queue
 pub struct WorkCommand {
     media_root: PathBuf,
+    queue_root: PathBuf,
     background_mode: bool,
 }
 
 impl WorkCommand {
-    pub fn new(media_root: PathBuf, background_mode: bool) -> Self {
+    pub fn new(media_root: PathBuf, queue_root: PathBuf, background_mode: bool) -> Self {
         Self {
             media_root,
+            queue_root,
             background_mode,
         }
     }
@@ -42,9 +44,9 @@ impl WorkCommand {
         };
 
         info!("✅ Starting worker in {} mode.", mode);
-        info!("Watching for jobs in: {:?}", self.media_root.join("_queue"));
+        info!("Watching for jobs in: {:?}", self.queue_root.join("_queue"));
 
-        let queue = JobQueue::new(self.media_root.clone());
+        let queue = JobQueue::new(self.media_root.clone(), self.queue_root.clone());
         queue.init().await?;
 
         let processor = FFmpegProcessor::new(config.clone(), self.background_mode);
@@ -145,7 +147,7 @@ mod tests {
     #[tokio::test]
     async fn test_work_command_creation() {
         let temp_dir = TempDir::new().unwrap();
-        let work_cmd = WorkCommand::new(temp_dir.path().to_path_buf(), false);
+        let work_cmd = WorkCommand::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf(), false);
 
         assert_eq!(work_cmd.media_root, temp_dir.path());
         assert!(!work_cmd.background_mode);
@@ -153,7 +155,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_work_nonexistent_directory() {
-        let work_cmd = WorkCommand::new(PathBuf::from("/nonexistent/path"), false);
+        let work_cmd = WorkCommand::new(PathBuf::from("/nonexistent/path"), PathBuf::from("/tmp"), false);
 
         let result = work_cmd.execute().await;
         assert!(result.is_err());

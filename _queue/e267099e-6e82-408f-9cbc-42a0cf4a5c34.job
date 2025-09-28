@@ -1,0 +1,15 @@
+{
+  "id": "e267099e-6e82-408f-9cbc-42a0cf4a5c34",
+  "input_path": "video2.mkv",
+  "output_path": "video2.mp4",
+  "subtitle_path": null,
+  "file_type": "MKV",
+  "quality_settings": {
+    "ffmpeg_preset": "fast",
+    "ffmpeg_crf": "20",
+    "ffmpeg_audio_bitrate": "192k"
+  },
+  "post_processing": {
+    "disable_source_files": true
+  }
+}

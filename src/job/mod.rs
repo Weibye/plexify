@@ -67,15 +67,7 @@ impl Job {
         }
     }
 
-    /// Create a new job for a media file with relative paths (backward compatibility)
-    pub fn new_relative(
-        relative_path: PathBuf,
-        file_type: MediaFileType,
-        quality_settings: QualitySettings,
-        post_processing: PostProcessingSettings,
-    ) -> Self {
-        Self::new(relative_path, file_type, quality_settings, post_processing)
-    }
+
 
     /// Get the job file name for the queue
     pub fn job_filename(&self) -> String {
@@ -206,7 +198,7 @@ mod tests {
     fn test_webm_job_creation() {
         let quality = QualitySettings::default();
         let post_processing = PostProcessingSettings::default();
-        let job = Job::new_relative(
+        let job = Job::new(
             PathBuf::from("video.webm"),
             MediaFileType::WebM,
             quality,
@@ -222,7 +214,7 @@ mod tests {
     fn test_mkv_job_creation() {
         let quality = QualitySettings::default();
         let post_processing = PostProcessingSettings::default();
-        let job = Job::new_relative(
+        let job = Job::new(
             PathBuf::from("video.mkv"),
             MediaFileType::MKV,
             quality,
@@ -277,7 +269,7 @@ mod tests {
     fn test_relative_paths_with_media_root() {
         let quality = QualitySettings::default();
         let post_processing = PostProcessingSettings::default();
-        let job = Job::new_relative(
+        let job = Job::new(
             PathBuf::from("relative/video.mkv"),
             MediaFileType::MKV,
             quality,
@@ -306,7 +298,7 @@ mod tests {
         let post_processing = PostProcessingSettings {
             disable_source_files: false,
         };
-        let job = Job::new_relative(
+        let job = Job::new(
             PathBuf::from("test.webm"),
             MediaFileType::WebM,
             quality.clone(),
