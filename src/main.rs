@@ -63,6 +63,9 @@ enum Commands {
         /// Path to the queue directory (defaults to current working directory)
         #[arg(long, short = 'q')]
         queue_dir: Option<PathBuf>,
+        /// Quality preset for encoding. Available: fast, balanced, quality, ultrafast, archive
+        #[arg(long, short = 'p')]
+        preset: Option<String>,
     },
     /// Process jobs from the queue
     Work {
@@ -99,13 +102,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Scan { path, queue_dir } => {
+        Commands::Scan { path, queue_dir, preset } => {
             let queue_root = queue_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
             info!(
-                "Starting scan command for path: {:?}, queue: {:?}",
-                path, queue_root
+                "Starting scan command for path: {:?}, queue: {:?}, preset: {:?}",
+                path, queue_root, preset
             );
-            ScanCommand::new(path, queue_root).execute().await
+            ScanCommand::new(path, queue_root, preset).execute().await
         }
         Commands::Work {
             path,

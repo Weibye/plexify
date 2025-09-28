@@ -10,13 +10,15 @@ use crate::queue::JobQueue;
 pub struct ScanCommand {
     media_root: PathBuf,
     queue_root: PathBuf,
+    preset: Option<String>,
 }
 
 impl ScanCommand {
-    pub fn new(media_root: PathBuf, queue_root: PathBuf) -> Self {
+    pub fn new(media_root: PathBuf, queue_root: PathBuf, preset: Option<String>) -> Self {
         Self {
             media_root,
             queue_root,
+            preset,
         }
     }
 
@@ -99,7 +101,16 @@ impl ScanCommand {
         let mut job_count = 0;
 
         // Get configuration settings for jobs
-        let quality_settings = QualitySettings::from_env();
+        let quality_settings = match &self.preset {
+            Some(preset_name) => {
+                info!("Using quality preset: '{}'", preset_name);
+                QualitySettings::from_preset_name(preset_name)?
+            }
+            None => {
+                info!("Using quality settings from environment variables");
+                QualitySettings::from_env()
+            }
+        };
         let post_processing = PostProcessingSettings::default();
 
         // Process WebM files (require VTT subtitles)
@@ -183,7 +194,7 @@ mod tests {
     async fn test_scan_empty_directory() {
         let temp_dir = TempDir::new().unwrap();
         let scan_cmd =
-            ScanCommand::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+            ScanCommand::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf(), None);
 
         let result = scan_cmd.execute().await;
         assert!(result.is_ok());
@@ -191,7 +202,33 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_nonexistent_directory() {
-        let scan_cmd = ScanCommand::new(PathBuf::from("/nonexistent/path"), PathBuf::from("/tmp"));
+        let scan_cmd = ScanCommand::new(PathBuf::from("/nonexistent/path"), PathBuf::from("/tmp"), None);
+
+        let result = scan_cmd.execute().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_scan_with_preset() {
+        let temp_dir = TempDir::new().unwrap();
+        let scan_cmd = ScanCommand::new(
+            temp_dir.path().to_path_buf(),
+            temp_dir.path().to_path_buf(),
+            Some("quality".to_string()),
+        );
+
+        let result = scan_cmd.execute().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_scan_with_invalid_preset() {
+        let temp_dir = TempDir::new().unwrap();
+        let scan_cmd = ScanCommand::new(
+            temp_dir.path().to_path_buf(),
+            temp_dir.path().to_path_buf(),
+            Some("invalid_preset".to_string()),
+        );
 
         let result = scan_cmd.execute().await;
         assert!(result.is_err());
