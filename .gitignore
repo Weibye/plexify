@@ -1,4 +1,21 @@
+# Build outputs
 /target
+*.exe
+*.deb
+*.rpm
+*.tar.gz
+*.zip
+
+# Plexify working directories
 _queue/
 _in_progress/
 _completed/
+_worker.log
+
+# Temporary files
+*.tmp
+.env.local
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -201,6 +201,53 @@ Write-Host "Binary installed at: $installPath"
 3. Replace your existing binary
 4. Verify the installation: `plexify --version`
 
+#### Automated Update Scripts
+
+The repository includes ready-to-use update scripts:
+
+**One-line update (Linux/macOS):**
+```bash
+curl -sSL https://raw.githubusercontent.com/Weibye/plexify/main/scripts/update-plexify.sh | bash
+```
+
+**Windows PowerShell:**
+```powershell
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/Weibye/plexify/main/scripts/Update-Plexify.ps1" -OutFile "Update-Plexify.ps1"
+.\Update-Plexify.ps1
+```
+
+See the [`scripts/`](scripts/) directory for detailed usage and automation options.
+
+### Docker Deployment
+
+For containerized worker nodes:
+
+**Quick start:**
+```bash
+# Clone repository
+git clone https://github.com/Weibye/plexify.git
+cd plexify
+
+# Set environment variables
+export MEDIA_PATH=/path/to/your/media
+export QUEUE_PATH=/path/to/shared/queue
+
+# Start worker
+docker-compose up plexify-worker
+
+# Run scanner (in another terminal)
+docker-compose run --rm plexify-scanner
+```
+
+**Production setup with multiple workers:**
+```bash
+# Start 3 background workers
+docker-compose up -d --scale plexify-worker=3
+
+# Run scanner periodically via cron
+0 */6 * * * cd /path/to/plexify && docker-compose run --rm plexify-scanner
+```
+
 ## Usage
 
 ### Basic Commands

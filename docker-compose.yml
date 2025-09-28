@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  plexify-worker:
+    build: .
+    volumes:
+      # Mount your media directory
+      - "${MEDIA_PATH:-./media}:/media"
+      # Optional: mount queue directory if using shared storage
+      - "${QUEUE_PATH:-./queue}:/queue"
+    environment:
+      # FFmpeg settings
+      - FFMPEG_PRESET=${FFMPEG_PRESET:-veryfast}
+      - FFMPEG_CRF=${FFMPEG_CRF:-23}
+      - FFMPEG_AUDIO_BITRATE=${FFMPEG_AUDIO_BITRATE:-128k}
+      
+      # Worker settings
+      - SLEEP_INTERVAL=${SLEEP_INTERVAL:-60}
+      - RUST_LOG=${RUST_LOG:-info}
+    
+    # Run as background worker
+    command: ["plexify", "work", "/media", "--background", "--queue-dir", "/queue"]
+    
+    # Restart policy
+    restart: unless-stopped
+    
+    # Resource limits (optional)
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # Scanner service (run occasionally)
+  plexify-scanner:
+    build: .
+    volumes:
+      - "${MEDIA_PATH:-./media}:/media"
+      - "${QUEUE_PATH:-./queue}:/queue"
+    environment:
+      - RUST_LOG=${RUST_LOG:-info}
+    
+    command: ["plexify", "scan", "/media", "--queue-dir", "/queue"]
+    
+    # Don't restart scanner, it should run and exit
+    restart: "no"
+    
+    profiles:
+      - scanner
