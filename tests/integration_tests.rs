@@ -25,9 +25,14 @@ fn test_scan_and_clean_workflow() {
         "Failed to build plexify binary"
     );
 
-    // Test scan command
+    // Test scan command (use temp_path as both media dir and queue dir)
     let scan_output = Command::new("./target/debug/plexify")
-        .args(["scan", temp_path.to_str().unwrap()])
+        .args([
+            "scan",
+            temp_path.to_str().unwrap(),
+            "--queue-dir",
+            temp_path.to_str().unwrap(),
+        ])
         .output()
         .expect("Failed to execute scan command");
 
@@ -35,28 +40,51 @@ fn test_scan_and_clean_workflow() {
 
     let scan_stdout = String::from_utf8_lossy(&scan_output.stdout);
     let scan_stderr = String::from_utf8_lossy(&scan_output.stderr);
-    let scan_output_text = format!("{}{}", scan_stdout, scan_stderr);
+    let scan_output_text = format!("{scan_stdout}{scan_stderr}");
 
     assert!(
         scan_output_text.contains("Added 2 new jobs"),
-        "Expected 2 jobs to be created, got: {}",
-        scan_output_text
+        "Expected 2 jobs to be created, got: {scan_output_text}"
     );
     assert!(
         scan_output_text.contains("SKIPPING: Missing subtitle file"),
-        "Expected video3.webm to be skipped, got: {}",
-        scan_output_text
+        "Expected video3.webm to be skipped, got: {scan_output_text}"
     );
 
     // Verify queue files were created
     assert!(temp_path.join("_queue").exists());
-    assert!(temp_path.join("_queue/video1.job").exists());
-    assert!(temp_path.join("_queue/video2.job").exists());
-    assert!(!temp_path.join("_queue/video3.job").exists());
+
+    // Check that job files were created (they will have UUID names now)
+    let queue_dir = temp_path.join("_queue");
+    let job_files: Vec<_> = std::fs::read_dir(&queue_dir)
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path.extension()? == "job" {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    assert_eq!(job_files.len(), 2, "Expected 2 job files to be created");
+
+    // Check that video3.webm was not processed (no matching .vtt file)
+    assert!(
+        scan_output_text.contains("SKIPPING: Missing subtitle file"),
+        "Expected video3.webm to be skipped, got: {scan_output_text}"
+    );
 
     // Test clean command
     let clean_output = Command::new("./target/debug/plexify")
-        .args(["clean", temp_path.to_str().unwrap()])
+        .args([
+            "clean",
+            temp_path.to_str().unwrap(),
+            "--queue-dir",
+            temp_path.to_str().unwrap(),
+        ])
         .output()
         .expect("Failed to execute clean command");
 
@@ -132,4 +160,124 @@ fn test_invalid_paths() {
         !clean_output.status.success(),
         "Clean should fail with invalid path"
     );
+}
+
+/// Test that job files contain all work details
+#[test]
+fn test_job_files_contain_complete_details() {
+    // Build the binary first
+    let build_output = Command::new("cargo")
+        .args(["build", "--bin", "plexify"])
+        .output()
+        .expect("Failed to build plexify");
+
+    assert!(
+        build_output.status.success(),
+        "Failed to build plexify binary"
+    );
+
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+
+    // Create test files
+    fs::write(temp_path.join("video1.webm"), "fake webm content").unwrap();
+    fs::write(
+        temp_path.join("video1.vtt"),
+        "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nTest subtitle",
+    )
+    .unwrap();
+    fs::write(temp_path.join("video2.mkv"), "fake mkv content").unwrap();
+
+    // Set custom environment variables to test they're captured
+    std::env::set_var("FFMPEG_PRESET", "fast");
+    std::env::set_var("FFMPEG_CRF", "20");
+    std::env::set_var("FFMPEG_AUDIO_BITRATE", "192k");
+
+    // Run scan command (use temp_path as both media dir and queue dir)
+    let scan_output = Command::new("./target/debug/plexify")
+        .args([
+            "scan",
+            temp_path.to_str().unwrap(),
+            "--queue-dir",
+            temp_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute scan command");
+
+    assert!(scan_output.status.success(), "Scan command failed");
+
+    // Read and verify job files
+    let queue_dir = temp_path.join("_queue");
+    assert!(queue_dir.exists());
+
+    let job_files: Vec<_> = std::fs::read_dir(&queue_dir)
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path.extension()? == "job" {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    assert_eq!(job_files.len(), 2, "Expected 2 job files to be created");
+
+    // Read and parse job files to verify they contain all details
+    for job_file in job_files {
+        let content = fs::read_to_string(&job_file).unwrap();
+        let job: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+        // Verify required fields are present
+        assert!(job.get("id").is_some(), "Job should have id field");
+        assert!(
+            job.get("input_path").is_some(),
+            "Job should have input_path field"
+        );
+        assert!(
+            job.get("output_path").is_some(),
+            "Job should have output_path field"
+        );
+        assert!(
+            job.get("file_type").is_some(),
+            "Job should have file_type field"
+        );
+
+        // Verify quality settings are captured from environment
+        let quality_settings = job.get("quality_settings").unwrap();
+        assert_eq!(quality_settings.get("ffmpeg_preset").unwrap(), "fast");
+        assert_eq!(quality_settings.get("ffmpeg_crf").unwrap(), "20");
+        assert_eq!(
+            quality_settings.get("ffmpeg_audio_bitrate").unwrap(),
+            "192k"
+        );
+
+        // Verify post-processing settings
+        let post_processing = job.get("post_processing").unwrap();
+        assert_eq!(post_processing.get("disable_source_files").unwrap(), true);
+
+        // Verify paths are consistent
+        let input_path = job.get("input_path").unwrap().as_str().unwrap();
+        let output_path = job.get("output_path").unwrap().as_str().unwrap();
+
+        if input_path.ends_with(".webm") {
+            assert!(output_path.ends_with(".mp4"));
+            assert!(job
+                .get("subtitle_path")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .ends_with(".vtt"));
+        } else if input_path.ends_with(".mkv") {
+            assert!(output_path.ends_with(".mp4"));
+            assert!(job.get("subtitle_path").unwrap().is_null());
+        }
+    }
+
+    // Clean up environment variables
+    std::env::remove_var("FFMPEG_PRESET");
+    std::env::remove_var("FFMPEG_CRF");
+    std::env::remove_var("FFMPEG_AUDIO_BITRATE");
 }

@@ -3,17 +3,21 @@ use std::path::PathBuf;
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
-use crate::job::{Job, MediaFileType};
+use crate::job::{Job, MediaFileType, PostProcessingSettings, QualitySettings};
 use crate::queue::JobQueue;
 
 /// Command to scan a directory for media files and create jobs
 pub struct ScanCommand {
     media_root: PathBuf,
+    queue_root: PathBuf,
 }
 
 impl ScanCommand {
-    pub fn new(media_root: PathBuf) -> Self {
-        Self { media_root }
+    pub fn new(media_root: PathBuf, queue_root: PathBuf) -> Self {
+        Self {
+            media_root,
+            queue_root,
+        }
     }
 
     pub async fn execute(&self) -> Result<()> {
@@ -30,7 +34,7 @@ impl ScanCommand {
 
         info!("🔎 Scanning directory: {:?}", self.media_root);
 
-        let queue = JobQueue::new(self.media_root.clone());
+        let queue = JobQueue::new(self.media_root.clone(), self.queue_root.clone());
         queue.init().await?;
 
         let mut webm_files = Vec::new();
@@ -71,12 +75,21 @@ impl ScanCommand {
 
         let mut job_count = 0;
 
+        // Get configuration settings for jobs
+        let quality_settings = QualitySettings::from_env();
+        let post_processing = PostProcessingSettings::default();
+
         // Process WebM files (require VTT subtitles)
         for webm_path in webm_files {
-            let job = Job::new(webm_path.clone(), MediaFileType::WebM);
+            let job = Job::new(
+                webm_path.clone(),
+                MediaFileType::WebM,
+                quality_settings.clone(),
+                post_processing.clone(),
+            );
 
             // Check if output already exists
-            if job.output_exists(&self.media_root) {
+            if job.output_exists(Some(&self.media_root)) {
                 debug!("Output already exists for: {:?}", webm_path);
                 continue;
             }
@@ -88,7 +101,7 @@ impl ScanCommand {
             }
 
             // Check if required subtitle file exists
-            if !job.has_required_subtitle(&self.media_root)? {
+            if !job.has_required_subtitle(Some(&self.media_root))? {
                 warn!("⚠️ SKIPPING: Missing subtitle file for '{:?}'", webm_path);
                 continue;
             }
@@ -101,10 +114,15 @@ impl ScanCommand {
 
         // Process MKV files (embedded subtitles)
         for mkv_path in mkv_files {
-            let job = Job::new(mkv_path.clone(), MediaFileType::MKV);
+            let job = Job::new(
+                mkv_path.clone(),
+                MediaFileType::MKV,
+                quality_settings.clone(),
+                post_processing.clone(),
+            );
 
             // Check if output already exists
-            if job.output_exists(&self.media_root) {
+            if job.output_exists(Some(&self.media_root)) {
                 debug!("Output already exists for: {:?}", mkv_path);
                 continue;
             }
@@ -136,12 +154,12 @@ impl ScanCommand {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use tokio::fs;
 
     #[tokio::test]
     async fn test_scan_empty_directory() {
         let temp_dir = TempDir::new().unwrap();
-        let scan_cmd = ScanCommand::new(temp_dir.path().to_path_buf());
+        let scan_cmd =
+            ScanCommand::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
 
         let result = scan_cmd.execute().await;
         assert!(result.is_ok());
@@ -149,7 +167,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_nonexistent_directory() {
-        let scan_cmd = ScanCommand::new(PathBuf::from("/nonexistent/path"));
+        let scan_cmd = ScanCommand::new(PathBuf::from("/nonexistent/path"), PathBuf::from("/tmp"));
 
         let result = scan_cmd.execute().await;
         assert!(result.is_err());

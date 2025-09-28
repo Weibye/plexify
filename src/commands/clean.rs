@@ -7,11 +7,15 @@ use crate::queue::JobQueue;
 /// Command to clean up temporary files and directories
 pub struct CleanCommand {
     media_root: PathBuf,
+    queue_root: PathBuf,
 }
 
 impl CleanCommand {
-    pub fn new(media_root: PathBuf) -> Self {
-        Self { media_root }
+    pub fn new(media_root: PathBuf, queue_root: PathBuf) -> Self {
+        Self {
+            media_root,
+            queue_root,
+        }
     }
 
     pub async fn execute(&self) -> Result<()> {
@@ -28,7 +32,7 @@ impl CleanCommand {
 
         info!("🧹 Cleaning up temporary files...");
 
-        let queue = JobQueue::new(self.media_root.clone());
+        let queue = JobQueue::new(self.media_root.clone(), self.queue_root.clone());
         queue.clean().await?;
 
         // Also clean up worker log if it exists
@@ -51,7 +55,8 @@ mod tests {
     #[tokio::test]
     async fn test_clean_empty_directory() {
         let temp_dir = TempDir::new().unwrap();
-        let clean_cmd = CleanCommand::new(temp_dir.path().to_path_buf());
+        let clean_cmd =
+            CleanCommand::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
 
         let result = clean_cmd.execute().await;
         assert!(result.is_ok());
@@ -59,7 +64,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_clean_nonexistent_directory() {
-        let clean_cmd = CleanCommand::new(PathBuf::from("/nonexistent/path"));
+        let clean_cmd =
+            CleanCommand::new(PathBuf::from("/nonexistent/path"), PathBuf::from("/tmp"));
 
         let result = clean_cmd.execute().await;
         assert!(result.is_err());

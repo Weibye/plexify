@@ -14,11 +14,11 @@ pub struct JobQueue {
 }
 
 impl JobQueue {
-    /// Create a new job queue for the given media directory
-    pub fn new(media_root: PathBuf) -> Self {
-        let queue_dir = media_root.join("_queue");
-        let in_progress_dir = media_root.join("_in_progress");
-        let completed_dir = media_root.join("_completed");
+    /// Create a new job queue with queue directory separate from media directory
+    pub fn new(media_root: PathBuf, queue_root: PathBuf) -> Self {
+        let queue_dir = queue_root.join("_queue");
+        let in_progress_dir = queue_root.join("_in_progress");
+        let completed_dir = queue_root.join("_completed");
 
         Self {
             media_root,
@@ -38,10 +38,10 @@ impl JobQueue {
 
     /// Add a job to the queue using atomic file operations
     pub async fn enqueue_job(&self, job: &Job) -> Result<()> {
-        let job_content = job.relative_path.to_string_lossy();
-        let job_filename = job.job_filename_from_source();
+        let job_content = serde_json::to_string_pretty(job)?;
+        let job_filename = job.job_filename();
         let job_path = self.queue_dir.join(&job_filename);
-        let lock_dir = self.queue_dir.join(format!("{}.lock", job_filename));
+        let lock_dir = self.queue_dir.join(format!("{job_filename}.lock"));
 
         // Use a lock directory for atomic job creation
         if let Err(_) = async_fs::create_dir(&lock_dir).await {
@@ -60,7 +60,7 @@ impl JobQueue {
             Err(e) => {
                 // Clean up lock directory on error
                 let _ = async_fs::remove_dir(&lock_dir).await;
-                Err(anyhow!("Failed to create job file: {}", e))
+                Err(anyhow!("Failed to create job file: {e}"))
             }
         }
     }
@@ -85,14 +85,14 @@ impl JobQueue {
                         Ok(_) => {
                             debug!("Claimed job: {}", job_name);
 
-                            // Read job content
+                            // Read and deserialize job content
                             let content = async_fs::read_to_string(&in_progress_path).await?;
-                            let relative_path = PathBuf::from(content.trim());
+                            let job: Job = serde_json::from_str(&content)?;
 
                             return Ok(Some(ClaimedJob {
                                 queue: self,
                                 job_name: job_name.to_string(),
-                                relative_path,
+                                job,
                                 in_progress_path,
                             }));
                         }
@@ -110,7 +110,7 @@ impl JobQueue {
 
     /// Check if a job already exists in the queue
     pub async fn job_exists(&self, job: &Job) -> Result<bool> {
-        let job_filename = job.job_filename_from_source();
+        let job_filename = job.job_filename();
         let job_path = self.queue_dir.join(job_filename);
         Ok(job_path.exists())
     }
@@ -150,7 +150,7 @@ impl JobQueue {
 pub struct ClaimedJob<'a> {
     queue: &'a JobQueue,
     job_name: String,
-    pub relative_path: PathBuf,
+    pub job: Job,
     in_progress_path: PathBuf,
 }
 
@@ -178,25 +178,76 @@ impl<'a> ClaimedJob<'a> {
 
     /// Get the media file extension
     pub fn file_extension(&self) -> Option<&str> {
-        self.relative_path.extension()?.to_str()
+        self.job.input_path.extension()?.to_str()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job::{Job, MediaFileType, PostProcessingSettings, QualitySettings};
     use tempfile::TempDir;
     use tokio::test;
 
     #[test]
     async fn test_queue_initialization() {
         let temp_dir = TempDir::new().unwrap();
-        let queue = JobQueue::new(temp_dir.path().to_path_buf());
+        let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
 
         queue.init().await.unwrap();
 
         assert!(queue.queue_dir.exists());
         assert!(queue.in_progress_dir.exists());
         assert!(queue.completed_dir.exists());
+    }
+
+    #[test]
+    async fn test_remote_queue_initialization() {
+        let media_dir = TempDir::new().unwrap();
+        let queue_dir = TempDir::new().unwrap();
+        let queue = JobQueue::new(
+            media_dir.path().to_path_buf(),
+            queue_dir.path().to_path_buf(),
+        );
+
+        queue.init().await.unwrap();
+
+        // Queue directories should be in the separate queue directory
+        assert!(queue_dir.path().join("_queue").exists());
+        assert!(queue_dir.path().join("_in_progress").exists());
+        assert!(queue_dir.path().join("_completed").exists());
+
+        // Media directory should be clean
+        assert!(!media_dir.path().join("_queue").exists());
+    }
+
+    #[test]
+    async fn test_job_enqueue_and_claim() {
+        let temp_dir = TempDir::new().unwrap();
+        let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        queue.init().await.unwrap();
+
+        let quality = QualitySettings::default();
+        let post_processing = PostProcessingSettings::default();
+        let job = Job::new(
+            PathBuf::from("test.webm"),
+            MediaFileType::WebM,
+            quality,
+            post_processing,
+        );
+
+        // Enqueue job
+        queue.enqueue_job(&job).await.unwrap();
+
+        // Claim job
+        let claimed = queue.claim_job().await.unwrap().unwrap();
+        assert_eq!(claimed.job.input_path, PathBuf::from("test.webm"));
+        assert_eq!(claimed.job.file_type, MediaFileType::WebM);
+
+        // Mark as complete
+        claimed.complete().await.unwrap();
+
+        // Should be no more jobs
+        assert!(queue.claim_job().await.unwrap().is_none());
     }
 }
