@@ -67,8 +67,6 @@ impl Job {
         }
     }
 
-
-
     /// Get the job file name for the queue
     pub fn job_filename(&self) -> String {
         format!("{}.job", self.id)
@@ -255,14 +253,29 @@ mod tests {
         );
 
         // Test that absolute paths work without media_root
-        assert_eq!(job.full_input_path(None), PathBuf::from("/absolute/path/video.webm"));
-        assert_eq!(job.full_output_path(None), PathBuf::from("/absolute/path/video.mp4"));
-        assert_eq!(job.full_subtitle_path(None), Some(PathBuf::from("/absolute/path/video.vtt")));
+        assert_eq!(
+            job.full_input_path(None),
+            PathBuf::from("/absolute/path/video.webm")
+        );
+        assert_eq!(
+            job.full_output_path(None),
+            PathBuf::from("/absolute/path/video.mp4")
+        );
+        assert_eq!(
+            job.full_subtitle_path(None),
+            Some(PathBuf::from("/absolute/path/video.vtt"))
+        );
 
         // Test that absolute paths ignore media_root
         let media_root = PathBuf::from("/different/root");
-        assert_eq!(job.full_input_path(Some(&media_root)), PathBuf::from("/absolute/path/video.webm"));
-        assert_eq!(job.full_output_path(Some(&media_root)), PathBuf::from("/absolute/path/video.mp4"));
+        assert_eq!(
+            job.full_input_path(Some(&media_root)),
+            PathBuf::from("/absolute/path/video.webm")
+        );
+        assert_eq!(
+            job.full_output_path(Some(&media_root)),
+            PathBuf::from("/absolute/path/video.mp4")
+        );
     }
 
     #[test]
@@ -277,15 +290,27 @@ mod tests {
         );
 
         let media_root = PathBuf::from("/media/root");
-        
+
         // Test that relative paths are resolved with media_root
-        assert_eq!(job.full_input_path(Some(&media_root)), PathBuf::from("/media/root/relative/video.mkv"));
-        assert_eq!(job.full_output_path(Some(&media_root)), PathBuf::from("/media/root/relative/video.mp4"));
+        assert_eq!(
+            job.full_input_path(Some(&media_root)),
+            PathBuf::from("/media/root/relative/video.mkv")
+        );
+        assert_eq!(
+            job.full_output_path(Some(&media_root)),
+            PathBuf::from("/media/root/relative/video.mp4")
+        );
         assert_eq!(job.full_subtitle_path(Some(&media_root)), None); // MKV has no external subtitles
-        
+
         // Test that relative paths work without media_root (use as-is)
-        assert_eq!(job.full_input_path(None), PathBuf::from("relative/video.mkv"));
-        assert_eq!(job.full_output_path(None), PathBuf::from("relative/video.mp4"));
+        assert_eq!(
+            job.full_input_path(None),
+            PathBuf::from("relative/video.mkv")
+        );
+        assert_eq!(
+            job.full_output_path(None),
+            PathBuf::from("relative/video.mp4")
+        );
     }
 
     #[test]
@@ -313,7 +338,13 @@ mod tests {
         assert_eq!(job.output_path, deserialized.output_path);
         assert_eq!(job.subtitle_path, deserialized.subtitle_path);
         assert_eq!(job.file_type, deserialized.file_type);
-        assert_eq!(job.quality_settings.ffmpeg_preset, deserialized.quality_settings.ffmpeg_preset);
-        assert_eq!(job.post_processing.disable_source_files, deserialized.post_processing.disable_source_files);
+        assert_eq!(
+            job.quality_settings.ffmpeg_preset,
+            deserialized.quality_settings.ffmpeg_preset
+        );
+        assert_eq!(
+            job.post_processing.disable_source_files,
+            deserialized.post_processing.disable_source_files
+        );
     }
 }

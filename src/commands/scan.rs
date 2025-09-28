@@ -14,7 +14,10 @@ pub struct ScanCommand {
 
 impl ScanCommand {
     pub fn new(media_root: PathBuf, queue_root: PathBuf) -> Self {
-        Self { media_root, queue_root }
+        Self {
+            media_root,
+            queue_root,
+        }
     }
 
     pub async fn execute(&self) -> Result<()> {
@@ -155,7 +158,8 @@ mod tests {
     #[tokio::test]
     async fn test_scan_empty_directory() {
         let temp_dir = TempDir::new().unwrap();
-        let scan_cmd = ScanCommand::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        let scan_cmd =
+            ScanCommand::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
 
         let result = scan_cmd.execute().await;
         assert!(result.is_ok());

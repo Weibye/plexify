@@ -101,20 +101,32 @@ async fn main() -> Result<()> {
     let result = match cli.command {
         Commands::Scan { path, queue_dir } => {
             let queue_root = queue_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
-            info!("Starting scan command for path: {:?}, queue: {:?}", path, queue_root);
+            info!(
+                "Starting scan command for path: {:?}, queue: {:?}",
+                path, queue_root
+            );
             ScanCommand::new(path, queue_root).execute().await
         }
-        Commands::Work { path, queue_dir, background } => {
+        Commands::Work {
+            path,
+            queue_dir,
+            background,
+        } => {
             let queue_root = queue_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
             info!(
                 "Starting work command for path: {:?}, queue: {:?}, background: {}",
                 path, queue_root, background
             );
-            WorkCommand::new(path, queue_root, background).execute().await
+            WorkCommand::new(path, queue_root, background)
+                .execute()
+                .await
         }
         Commands::Clean { path, queue_dir } => {
             let queue_root = queue_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
-            info!("Starting clean command for path: {:?}, queue: {:?}", path, queue_root);
+            info!(
+                "Starting clean command for path: {:?}, queue: {:?}",
+                path, queue_root
+            );
             CleanCommand::new(path, queue_root).execute().await
         }
     };

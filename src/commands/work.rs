@@ -147,7 +147,11 @@ mod tests {
     #[tokio::test]
     async fn test_work_command_creation() {
         let temp_dir = TempDir::new().unwrap();
-        let work_cmd = WorkCommand::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf(), false);
+        let work_cmd = WorkCommand::new(
+            temp_dir.path().to_path_buf(),
+            temp_dir.path().to_path_buf(),
+            false,
+        );
 
         assert_eq!(work_cmd.media_root, temp_dir.path());
         assert!(!work_cmd.background_mode);
@@ -155,7 +159,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_work_nonexistent_directory() {
-        let work_cmd = WorkCommand::new(PathBuf::from("/nonexistent/path"), PathBuf::from("/tmp"), false);
+        let work_cmd = WorkCommand::new(
+            PathBuf::from("/nonexistent/path"),
+            PathBuf::from("/tmp"),
+            false,
+        );
 
         let result = work_cmd.execute().await;
         assert!(result.is_err());
