@@ -22,11 +22,21 @@ impl FFmpegProcessor {
     }
 
     /// Process a job using FFmpeg
-    pub async fn process_job(&self, job: &Job, media_root: &Path) -> Result<()> {
-        let input_path = media_root.join(&job.relative_path);
-        let output_path = media_root.join(job.output_path());
+    pub async fn process_job(&self, job: &Job, media_root: Option<&Path>) -> Result<()> {
+        let input_path = job.full_input_path(media_root);
+        let output_path = job.full_output_path(media_root);
 
         info!("🚀 Starting conversion for: {:?}", input_path);
+
+        // Ensure input file exists
+        if !input_path.exists() {
+            return Err(anyhow!("Input file does not exist: {:?}", input_path));
+        }
+
+        // Create output directory if it doesn't exist
+        if let Some(parent) = output_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
 
         let mut cmd = if self.background_mode {
             let mut c = Command::new("nice");
@@ -43,9 +53,7 @@ impl FFmpegProcessor {
         // Add format-specific flags and inputs
         match job.file_type {
             MediaFileType::WebM => {
-                if let Some(subtitle_path) = job.subtitle_path() {
-                    let vtt_path = media_root.join(subtitle_path);
-
+                if let Some(vtt_path) = job.full_subtitle_path(media_root) {
                     // Check if subtitle file exists
                     if !vtt_path.exists() {
                         return Err(anyhow!("Required subtitle file not found: {:?}", vtt_path));
@@ -65,18 +73,18 @@ impl FFmpegProcessor {
             }
         }
 
-        // Add encoding settings
+        // Add encoding settings using job's quality settings
         cmd.args([
             "-c:v",
             "libx264",
             "-preset",
-            &self.config.ffmpeg_preset,
+            &job.quality_settings.ffmpeg_preset,
             "-crf",
-            &self.config.ffmpeg_crf,
+            &job.quality_settings.ffmpeg_crf,
             "-c:a",
             "aac",
             "-b:a",
-            &self.config.ffmpeg_audio_bitrate,
+            &job.quality_settings.ffmpeg_audio_bitrate,
             "-c:s",
             "mov_text",
             "-y", // Overwrite output files
@@ -107,8 +115,8 @@ impl FFmpegProcessor {
     }
 
     /// Rename original files to .disabled after successful conversion
-    pub async fn disable_source_files(&self, job: &Job, media_root: &Path) -> Result<()> {
-        let input_path = media_root.join(&job.relative_path);
+    pub async fn disable_source_files(&self, job: &Job, media_root: Option<&Path>) -> Result<()> {
+        let input_path = job.full_input_path(media_root);
         let disabled_input = input_path.with_extension(format!(
             "{}.disabled",
             input_path
@@ -126,8 +134,7 @@ impl FFmpegProcessor {
         );
 
         // Rename subtitle file if it exists (WebM)
-        if let Some(subtitle_path) = job.subtitle_path() {
-            let vtt_path = media_root.join(subtitle_path);
+        if let Some(vtt_path) = job.full_subtitle_path(media_root) {
             if vtt_path.exists() {
                 let disabled_vtt = vtt_path.with_extension("vtt.disabled");
                 tokio::fs::rename(&vtt_path, &disabled_vtt).await?;
@@ -145,8 +152,6 @@ impl FFmpegProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::{Job, MediaFileType};
-    use tempfile::TempDir;
 
     #[tokio::test]
     async fn test_ffmpeg_processor_creation() {

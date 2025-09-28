@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
-use crate::job::{Job, MediaFileType};
+use crate::job::{Job, MediaFileType, PostProcessingSettings, QualitySettings};
 use crate::queue::JobQueue;
 
 /// Command to scan a directory for media files and create jobs
@@ -71,12 +71,21 @@ impl ScanCommand {
 
         let mut job_count = 0;
 
+        // Get configuration settings for jobs
+        let quality_settings = QualitySettings::from_env();
+        let post_processing = PostProcessingSettings::default();
+
         // Process WebM files (require VTT subtitles)
         for webm_path in webm_files {
-            let job = Job::new(webm_path.clone(), MediaFileType::WebM);
+            let job = Job::new_relative(
+                webm_path.clone(),
+                MediaFileType::WebM,
+                quality_settings.clone(),
+                post_processing.clone(),
+            );
 
             // Check if output already exists
-            if job.output_exists(&self.media_root) {
+            if job.output_exists(Some(&self.media_root)) {
                 debug!("Output already exists for: {:?}", webm_path);
                 continue;
             }
@@ -88,7 +97,7 @@ impl ScanCommand {
             }
 
             // Check if required subtitle file exists
-            if !job.has_required_subtitle(&self.media_root)? {
+            if !job.has_required_subtitle(Some(&self.media_root))? {
                 warn!("⚠️ SKIPPING: Missing subtitle file for '{:?}'", webm_path);
                 continue;
             }
@@ -101,10 +110,15 @@ impl ScanCommand {
 
         // Process MKV files (embedded subtitles)
         for mkv_path in mkv_files {
-            let job = Job::new(mkv_path.clone(), MediaFileType::MKV);
+            let job = Job::new_relative(
+                mkv_path.clone(),
+                MediaFileType::MKV,
+                quality_settings.clone(),
+                post_processing.clone(),
+            );
 
             // Check if output already exists
-            if job.output_exists(&self.media_root) {
+            if job.output_exists(Some(&self.media_root)) {
                 debug!("Output already exists for: {:?}", mkv_path);
                 continue;
             }
@@ -136,7 +150,6 @@ impl ScanCommand {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-    use tokio::fs;
 
     #[tokio::test]
     async fn test_scan_empty_directory() {

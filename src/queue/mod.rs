@@ -38,8 +38,8 @@ impl JobQueue {
 
     /// Add a job to the queue using atomic file operations
     pub async fn enqueue_job(&self, job: &Job) -> Result<()> {
-        let job_content = job.relative_path.to_string_lossy();
-        let job_filename = job.job_filename_from_source();
+        let job_content = serde_json::to_string_pretty(job)?;
+        let job_filename = job.job_filename();
         let job_path = self.queue_dir.join(&job_filename);
         let lock_dir = self.queue_dir.join(format!("{}.lock", job_filename));
 
@@ -85,14 +85,14 @@ impl JobQueue {
                         Ok(_) => {
                             debug!("Claimed job: {}", job_name);
 
-                            // Read job content
+                            // Read and deserialize job content
                             let content = async_fs::read_to_string(&in_progress_path).await?;
-                            let relative_path = PathBuf::from(content.trim());
+                            let job: Job = serde_json::from_str(&content)?;
 
                             return Ok(Some(ClaimedJob {
                                 queue: self,
                                 job_name: job_name.to_string(),
-                                relative_path,
+                                job,
                                 in_progress_path,
                             }));
                         }
@@ -110,7 +110,7 @@ impl JobQueue {
 
     /// Check if a job already exists in the queue
     pub async fn job_exists(&self, job: &Job) -> Result<bool> {
-        let job_filename = job.job_filename_from_source();
+        let job_filename = job.job_filename();
         let job_path = self.queue_dir.join(job_filename);
         Ok(job_path.exists())
     }
@@ -150,7 +150,7 @@ impl JobQueue {
 pub struct ClaimedJob<'a> {
     queue: &'a JobQueue,
     job_name: String,
-    pub relative_path: PathBuf,
+    pub job: Job,
     in_progress_path: PathBuf,
 }
 
@@ -178,7 +178,7 @@ impl<'a> ClaimedJob<'a> {
 
     /// Get the media file extension
     pub fn file_extension(&self) -> Option<&str> {
-        self.relative_path.extension()?.to_str()
+        self.job.input_path.extension()?.to_str()
     }
 }
 

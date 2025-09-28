@@ -50,9 +50,30 @@ fn test_scan_and_clean_workflow() {
 
     // Verify queue files were created
     assert!(temp_path.join("_queue").exists());
-    assert!(temp_path.join("_queue/video1.job").exists());
-    assert!(temp_path.join("_queue/video2.job").exists());
-    assert!(!temp_path.join("_queue/video3.job").exists());
+    
+    // Check that job files were created (they will have UUID names now)
+    let queue_dir = temp_path.join("_queue");
+    let job_files: Vec<_> = std::fs::read_dir(&queue_dir)
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path.extension()? == "job" {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect();
+    
+    assert_eq!(job_files.len(), 2, "Expected 2 job files to be created");
+    
+    // Check that video3.webm was not processed (no matching .vtt file)
+    assert!(
+        scan_output_text.contains("SKIPPING: Missing subtitle file"),
+        "Expected video3.webm to be skipped, got: {}",
+        scan_output_text
+    );
 
     // Test clean command
     let clean_output = Command::new("./target/debug/plexify")

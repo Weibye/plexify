@@ -7,8 +7,26 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Job {
     pub id: String,
-    pub relative_path: PathBuf,
+    pub input_path: PathBuf,
+    pub output_path: PathBuf,
+    pub subtitle_path: Option<PathBuf>,
     pub file_type: MediaFileType,
+    pub quality_settings: QualitySettings,
+    pub post_processing: PostProcessingSettings,
+}
+
+/// Quality settings for video encoding
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QualitySettings {
+    pub ffmpeg_preset: String,
+    pub ffmpeg_crf: String,
+    pub ffmpeg_audio_bitrate: String,
+}
+
+/// Post-processing settings for what to do after conversion
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PostProcessingSettings {
+    pub disable_source_files: bool,
 }
 
 /// Supported media file types
@@ -21,29 +39,42 @@ pub enum MediaFileType {
 }
 
 impl Job {
-    /// Create a new job for a media file
-    pub fn new(relative_path: PathBuf, file_type: MediaFileType) -> Self {
+    /// Create a new job for a media file with configuration
+    pub fn new(
+        input_path: PathBuf,
+        file_type: MediaFileType,
+        quality_settings: QualitySettings,
+        post_processing: PostProcessingSettings,
+    ) -> Self {
+        let output_path = match file_type {
+            MediaFileType::WebM => input_path.with_extension("mp4"),
+            MediaFileType::MKV => input_path.with_extension("mp4"),
+        };
+
+        let subtitle_path = match file_type {
+            MediaFileType::WebM => Some(input_path.with_extension("vtt")),
+            MediaFileType::MKV => None, // MKV uses embedded subtitles
+        };
+
         Self {
             id: Uuid::new_v4().to_string(),
-            relative_path,
+            input_path,
+            output_path,
+            subtitle_path,
             file_type,
+            quality_settings,
+            post_processing,
         }
     }
 
-    /// Get the output file path (same as input but with .mp4 extension)
-    pub fn output_path(&self) -> PathBuf {
-        match self.file_type {
-            MediaFileType::WebM => self.relative_path.with_extension("mp4"),
-            MediaFileType::MKV => self.relative_path.with_extension("mp4"),
-        }
-    }
-
-    /// Get the subtitle file path for WebM files
-    pub fn subtitle_path(&self) -> Option<PathBuf> {
-        match self.file_type {
-            MediaFileType::WebM => Some(self.relative_path.with_extension("vtt")),
-            MediaFileType::MKV => None, // MKV uses embedded subtitles
-        }
+    /// Create a new job for a media file with relative paths (backward compatibility)
+    pub fn new_relative(
+        relative_path: PathBuf,
+        file_type: MediaFileType,
+        quality_settings: QualitySettings,
+        post_processing: PostProcessingSettings,
+    ) -> Self {
+        Self::new(relative_path, file_type, quality_settings, post_processing)
     }
 
     /// Get the job file name for the queue
@@ -51,17 +82,33 @@ impl Job {
         format!("{}.job", self.id)
     }
 
-    /// Check if the output file already exists
-    pub fn output_exists(&self, media_root: &Path) -> bool {
-        media_root.join(self.output_path()).exists()
+    /// Check if the output file already exists (works with both absolute and relative paths)
+    pub fn output_exists(&self, media_root: Option<&Path>) -> bool {
+        let output_path = if self.output_path.is_absolute() {
+            self.output_path.clone()
+        } else {
+            match media_root {
+                Some(root) => root.join(&self.output_path),
+                None => self.output_path.clone(),
+            }
+        };
+        output_path.exists()
     }
 
-    /// For WebM files, check if the required subtitle file exists
-    pub fn has_required_subtitle(&self, media_root: &Path) -> Result<bool> {
+    /// For WebM files, check if the required subtitle file exists (works with both absolute and relative paths)
+    pub fn has_required_subtitle(&self, media_root: Option<&Path>) -> Result<bool> {
         match self.file_type {
             MediaFileType::WebM => {
-                if let Some(subtitle_path) = self.subtitle_path() {
-                    Ok(media_root.join(subtitle_path).exists())
+                if let Some(subtitle_path) = &self.subtitle_path {
+                    let full_subtitle_path = if subtitle_path.is_absolute() {
+                        subtitle_path.clone()
+                    } else {
+                        match media_root {
+                            Some(root) => root.join(subtitle_path),
+                            None => subtitle_path.clone(),
+                        }
+                    };
+                    Ok(full_subtitle_path.exists())
                 } else {
                     Err(anyhow!("WebM job should have subtitle path"))
                 }
@@ -70,14 +117,83 @@ impl Job {
         }
     }
 
+    /// Get the full input path (for absolute paths, returns as-is; for relative paths, joins with media_root)
+    pub fn full_input_path(&self, media_root: Option<&Path>) -> PathBuf {
+        if self.input_path.is_absolute() {
+            self.input_path.clone()
+        } else {
+            match media_root {
+                Some(root) => root.join(&self.input_path),
+                None => self.input_path.clone(),
+            }
+        }
+    }
+
+    /// Get the full output path (for absolute paths, returns as-is; for relative paths, joins with media_root)
+    pub fn full_output_path(&self, media_root: Option<&Path>) -> PathBuf {
+        if self.output_path.is_absolute() {
+            self.output_path.clone()
+        } else {
+            match media_root {
+                Some(root) => root.join(&self.output_path),
+                None => self.output_path.clone(),
+            }
+        }
+    }
+
+    /// Get the full subtitle path if it exists (for absolute paths, returns as-is; for relative paths, joins with media_root)
+    pub fn full_subtitle_path(&self, media_root: Option<&Path>) -> Option<PathBuf> {
+        self.subtitle_path.as_ref().map(|path| {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                match media_root {
+                    Some(root) => root.join(path),
+                    None => path.clone(),
+                }
+            }
+        })
+    }
+
     /// Create a job filename based on the source file (for compatibility)
     pub fn job_filename_from_source(&self) -> String {
         let stem = self
-            .relative_path
+            .input_path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");
         format!("{}.job", stem)
+    }
+}
+
+impl QualitySettings {
+    /// Create quality settings from environment variables with defaults
+    pub fn from_env() -> Self {
+        use std::env;
+        Self {
+            ffmpeg_preset: env::var("FFMPEG_PRESET").unwrap_or_else(|_| "veryfast".to_string()),
+            ffmpeg_crf: env::var("FFMPEG_CRF").unwrap_or_else(|_| "23".to_string()),
+            ffmpeg_audio_bitrate: env::var("FFMPEG_AUDIO_BITRATE")
+                .unwrap_or_else(|_| "128k".to_string()),
+        }
+    }
+}
+
+impl Default for QualitySettings {
+    fn default() -> Self {
+        Self {
+            ffmpeg_preset: "veryfast".to_string(),
+            ffmpeg_crf: "23".to_string(),
+            ffmpeg_audio_bitrate: "128k".to_string(),
+        }
+    }
+}
+
+impl Default for PostProcessingSettings {
+    fn default() -> Self {
+        Self {
+            disable_source_files: true,
+        }
     }
 }
 
@@ -88,19 +204,50 @@ mod tests {
 
     #[test]
     fn test_webm_job_creation() {
-        let job = Job::new(PathBuf::from("video.webm"), MediaFileType::WebM);
-        assert_eq!(job.relative_path, PathBuf::from("video.webm"));
+        let quality = QualitySettings::default();
+        let post_processing = PostProcessingSettings::default();
+        let job = Job::new_relative(
+            PathBuf::from("video.webm"),
+            MediaFileType::WebM,
+            quality,
+            post_processing,
+        );
+        assert_eq!(job.input_path, PathBuf::from("video.webm"));
         assert_eq!(job.file_type, MediaFileType::WebM);
-        assert_eq!(job.output_path(), PathBuf::from("video.mp4"));
-        assert_eq!(job.subtitle_path(), Some(PathBuf::from("video.vtt")));
+        assert_eq!(job.output_path, PathBuf::from("video.mp4"));
+        assert_eq!(job.subtitle_path, Some(PathBuf::from("video.vtt")));
     }
 
     #[test]
     fn test_mkv_job_creation() {
-        let job = Job::new(PathBuf::from("video.mkv"), MediaFileType::MKV);
-        assert_eq!(job.relative_path, PathBuf::from("video.mkv"));
+        let quality = QualitySettings::default();
+        let post_processing = PostProcessingSettings::default();
+        let job = Job::new_relative(
+            PathBuf::from("video.mkv"),
+            MediaFileType::MKV,
+            quality,
+            post_processing,
+        );
+        assert_eq!(job.input_path, PathBuf::from("video.mkv"));
         assert_eq!(job.file_type, MediaFileType::MKV);
-        assert_eq!(job.output_path(), PathBuf::from("video.mp4"));
-        assert_eq!(job.subtitle_path(), None);
+        assert_eq!(job.output_path, PathBuf::from("video.mp4"));
+        assert_eq!(job.subtitle_path, None);
+    }
+
+    #[test]
+    fn test_quality_settings_from_env() {
+        std::env::set_var("FFMPEG_PRESET", "fast");
+        std::env::set_var("FFMPEG_CRF", "20");
+        std::env::set_var("FFMPEG_AUDIO_BITRATE", "192k");
+
+        let quality = QualitySettings::from_env();
+        assert_eq!(quality.ffmpeg_preset, "fast");
+        assert_eq!(quality.ffmpeg_crf, "20");
+        assert_eq!(quality.ffmpeg_audio_bitrate, "192k");
+
+        // Clean up
+        std::env::remove_var("FFMPEG_PRESET");
+        std::env::remove_var("FFMPEG_CRF");
+        std::env::remove_var("FFMPEG_AUDIO_BITRATE");
     }
 }

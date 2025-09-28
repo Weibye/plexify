@@ -6,7 +6,6 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::Config;
 use crate::ffmpeg::FFmpegProcessor;
-use crate::job::{Job, MediaFileType};
 use crate::queue::JobQueue;
 
 /// Command to process jobs from the queue
@@ -98,31 +97,25 @@ impl WorkCommand {
         if let Some(claimed_job) = queue.claim_job().await? {
             info!("➡️ Claimed job: {}", claimed_job.job_name());
 
-            // Determine the job type from file extension
-            let file_type = match claimed_job.file_extension() {
-                Some("webm") => MediaFileType::WebM,
-                Some("mkv") => MediaFileType::MKV,
-                _ => {
-                    error!(
-                        "❌ Unknown file extension for job: {:?}",
-                        claimed_job.relative_path
-                    );
-                    claimed_job.return_to_queue().await?;
-                    return Ok(true); // We processed something (even if it failed)
-                }
+            // Get the job details directly from the job file
+            let job = &claimed_job.job;
+
+            // Process the job with FFmpeg using the job's own media_root (for absolute paths) or self.media_root (for relative paths)
+            let media_root = if job.input_path.is_absolute() {
+                None
+            } else {
+                Some(self.media_root.as_path())
             };
 
-            // Create job object for processing
-            let job = Job::new(claimed_job.relative_path.clone(), file_type);
-
-            // Process the job with FFmpeg
             let job_name = claimed_job.job_name().to_string();
-            match processor.process_job(&job, &self.media_root).await {
+            match processor.process_job(job, media_root).await {
                 Ok(_) => {
-                    // Conversion successful - disable source files and mark job complete
-                    if let Err(e) = processor.disable_source_files(&job, &self.media_root).await {
-                        warn!("Failed to disable source files: {}", e);
-                        // Continue anyway, the conversion was successful
+                    // Conversion successful - disable source files if configured and mark job complete
+                    if job.post_processing.disable_source_files {
+                        if let Err(e) = processor.disable_source_files(job, media_root).await {
+                            warn!("Failed to disable source files: {}", e);
+                            // Continue anyway, the conversion was successful
+                        }
                     }
 
                     claimed_job.complete().await?;
