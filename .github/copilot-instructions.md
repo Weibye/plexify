@@ -44,6 +44,34 @@ src/
 4. **Performance**: Consider memory usage for large media file operations
 5. **Safety**: Use `PathBuf` for all file system operations
 
+### Quality Checks - MANDATORY BEFORE FINISHING
+
+**ALL agents MUST run these quality checks before finishing any work and ensure they pass:**
+
+1. **Build Check**: `cargo build` - Must succeed without errors
+2. **Test Check**: `cargo test` - All tests must pass
+3. **Format Check**: `cargo fmt --all -- --check` - Code must be properly formatted
+4. **Clippy Check**: `cargo clippy --all-targets --all-features` - Must pass without errors (warnings are acceptable)
+
+**If any check fails, the agent MUST fix the issues before completing the task.**
+
+These checks mirror the CI/CD pipeline and ensure code quality is maintained. The agent should run these checks:
+- After making any code changes
+- Before using the report_progress tool to finalize work
+- If checks fail, fix issues and re-run all checks until they pass
+
+### CI/CD Pipeline
+
+The repository includes a comprehensive CI/CD pipeline (`.github/workflows/ci.yml`) with the following jobs:
+
+1. **Test Job**: Builds and runs all tests (`cargo build && cargo test`)
+2. **Format Job**: Validates code formatting (`cargo fmt --all -- --check`)
+3. **Clippy Job**: Runs linting checks (`cargo clippy --all-targets --all-features`)
+4. **Security Audit**: Scans dependencies for vulnerabilities using `cargo audit`
+5. **All Checks Job**: Ensures all above jobs pass before allowing merges
+
+**All jobs must pass for PRs to be merged.** Agents must ensure their changes pass these same checks locally.
+
 ### Pull Request Standards
 1. Any transient information, like feature x is now faster, feature y has changed, etc. belongs to the PR description and the changelog, and only those two placed. Code, documentation, and tests must be self-explanatory and not contain any transient information. They should be valid for the lifetime of the code and reflect the current state of the code.
 2. Pull requests should be short, succinct, and focused. No need to repeat unnecessary information.
@@ -102,8 +130,17 @@ Key environment variables:
 
 ### Job Creation
 ```rust
-let job = Job::new(relative_path, MediaFileType::WebM);
-if !job.output_exists(&media_root) && job.has_required_subtitle(&media_root)? {
+let quality_settings = QualitySettings::from_env();
+let post_processing = PostProcessingSettings::default();
+
+let job = Job::new(
+    relative_path,
+    MediaFileType::WebM,
+    quality_settings,
+    post_processing,
+);
+
+if !job.output_exists(Some(&media_root)) && job.has_required_subtitle(Some(&media_root))? {
     queue.enqueue_job(&job).await?;
 }
 ```
@@ -128,6 +165,29 @@ if let Err(e) = result {
 3. **Mock External Dependencies**: Use temp directories for file system tests
 4. **Error Cases**: Test error conditions and edge cases
 5. **Async Tests**: Use `#[tokio::test]` for async test functions
+
+### Local Quality Checks
+
+Before submitting any changes, run these commands locally to ensure code quality:
+
+```bash
+# Format code (auto-fix)
+cargo fmt
+
+# Build and check for errors
+cargo build
+
+# Run all tests
+cargo test
+
+# Check code formatting (must pass)
+cargo fmt --all -- --check
+
+# Run linter (must pass)
+cargo clippy --all-targets --all-features
+```
+
+**Note**: The `cargo fmt --all -- --check` and `cargo clippy` commands must pass without errors for CI to succeed.
 
 ## CLI Usage Patterns
 
