@@ -46,7 +46,40 @@ sudo yum install ffmpeg
 
 ## Installation
 
-### Option 1: From Source
+### Option 1: Pre-built Binaries (Recommended)
+
+Download the latest release from the [GitHub releases page](https://github.com/Weibye/plexify/releases):
+
+1. **Download the binary for your platform:**
+   - **Linux (x86_64)**: `plexify-linux-amd64`
+   - **Linux (ARM64)**: `plexify-linux-arm64`
+   - **Windows (x86_64)**: `plexify-windows-amd64.exe`
+   - **macOS (Intel)**: `plexify-macos-amd64`
+   - **macOS (Apple Silicon)**: `plexify-macos-arm64`
+
+2. **Verify the download (recommended):**
+   ```bash
+   # Linux/macOS
+   sha256sum -c plexify-*.sha256
+   
+   # Windows PowerShell
+   Get-FileHash plexify-windows-amd64.exe -Algorithm SHA256
+   ```
+
+3. **Make executable (Linux/macOS only):**
+   ```bash
+   chmod +x plexify-*
+   ```
+
+4. **Move to system PATH (optional):**
+   ```bash
+   # Linux/macOS
+   sudo mv plexify-* /usr/local/bin/plexify
+   
+   # Windows: Move to a directory in your PATH
+   ```
+
+### Option 2: From Source
 
 1. Clone the repository:
 ```bash
@@ -66,9 +99,107 @@ cargo build --release
 cargo install --path .
 ```
 
-### Option 2: Pre-built Binaries (Coming Soon)
+### Keeping Systems Updated
 
-Pre-built binaries for Linux, macOS, and Windows will be available in the GitHub releases.
+#### Automated Updates (Recommended)
+
+For production worker nodes, create an update script to automatically fetch the latest release:
+
+**Linux/macOS (`update-plexify.sh`):**
+```bash
+#!/bin/bash
+set -e
+
+REPO="Weibye/plexify"
+INSTALL_DIR="/usr/local/bin"
+PLATFORM=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m)
+
+# Map architecture names
+case $ARCH in
+  x86_64) ARCH="amd64" ;;
+  aarch64|arm64) ARCH="arm64" ;;
+  *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
+esac
+
+# Get latest release info
+LATEST_RELEASE=$(curl -s "https://api.github.com/repos/$REPO/releases/latest")
+VERSION=$(echo "$LATEST_RELEASE" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+BINARY_NAME="plexify-${PLATFORM}-${ARCH}"
+
+echo "Updating plexify to version $VERSION"
+
+# Download binary and checksum
+curl -L -o "/tmp/$BINARY_NAME" \
+  "https://github.com/$REPO/releases/download/$VERSION/$BINARY_NAME"
+curl -L -o "/tmp/$BINARY_NAME.sha256" \
+  "https://github.com/$REPO/releases/download/$VERSION/$BINARY_NAME.sha256"
+
+# Verify checksum
+cd /tmp && sha256sum -c "$BINARY_NAME.sha256"
+
+# Install
+chmod +x "/tmp/$BINARY_NAME"
+sudo mv "/tmp/$BINARY_NAME" "$INSTALL_DIR/plexify"
+
+echo "Successfully updated plexify to $VERSION"
+plexify --version || echo "plexify installed at $INSTALL_DIR/plexify"
+```
+
+**Windows PowerShell (`Update-Plexify.ps1`):**
+```powershell
+param(
+    [string]$InstallDir = "$env:USERPROFILE\bin"
+)
+
+$ErrorActionPreference = "Stop"
+
+$repo = "Weibye/plexify"
+$binaryName = "plexify-windows-amd64.exe"
+
+# Create install directory if it doesn't exist
+if (!(Test-Path $InstallDir)) {
+    New-Item -ItemType Directory -Path $InstallDir -Force
+}
+
+# Get latest release
+$release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest"
+$version = $release.tag_name
+
+Write-Host "Updating plexify to version $version"
+
+# Download binary
+$binaryUrl = "https://github.com/$repo/releases/download/$version/$binaryName"
+$checksumUrl = "https://github.com/$repo/releases/download/$version/$binaryName.sha256"
+
+$tempBinary = "$env:TEMP\$binaryName"
+$tempChecksum = "$env:TEMP\$binaryName.sha256"
+
+Invoke-WebRequest -Uri $binaryUrl -OutFile $tempBinary
+Invoke-WebRequest -Uri $checksumUrl -OutFile $tempChecksum
+
+# Verify checksum
+$expectedHash = (Get-Content $tempChecksum).Split()[0]
+$actualHash = (Get-FileHash $tempBinary -Algorithm SHA256).Hash
+
+if ($expectedHash.ToUpper() -ne $actualHash.ToUpper()) {
+    throw "Checksum verification failed"
+}
+
+# Install
+$installPath = Join-Path $InstallDir "plexify.exe"
+Move-Item $tempBinary $installPath -Force
+
+Write-Host "Successfully updated plexify to $version"
+Write-Host "Binary installed at: $installPath"
+```
+
+#### Manual Updates
+
+1. Check the [releases page](https://github.com/Weibye/plexify/releases) for new versions
+2. Download the appropriate binary for your platform
+3. Replace your existing binary
+4. Verify the installation: `plexify --version`
 
 ## Usage
 
