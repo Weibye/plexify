@@ -28,6 +28,20 @@ impl JobQueue {
         }
     }
 
+    /// Create a new job queue with custom queue directory (detached from media directory)
+    pub fn new_detached(media_root: PathBuf, queue_root: PathBuf) -> Self {
+        let queue_dir = queue_root.join("_queue");
+        let in_progress_dir = queue_root.join("_in_progress");
+        let completed_dir = queue_root.join("_completed");
+
+        Self {
+            media_root,
+            queue_dir,
+            in_progress_dir,
+            completed_dir,
+        }
+    }
+
     /// Initialize queue directories
     pub async fn init(&self) -> Result<()> {
         async_fs::create_dir_all(&self.queue_dir).await?;
@@ -185,6 +199,7 @@ impl<'a> ClaimedJob<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job::{Job, MediaFileType, PostProcessingSettings, QualitySettings};
     use tempfile::TempDir;
     use tokio::test;
 
@@ -198,5 +213,55 @@ mod tests {
         assert!(queue.queue_dir.exists());
         assert!(queue.in_progress_dir.exists());
         assert!(queue.completed_dir.exists());
+    }
+
+    #[test]
+    async fn test_detached_queue_initialization() {
+        let media_dir = TempDir::new().unwrap();
+        let queue_dir = TempDir::new().unwrap();
+        let queue = JobQueue::new_detached(
+            media_dir.path().to_path_buf(),
+            queue_dir.path().to_path_buf(),
+        );
+
+        queue.init().await.unwrap();
+
+        // Queue directories should be in the separate queue directory
+        assert!(queue_dir.path().join("_queue").exists());
+        assert!(queue_dir.path().join("_in_progress").exists());
+        assert!(queue_dir.path().join("_completed").exists());
+
+        // Media directory should be clean
+        assert!(!media_dir.path().join("_queue").exists());
+    }
+
+    #[test]
+    async fn test_job_enqueue_and_claim() {
+        let temp_dir = TempDir::new().unwrap();
+        let queue = JobQueue::new(temp_dir.path().to_path_buf());
+        queue.init().await.unwrap();
+
+        let quality = QualitySettings::default();
+        let post_processing = PostProcessingSettings::default();
+        let job = Job::new_relative(
+            PathBuf::from("test.webm"),
+            MediaFileType::WebM,
+            quality,
+            post_processing,
+        );
+
+        // Enqueue job
+        queue.enqueue_job(&job).await.unwrap();
+
+        // Claim job
+        let claimed = queue.claim_job().await.unwrap().unwrap();
+        assert_eq!(claimed.job.input_path, PathBuf::from("test.webm"));
+        assert_eq!(claimed.job.file_type, MediaFileType::WebM);
+
+        // Mark as complete
+        claimed.complete().await.unwrap();
+
+        // Should be no more jobs
+        assert!(queue.claim_job().await.unwrap().is_none());
     }
 }

@@ -250,4 +250,78 @@ mod tests {
         std::env::remove_var("FFMPEG_CRF");
         std::env::remove_var("FFMPEG_AUDIO_BITRATE");
     }
+
+    #[test]
+    fn test_absolute_paths() {
+        let quality = QualitySettings::default();
+        let post_processing = PostProcessingSettings::default();
+        let job = Job::new(
+            PathBuf::from("/absolute/path/video.webm"),
+            MediaFileType::WebM,
+            quality,
+            post_processing,
+        );
+
+        // Test that absolute paths work without media_root
+        assert_eq!(job.full_input_path(None), PathBuf::from("/absolute/path/video.webm"));
+        assert_eq!(job.full_output_path(None), PathBuf::from("/absolute/path/video.mp4"));
+        assert_eq!(job.full_subtitle_path(None), Some(PathBuf::from("/absolute/path/video.vtt")));
+
+        // Test that absolute paths ignore media_root
+        let media_root = PathBuf::from("/different/root");
+        assert_eq!(job.full_input_path(Some(&media_root)), PathBuf::from("/absolute/path/video.webm"));
+        assert_eq!(job.full_output_path(Some(&media_root)), PathBuf::from("/absolute/path/video.mp4"));
+    }
+
+    #[test]
+    fn test_relative_paths_with_media_root() {
+        let quality = QualitySettings::default();
+        let post_processing = PostProcessingSettings::default();
+        let job = Job::new_relative(
+            PathBuf::from("relative/video.mkv"),
+            MediaFileType::MKV,
+            quality,
+            post_processing,
+        );
+
+        let media_root = PathBuf::from("/media/root");
+        
+        // Test that relative paths are resolved with media_root
+        assert_eq!(job.full_input_path(Some(&media_root)), PathBuf::from("/media/root/relative/video.mkv"));
+        assert_eq!(job.full_output_path(Some(&media_root)), PathBuf::from("/media/root/relative/video.mp4"));
+        assert_eq!(job.full_subtitle_path(Some(&media_root)), None); // MKV has no external subtitles
+        
+        // Test that relative paths work without media_root (use as-is)
+        assert_eq!(job.full_input_path(None), PathBuf::from("relative/video.mkv"));
+        assert_eq!(job.full_output_path(None), PathBuf::from("relative/video.mp4"));
+    }
+
+    #[test]
+    fn test_job_serialization() {
+        let quality = QualitySettings {
+            ffmpeg_preset: "medium".to_string(),
+            ffmpeg_crf: "18".to_string(),
+            ffmpeg_audio_bitrate: "256k".to_string(),
+        };
+        let post_processing = PostProcessingSettings {
+            disable_source_files: false,
+        };
+        let job = Job::new_relative(
+            PathBuf::from("test.webm"),
+            MediaFileType::WebM,
+            quality.clone(),
+            post_processing.clone(),
+        );
+
+        // Test JSON serialization/deserialization
+        let json = serde_json::to_string(&job).unwrap();
+        let deserialized: Job = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(job.input_path, deserialized.input_path);
+        assert_eq!(job.output_path, deserialized.output_path);
+        assert_eq!(job.subtitle_path, deserialized.subtitle_path);
+        assert_eq!(job.file_type, deserialized.file_type);
+        assert_eq!(job.quality_settings.ffmpeg_preset, deserialized.quality_settings.ffmpeg_preset);
+        assert_eq!(job.post_processing.disable_source_files, deserialized.post_processing.disable_source_files);
+    }
 }
