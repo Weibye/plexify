@@ -220,11 +220,13 @@ mod tests {
         let post_processing = PostProcessingSettings {
             disable_source_files: false,
         };
+        let media_root = temp_dir.path();
         let job = Job::new(
             PathBuf::from("test.mkv"),
             MediaFileType::Mkv,
             quality,
             post_processing,
+            media_root,
         );
 
         let work_output_path = job.work_folder_output_path(work_folder);
@@ -263,6 +265,7 @@ mod tests {
             MediaFileType::Mkv,
             quality,
             post_processing,
+            &media_folder,
         );
 
         // Create a dummy file in the work folder
@@ -274,15 +277,15 @@ mod tests {
         let config = Config::default();
         let processor = FFmpegProcessor::new(config, false);
 
-        // Move the file
+        // Move the file - since job now has absolute paths, pass None for media_root
         processor
-            .move_to_destination(&job, Some(&media_folder), &work_folder)
+            .move_to_destination(&job, None, &work_folder)
             .await
             .unwrap();
 
         // Verify the file was moved
         assert!(!work_output_path.exists());
-        let final_path = job.full_output_path(Some(&media_folder));
+        let final_path = job.full_output_path(None);
         assert!(final_path.exists());
 
         let content = tokio::fs::read_to_string(&final_path).await.unwrap();

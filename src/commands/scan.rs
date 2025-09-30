@@ -115,7 +115,7 @@ impl ScanCommand {
 
         // Process WebM files (require VTT subtitles)
         for webm_path in webm_files {
-            let job = Job::new_with_media_root(
+            let job = Job::new(
                 webm_path.clone(),
                 MediaFileType::WebM,
                 quality_settings.clone(),
@@ -149,7 +149,7 @@ impl ScanCommand {
 
         // Process MKV files (embedded subtitles)
         for mkv_path in mkv_files {
-            let job = Job::new_with_media_root(
+            let job = Job::new(
                 mkv_path.clone(),
                 MediaFileType::Mkv,
                 quality_settings.clone(),
