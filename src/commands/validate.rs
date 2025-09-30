@@ -6,29 +6,37 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 use walkdir::WalkDir;
 
+/// Media file extensions that should be validated
+const MEDIA_EXTENSIONS: &[&str] = &["mkv", "mp4", "avi", "webm", "mov", "m4v"];
+
+/// Content type for categorizing naming patterns
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ContentType {
+    Show,
+    Movie,
+}
+
+/// Directory mapping configuration
+const DIRECTORY_MAPPING: &[(&str, ContentType)] = &[
+    ("Anime", ContentType::Show),
+    ("Series", ContentType::Show),
+    ("Movies", ContentType::Movie),
+];
+
 /// Naming scheme patterns for different content types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamingPatterns {
-    /// TV Show patterns
-    pub tv_shows: Vec<TvShowPattern>,
-    /// Movie patterns  
-    pub movies: Vec<MoviePattern>,
+    /// All naming patterns
+    pub patterns: Vec<NamingPattern>,
 }
 
-/// TV Show naming pattern
+/// Unified naming pattern
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TvShowPattern {
+pub struct NamingPattern {
     pub description: String,
     pub pattern: String,
     pub example: String,
-}
-
-/// Movie naming pattern
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MoviePattern {
-    pub description: String,
-    pub pattern: String,
-    pub example: String,
+    pub content_type: ContentType,
 }
 
 /// Validation issue found in a media file
@@ -43,7 +51,7 @@ pub struct ValidationIssue {
 /// Types of naming issues
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IssueType {
-    TvShowNaming,
+    ShowNaming,
     MovieNaming,
     DirectoryStructure,
     FileExtension,
@@ -68,38 +76,51 @@ pub struct ValidateCommand {
 impl Default for NamingPatterns {
     fn default() -> Self {
         Self {
-            tv_shows: vec![
-                TvShowPattern {
-                    description: "Standard TV Show format".to_string(),
-                    pattern: r"^TV Shows/[^/]+/Season \d{2}/[^/]+ - s\d{2}e\d{2} - [^/]+\.\w+$"
-                        .to_string(),
-                    example: "TV Shows/Breaking Bad/Season 01/Breaking Bad - s01e01 - Pilot.mkv"
-                        .to_string(),
+            patterns: vec![
+                // Anime patterns (shows)
+                NamingPattern {
+                    description: "Standard Anime format".to_string(),
+                    pattern: r"^Anime/[^/]+/Season \d{2}/[^/]+ - s\d{2}e\d{2} - [^/]+\.\w+$".to_string(),
+                    example: "Anime/Attack on Titan/Season 01/Attack on Titan - s01e01 - To You, in 2000 Years.mkv".to_string(),
+                    content_type: ContentType::Show,
                 },
-                TvShowPattern {
-                    description: "Alternative TV Show format".to_string(),
-                    pattern: r"^TV Shows/[^/]+/Season \d{2}/[^/]+ S\d{2}E\d{2} [^/]+\.\w+$"
-                        .to_string(),
-                    example: "TV Shows/Breaking Bad/Season 01/Breaking Bad S01E01 Pilot.mkv"
-                        .to_string(),
+                NamingPattern {
+                    description: "Alternative Anime format".to_string(),
+                    pattern: r"^Anime/[^/]+/Season \d{2}/[^/]+ S\d{2}E\d{2} [^/]+\.\w+$".to_string(),
+                    example: "Anime/Attack on Titan/Season 01/Attack on Titan S01E01 To You, in 2000 Years.mkv".to_string(),
+                    content_type: ContentType::Show,
                 },
-                TvShowPattern {
-                    description: "Simple TV Show format".to_string(),
-                    pattern: r"^TV Shows/[^/]+/Season \d{2}/S\d{2}E\d{2} - [^/]+\.\w+$".to_string(),
-                    example: "TV Shows/Breaking Bad/Season 01/S01E01 - Pilot.mkv".to_string(),
+                // Series patterns (shows)  
+                NamingPattern {
+                    description: "Standard Series format".to_string(),
+                    pattern: r"^Series/[^/]+/Season \d{2}/[^/]+ - s\d{2}e\d{2} - [^/]+\.\w+$".to_string(),
+                    example: "Series/Breaking Bad/Season 01/Breaking Bad - s01e01 - Pilot.mkv".to_string(),
+                    content_type: ContentType::Show,
                 },
-            ],
-            movies: vec![
-                MoviePattern {
+                NamingPattern {
+                    description: "Alternative Series format".to_string(),
+                    pattern: r"^Series/[^/]+/Season \d{2}/[^/]+ S\d{2}E\d{2} [^/]+\.\w+$".to_string(),
+                    example: "Series/Breaking Bad/Season 01/Breaking Bad S01E01 Pilot.mkv".to_string(),
+                    content_type: ContentType::Show,
+                },
+                NamingPattern {
+                    description: "Simple Series format".to_string(),
+                    pattern: r"^Series/[^/]+/Season \d{2}/S\d{2}E\d{2} - [^/]+\.\w+$".to_string(),
+                    example: "Series/Breaking Bad/Season 01/S01E01 - Pilot.mkv".to_string(),
+                    content_type: ContentType::Show,
+                },
+                // Movie patterns
+                NamingPattern {
                     description: "Standard Movie format".to_string(),
                     pattern: r"^Movies/[^/]+ \(\d{4}\)/[^/]+ \(\d{4}\)\.\w+$".to_string(),
                     example: "Movies/The Dark Knight (2008)/The Dark Knight (2008).mkv".to_string(),
+                    content_type: ContentType::Movie,
                 },
-                MoviePattern {
+                NamingPattern {
                     description: "Collection Movie format".to_string(),
                     pattern: r"^Movies/[^/]+ Collection/[^/]+ \(\d{4}\)\.\w+$".to_string(),
-                    example: "Movies/Marvel Cinematic Universe Collection/Iron Man (2008).mkv"
-                        .to_string(),
+                    example: "Movies/Marvel Cinematic Universe Collection/Iron Man (2008).mkv".to_string(),
+                    content_type: ContentType::Movie,
                 },
             ],
         }
@@ -154,7 +175,7 @@ impl ValidateCommand {
             // Check if it's a media file
             if let Some(extension) = path.extension() {
                 let ext = extension.to_string_lossy().to_lowercase();
-                if matches!(ext.as_str(), "mkv" | "mp4" | "avi" | "webm" | "mov" | "m4v") {
+                if MEDIA_EXTENSIONS.contains(&ext.as_str()) {
                     report.scanned_files += 1;
 
                     // Get relative path from media root
@@ -187,44 +208,41 @@ impl ValidateCommand {
 
         debug!("Validating path: {}", path_str);
 
-        // Try TV show patterns first
-        for pattern in &self.patterns.tv_shows {
+        // Try all patterns
+        for pattern in &self.patterns.patterns {
             if let Ok(regex) = Regex::new(&pattern.pattern) {
                 if regex.is_match(&path_str) {
-                    debug!("Path matches TV show pattern: {}", pattern.description);
-                    return None; // Valid
-                }
-            }
-        }
-
-        // Try movie patterns
-        for pattern in &self.patterns.movies {
-            if let Ok(regex) = Regex::new(&pattern.pattern) {
-                if regex.is_match(&path_str) {
-                    debug!("Path matches movie pattern: {}", pattern.description);
+                    debug!(
+                        "Path matches {} pattern: {}",
+                        match pattern.content_type {
+                            ContentType::Show => "show",
+                            ContentType::Movie => "movie",
+                        },
+                        pattern.description
+                    );
                     return None; // Valid
                 }
             }
         }
 
         // If we reach here, the file doesn't match any pattern
-        let issue_type = if path_str.starts_with("TV Shows/") {
-            IssueType::TvShowNaming
-        } else if path_str.starts_with("Movies/") {
-            IssueType::MovieNaming
-        } else {
-            IssueType::DirectoryStructure
-        };
+        // Determine the expected content type based on directory
+        let issue_type = self.determine_issue_type(&path_str);
 
         let description = match issue_type {
-            IssueType::TvShowNaming => {
-                "TV show file doesn't match expected naming pattern".to_string()
-            }
+            IssueType::ShowNaming => "Show file doesn't match expected naming pattern".to_string(),
             IssueType::MovieNaming => {
                 "Movie file doesn't match expected naming pattern".to_string()
             }
             IssueType::DirectoryStructure => {
-                "File is not in a recognized directory structure (Movies/ or TV Shows/)".to_string()
+                format!(
+                    "File is not in a recognized directory structure ({})",
+                    DIRECTORY_MAPPING
+                        .iter()
+                        .map(|(dir, _)| *dir)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
             }
             _ => "Unknown naming issue".to_string(),
         };
@@ -235,6 +253,19 @@ impl ValidateCommand {
             description,
             suggested_path: self.suggest_path(&path_str, &issue_type),
         })
+    }
+
+    /// Determine issue type based on directory structure
+    fn determine_issue_type(&self, path_str: &str) -> IssueType {
+        for (dir_name, content_type) in DIRECTORY_MAPPING {
+            if path_str.starts_with(&format!("{}/", dir_name)) {
+                return match content_type {
+                    ContentType::Show => IssueType::ShowNaming,
+                    ContentType::Movie => IssueType::MovieNaming,
+                };
+            }
+        }
+        IssueType::DirectoryStructure
     }
 
     /// Suggest a corrected path for a file
@@ -294,7 +325,7 @@ impl ValidateCommand {
 
         for issue in &report.issues {
             let issue_type_str = match issue.issue_type {
-                IssueType::TvShowNaming => "TV Show Naming",
+                IssueType::ShowNaming => "Show Naming",
                 IssueType::MovieNaming => "Movie Naming",
                 IssueType::DirectoryStructure => "Directory Structure",
                 IssueType::FileExtension => "File Extension",
@@ -319,13 +350,32 @@ impl ValidateCommand {
 
         println!("\n💡 Supported Patterns:");
         println!("─────────────────────");
-        println!("📺 TV Shows:");
-        for pattern in &report.patterns_used.tv_shows {
-            println!("   • {}", pattern.example);
+
+        let show_patterns: Vec<_> = report
+            .patterns_used
+            .patterns
+            .iter()
+            .filter(|p| p.content_type == ContentType::Show)
+            .collect();
+        let movie_patterns: Vec<_> = report
+            .patterns_used
+            .patterns
+            .iter()
+            .filter(|p| p.content_type == ContentType::Movie)
+            .collect();
+
+        if !show_patterns.is_empty() {
+            println!("📺 Shows:");
+            for pattern in show_patterns {
+                println!("   • {}", pattern.example);
+            }
         }
-        println!("\n🎬 Movies:");
-        for pattern in &report.patterns_used.movies {
-            println!("   • {}", pattern.example);
+
+        if !movie_patterns.is_empty() {
+            println!("\n🎬 Movies:");
+            for pattern in movie_patterns {
+                println!("   • {}", pattern.example);
+            }
         }
     }
 }
@@ -354,10 +404,33 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let media_root = temp_dir.path();
 
-        // Create correctly named TV show
-        let tv_path = media_root.join("TV Shows/Breaking Bad/Season 01");
+        // Create correctly named TV show (using Series instead of TV Shows)
+        let tv_path = media_root.join("Series/Breaking Bad/Season 01");
         fs::create_dir_all(&tv_path).unwrap();
         fs::write(tv_path.join("Breaking Bad - s01e01 - Pilot.mkv"), "").unwrap();
+
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let result = validate_cmd.execute().await;
+
+        assert!(result.is_ok());
+        let report = result.unwrap();
+        assert_eq!(report.scanned_files, 1);
+        assert_eq!(report.issues.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_validate_correct_anime() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        // Create correctly named anime
+        let anime_path = media_root.join("Anime/Attack on Titan/Season 01");
+        fs::create_dir_all(&anime_path).unwrap();
+        fs::write(
+            anime_path.join("Attack on Titan - s01e01 - To You, in 2000 Years.mkv"),
+            "",
+        )
+        .unwrap();
 
         let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
         let result = validate_cmd.execute().await;
@@ -396,8 +469,8 @@ mod tests {
         fs::create_dir_all(media_root.join("Random")).unwrap();
         fs::write(media_root.join("Random/some_movie.mkv"), "").unwrap();
 
-        fs::create_dir_all(media_root.join("TV Shows/Show")).unwrap();
-        fs::write(media_root.join("TV Shows/Show/episode.mkv"), "").unwrap();
+        fs::create_dir_all(media_root.join("Series/Show")).unwrap();
+        fs::write(media_root.join("Series/Show/episode.mkv"), "").unwrap();
 
         let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
         let result = validate_cmd.execute().await;
