@@ -1,8 +1,10 @@
 use anyhow::{anyhow, Result};
+use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
 use walkdir::WalkDir;
@@ -81,9 +83,7 @@ pub struct ValidateCommand {
 /// Internal structure for compiled regex patterns
 #[derive(Debug, Clone)]
 struct CompiledPattern {
-    description: String,
     regex: Regex,
-    content_type: ContentType,
 }
 
 impl Default for NamingPatterns {
@@ -152,7 +152,7 @@ impl ValidateCommand {
     pub fn new(media_root: PathBuf) -> Self {
         let patterns = NamingPatterns::default();
         let compiled_patterns = Self::compile_patterns(&patterns);
-        
+
         Self {
             media_root,
             patterns,
@@ -165,17 +165,14 @@ impl ValidateCommand {
         patterns
             .patterns
             .iter()
-            .filter_map(|pattern| {
-                match Regex::new(&pattern.pattern) {
-                    Ok(regex) => Some(CompiledPattern {
-                        description: pattern.description.clone(),
-                        regex,
-                        content_type: pattern.content_type.clone(),
-                    }),
-                    Err(e) => {
-                        debug!("Failed to compile regex pattern '{}': {}", pattern.pattern, e);
-                        None
-                    }
+            .filter_map(|pattern| match Regex::new(&pattern.pattern) {
+                Ok(regex) => Some(CompiledPattern { regex }),
+                Err(e) => {
+                    debug!(
+                        "Failed to compile regex pattern '{}': {}",
+                        pattern.pattern, e
+                    );
+                    None
                 }
             })
             .collect()
@@ -184,7 +181,7 @@ impl ValidateCommand {
     /// Execute the validation command
     pub async fn execute(&self) -> Result<ValidationReport> {
         let start_time = Instant::now();
-        
+
         if !self.media_root.exists() {
             return Err(anyhow!(
                 "Media directory does not exist: {:?}",
@@ -199,18 +196,12 @@ impl ValidateCommand {
         info!("🔍 Validating Plex naming scheme in: {:?}", self.media_root);
         info!("📁 Recursively scanning all subdirectories...");
 
-        let mut report = ValidationReport {
-            scanned_files: 0,
-            issues: Vec::new(),
-            patterns_used: self.patterns.clone(),
-            scan_path: self.media_root.clone(),
-            validation_time: Duration::from_secs(0), // Will be set at the end
-        };
-
         // Create a lookup set for media extensions for faster checks
-        let media_extensions: std::collections::HashSet<&str> = MEDIA_EXTENSIONS.iter().copied().collect();
+        let media_extensions: std::collections::HashSet<&str> =
+            MEDIA_EXTENSIONS.iter().copied().collect();
 
-        // Walk through the directory to find media files
+        // First, collect all media files
+        let mut media_files = Vec::new();
         for entry in WalkDir::new(&self.media_root)
             .follow_links(false)
             .into_iter()
@@ -227,21 +218,41 @@ impl ValidateCommand {
             if let Some(extension) = path.extension() {
                 let ext = extension.to_string_lossy().to_lowercase();
                 if media_extensions.contains(ext.as_str()) {
-                    report.scanned_files += 1;
-
-                    // Get relative path from media root
-                    let relative_path = path.strip_prefix(&self.media_root)?;
-
-                    // Validate the file path
-                    if let Some(issue) = self.validate_file_path(relative_path, path) {
-                        report.issues.push(issue);
-                    }
+                    media_files.push(path.to_path_buf());
                 }
             }
         }
 
+        info!(
+            "🔍 Found {} media files, validating in parallel...",
+            media_files.len()
+        );
+
+        // Create shared reference to self for parallel processing
+        let media_root = Arc::new(&self.media_root);
+
+        // Process files in parallel using rayon
+        let issues: Vec<ValidationIssue> = media_files
+            .par_iter()
+            .filter_map(|path| {
+                let relative_path = match path.strip_prefix(media_root.as_ref()) {
+                    Ok(rel_path) => rel_path,
+                    Err(_) => return None,
+                };
+
+                self.validate_file_path_parallel(&self.compiled_patterns, relative_path, path)
+            })
+            .collect();
+
         let validation_time = start_time.elapsed();
-        report.validation_time = validation_time;
+
+        let report = ValidationReport {
+            scanned_files: media_files.len(),
+            issues,
+            patterns_used: self.patterns.clone(),
+            scan_path: self.media_root.clone(),
+            validation_time,
+        };
 
         info!(
             "✅ Validation complete. Scanned {} files, found {} issues in {:.2}s",
@@ -253,27 +264,27 @@ impl ValidateCommand {
         Ok(report)
     }
 
-    /// Validate a single file path against patterns
+    /// Validate a single file path against patterns (sequential version for testing)
     fn validate_file_path(
         &self,
         relative_path: &Path,
         full_path: &Path,
     ) -> Option<ValidationIssue> {
+        self.validate_file_path_parallel(&self.compiled_patterns, relative_path, full_path)
+    }
+
+    /// Validate a single file path against patterns (parallel version)
+    fn validate_file_path_parallel(
+        &self,
+        compiled_patterns: &[CompiledPattern],
+        relative_path: &Path,
+        full_path: &Path,
+    ) -> Option<ValidationIssue> {
         let path_str = relative_path.to_string_lossy().replace("\\", "/");
 
-        debug!("Validating path: {}", path_str);
-
         // Try all compiled patterns (much faster than recompiling regex each time)
-        for pattern in &self.compiled_patterns {
+        for pattern in compiled_patterns.iter() {
             if pattern.regex.is_match(&path_str) {
-                debug!(
-                    "Path matches {} pattern: {}",
-                    match pattern.content_type {
-                        ContentType::Show => "show",
-                        ContentType::Movie => "movie",
-                    },
-                    pattern.description
-                );
                 return None; // Valid
             }
         }
@@ -362,7 +373,10 @@ impl ValidateCommand {
         println!("📂 Scanned directory: {}", report.scan_path.display());
         println!("📁 Files scanned: {}", report.scanned_files);
         println!("⚠️  Issues found: {}", report.issues.len());
-        println!("⏱️  Validation time: {:.2}s", report.validation_time.as_secs_f64());
+        println!(
+            "⏱️  Validation time: {:.2}s",
+            report.validation_time.as_secs_f64()
+        );
 
         if report.issues.is_empty() {
             println!("\n✅ All files conform to Plex naming conventions!");
