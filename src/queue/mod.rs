@@ -7,6 +7,7 @@ use crate::job::Job;
 
 /// Manages the job queue with atomic operations for distributed processing
 pub struct JobQueue {
+    #[allow(dead_code)]
     pub media_root: PathBuf,
     pub queue_dir: PathBuf,
     pub in_progress_dir: PathBuf,
@@ -44,7 +45,7 @@ impl JobQueue {
         let lock_dir = self.queue_dir.join(format!("{job_filename}.lock"));
 
         // Use a lock directory for atomic job creation
-        if let Err(_) = async_fs::create_dir(&lock_dir).await {
+        if async_fs::create_dir(&lock_dir).await.is_err() {
             debug!("Job already being created: {}", job_filename);
             return Ok(()); // Job is already being created by another process
         }
@@ -66,7 +67,7 @@ impl JobQueue {
     }
 
     /// Atomically claim a job from the queue
-    pub async fn claim_job(&self) -> Result<Option<ClaimedJob>> {
+    pub async fn claim_job(&self) -> Result<Option<ClaimedJob<'_>>> {
         let mut entries = async_fs::read_dir(&self.queue_dir).await?;
 
         while let Some(entry) = entries.next_entry().await? {
@@ -130,6 +131,7 @@ impl JobQueue {
     }
 
     /// Get count of pending jobs
+    #[allow(dead_code)]
     pub async fn pending_count(&self) -> Result<usize> {
         let mut count = 0;
         let mut entries = async_fs::read_dir(&self.queue_dir).await?;
@@ -177,6 +179,7 @@ impl<'a> ClaimedJob<'a> {
     }
 
     /// Get the media file extension
+    #[allow(dead_code)]
     pub fn file_extension(&self) -> Option<&str> {
         self.job.input_path.extension()?.to_str()
     }

@@ -189,6 +189,11 @@ fn test_job_files_contain_complete_details() {
     fs::write(temp_path.join("video2.mkv"), "fake mkv content").unwrap();
 
     // Set custom environment variables to test they're captured
+    // Save current values first
+    let original_preset = std::env::var("FFMPEG_PRESET").ok();
+    let original_crf = std::env::var("FFMPEG_CRF").ok();
+    let original_bitrate = std::env::var("FFMPEG_AUDIO_BITRATE").ok();
+
     std::env::set_var("FFMPEG_PRESET", "fast");
     std::env::set_var("FFMPEG_CRF", "20");
     std::env::set_var("FFMPEG_AUDIO_BITRATE", "192k");
@@ -276,10 +281,19 @@ fn test_job_files_contain_complete_details() {
         }
     }
 
-    // Clean up environment variables
-    std::env::remove_var("FFMPEG_PRESET");
-    std::env::remove_var("FFMPEG_CRF");
-    std::env::remove_var("FFMPEG_AUDIO_BITRATE");
+    // Restore original environment variables
+    match original_preset {
+        Some(val) => std::env::set_var("FFMPEG_PRESET", val),
+        None => std::env::remove_var("FFMPEG_PRESET"),
+    }
+    match original_crf {
+        Some(val) => std::env::set_var("FFMPEG_CRF", val),
+        None => std::env::remove_var("FFMPEG_CRF"),
+    }
+    match original_bitrate {
+        Some(val) => std::env::set_var("FFMPEG_AUDIO_BITRATE", val),
+        None => std::env::remove_var("FFMPEG_AUDIO_BITRATE"),
+    }
 }
 
 /// Test hierarchical directory scanning functionality
@@ -320,6 +334,8 @@ fn test_hierarchical_directory_scanning() {
     let scan_stdout = String::from_utf8_lossy(&scan_output.stdout);
     let scan_stderr = String::from_utf8_lossy(&scan_output.stderr);
     let scan_output_text = format!("{scan_stdout}{scan_stderr}");
+    // Normalize all path separators (backslash or multiple slashes) to a single '/'
+    let scan_output_text = scan_output_text.replace('\\', "/").replace("//", "/");
 
     // Verify that it mentions recursive scanning
     assert!(
@@ -329,14 +345,12 @@ fn test_hierarchical_directory_scanning() {
 
     // Verify that it found files in subdirectories
     assert!(
-        scan_output_text.contains("Action/action1.mkv")
-            || scan_output_text.contains("Movies/Action/action1.mkv"),
+        scan_output_text.contains("Movies/Action/action1.mkv"),
         "Should find files in Movies/Action subdirectory, got: {scan_output_text}"
     );
 
     assert!(
-        scan_output_text.contains("Show1/Season 1/episode1.webm")
-            || scan_output_text.contains("TV Shows/Show1/Season 1/episode1.webm"),
+        scan_output_text.contains("TV Shows/Show1/Season 1/episode1.webm"),
         "Should find files in nested TV show subdirectory, got: {scan_output_text}"
     );
 

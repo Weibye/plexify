@@ -10,13 +10,15 @@ use crate::queue::JobQueue;
 pub struct ScanCommand {
     media_root: PathBuf,
     queue_root: PathBuf,
+    preset: Option<String>,
 }
 
 impl ScanCommand {
-    pub fn new(media_root: PathBuf, queue_root: PathBuf) -> Self {
+    pub fn new(media_root: PathBuf, queue_root: PathBuf, preset: Option<String>) -> Self {
         Self {
             media_root,
             queue_root,
+            preset,
         }
     }
 
@@ -99,7 +101,16 @@ impl ScanCommand {
         let mut job_count = 0;
 
         // Get configuration settings for jobs
-        let quality_settings = QualitySettings::from_env();
+        let quality_settings = match &self.preset {
+            Some(preset_name) => {
+                info!("Using quality preset: '{}'", preset_name);
+                QualitySettings::from_preset_name(preset_name)?
+            }
+            None => {
+                info!("Using quality settings from environment variables");
+                QualitySettings::from_env()
+            }
+        };
         let post_processing = PostProcessingSettings::default();
 
         // Process WebM files (require VTT subtitles)
@@ -139,7 +150,7 @@ impl ScanCommand {
         for mkv_path in mkv_files {
             let job = Job::new(
                 mkv_path.clone(),
-                MediaFileType::MKV,
+                MediaFileType::Mkv,
                 quality_settings.clone(),
                 post_processing.clone(),
             );
@@ -182,8 +193,11 @@ mod tests {
     #[tokio::test]
     async fn test_scan_empty_directory() {
         let temp_dir = TempDir::new().unwrap();
-        let scan_cmd =
-            ScanCommand::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        let scan_cmd = ScanCommand::new(
+            temp_dir.path().to_path_buf(),
+            temp_dir.path().to_path_buf(),
+            None,
+        );
 
         let result = scan_cmd.execute().await;
         assert!(result.is_ok());
@@ -191,7 +205,37 @@ mod tests {
 
     #[tokio::test]
     async fn test_scan_nonexistent_directory() {
-        let scan_cmd = ScanCommand::new(PathBuf::from("/nonexistent/path"), PathBuf::from("/tmp"));
+        let scan_cmd = ScanCommand::new(
+            PathBuf::from("/nonexistent/path"),
+            PathBuf::from("/tmp"),
+            None,
+        );
+
+        let result = scan_cmd.execute().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_scan_with_preset() {
+        let temp_dir = TempDir::new().unwrap();
+        let scan_cmd = ScanCommand::new(
+            temp_dir.path().to_path_buf(),
+            temp_dir.path().to_path_buf(),
+            Some("quality".to_string()),
+        );
+
+        let result = scan_cmd.execute().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_scan_with_invalid_preset() {
+        let temp_dir = TempDir::new().unwrap();
+        let scan_cmd = ScanCommand::new(
+            temp_dir.path().to_path_buf(),
+            temp_dir.path().to_path_buf(),
+            Some("invalid_preset".to_string()),
+        );
 
         let result = scan_cmd.execute().await;
         assert!(result.is_err());
@@ -216,7 +260,11 @@ mod tests {
         fs::write(media_root.join("very/deep/nested/folder/deep.webm"), "").unwrap();
         fs::write(media_root.join("very/deep/nested/folder/deep.vtt"), "").unwrap();
 
-        let scan_cmd = ScanCommand::new(media_root.to_path_buf(), temp_dir.path().to_path_buf());
+        let scan_cmd = ScanCommand::new(
+            media_root.to_path_buf(),
+            temp_dir.path().to_path_buf(),
+            Some("quality".to_string()),
+        );
         let result = scan_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -257,7 +305,11 @@ mod tests {
         fs::write(media_root.join("level1/l1.mkv"), "").unwrap();
         fs::write(deep_path.join("deep.mkv"), "").unwrap();
 
-        let scan_cmd = ScanCommand::new(media_root.to_path_buf(), temp_dir.path().to_path_buf());
+        let scan_cmd = ScanCommand::new(
+            media_root.to_path_buf(),
+            temp_dir.path().to_path_buf(),
+            Some("quality".to_string()),
+        );
         let result = scan_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -298,7 +350,11 @@ mod tests {
         fs::write(media_root.join("mixed_folder/mixed1.vtt"), "").unwrap();
         fs::write(media_root.join("mixed_folder/mixed2.mkv"), "").unwrap();
 
-        let scan_cmd = ScanCommand::new(media_root.to_path_buf(), temp_dir.path().to_path_buf());
+        let scan_cmd = ScanCommand::new(
+            media_root.to_path_buf(),
+            temp_dir.path().to_path_buf(),
+            Some("quality".to_string()),
+        );
         let result = scan_cmd.execute().await;
 
         assert!(result.is_ok());

@@ -23,6 +23,21 @@ pub struct QualitySettings {
     pub ffmpeg_audio_bitrate: String,
 }
 
+/// Predefined quality presets for different use cases
+#[derive(Debug, Clone, PartialEq)]
+pub enum QualityPreset {
+    /// Fast encoding with good quality (veryfast/23/128k)
+    Fast,
+    /// Balanced encoding speed and quality (medium/20/192k)
+    Balanced,
+    /// High quality, slower encoding (slow/18/256k)
+    Quality,
+    /// Ultra-fast encoding for quick previews (ultrafast/28/96k)
+    UltraFast,
+    /// Archive quality for long-term storage (veryslow/15/320k)
+    Archive,
+}
+
 /// Post-processing settings for what to do after conversion
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PostProcessingSettings {
@@ -35,7 +50,7 @@ pub enum MediaFileType {
     /// WebM file with external VTT subtitle
     WebM,
     /// MKV file with embedded subtitles
-    MKV,
+    Mkv,
 }
 
 impl Job {
@@ -48,12 +63,12 @@ impl Job {
     ) -> Self {
         let output_path = match file_type {
             MediaFileType::WebM => input_path.with_extension("mp4"),
-            MediaFileType::MKV => input_path.with_extension("mp4"),
+            MediaFileType::Mkv => input_path.with_extension("mp4"),
         };
 
         let subtitle_path = match file_type {
             MediaFileType::WebM => Some(input_path.with_extension("vtt")),
-            MediaFileType::MKV => None, // MKV uses embedded subtitles
+            MediaFileType::Mkv => None, // MKV uses embedded subtitles
         };
 
         Self {
@@ -103,7 +118,7 @@ impl Job {
                     Err(anyhow!("WebM job should have subtitle path"))
                 }
             }
-            MediaFileType::MKV => Ok(true), // MKV doesn't need external subtitles
+            MediaFileType::Mkv => Ok(true), // MKV doesn't need external subtitles
         }
     }
 
@@ -146,6 +161,7 @@ impl Job {
     }
 
     /// Create a job filename based on the source file (for compatibility)
+    #[allow(dead_code)]
     pub fn job_filename_from_source(&self) -> String {
         let stem = self
             .input_path
@@ -165,6 +181,90 @@ impl QualitySettings {
             ffmpeg_crf: env::var("FFMPEG_CRF").unwrap_or_else(|_| "23".to_string()),
             ffmpeg_audio_bitrate: env::var("FFMPEG_AUDIO_BITRATE")
                 .unwrap_or_else(|_| "128k".to_string()),
+        }
+    }
+
+    /// Create quality settings from a preset, with optional environment variable overrides
+    pub fn from_preset(preset: QualityPreset) -> Self {
+        use std::env;
+        let base = preset.to_quality_settings();
+
+        Self {
+            ffmpeg_preset: env::var("FFMPEG_PRESET").unwrap_or(base.ffmpeg_preset),
+            ffmpeg_crf: env::var("FFMPEG_CRF").unwrap_or(base.ffmpeg_crf),
+            ffmpeg_audio_bitrate: env::var("FFMPEG_AUDIO_BITRATE")
+                .unwrap_or(base.ffmpeg_audio_bitrate),
+        }
+    }
+
+    /// Create quality settings from a preset name string
+    pub fn from_preset_name(preset_name: &str) -> Result<Self> {
+        let preset = QualityPreset::from_name(preset_name)?;
+        Ok(Self::from_preset(preset))
+    }
+}
+
+impl QualityPreset {
+    /// Convert preset to quality settings
+    pub fn to_quality_settings(&self) -> QualitySettings {
+        match self {
+            QualityPreset::Fast => QualitySettings {
+                ffmpeg_preset: "veryfast".to_string(),
+                ffmpeg_crf: "23".to_string(),
+                ffmpeg_audio_bitrate: "128k".to_string(),
+            },
+            QualityPreset::Balanced => QualitySettings {
+                ffmpeg_preset: "medium".to_string(),
+                ffmpeg_crf: "20".to_string(),
+                ffmpeg_audio_bitrate: "192k".to_string(),
+            },
+            QualityPreset::Quality => QualitySettings {
+                ffmpeg_preset: "slow".to_string(),
+                ffmpeg_crf: "18".to_string(),
+                ffmpeg_audio_bitrate: "256k".to_string(),
+            },
+            QualityPreset::UltraFast => QualitySettings {
+                ffmpeg_preset: "ultrafast".to_string(),
+                ffmpeg_crf: "28".to_string(),
+                ffmpeg_audio_bitrate: "96k".to_string(),
+            },
+            QualityPreset::Archive => QualitySettings {
+                ffmpeg_preset: "veryslow".to_string(),
+                ffmpeg_crf: "15".to_string(),
+                ffmpeg_audio_bitrate: "320k".to_string(),
+            },
+        }
+    }
+
+    /// Parse preset from string name
+    pub fn from_name(name: &str) -> Result<Self> {
+        match name.to_lowercase().as_str() {
+            "fast" => Ok(QualityPreset::Fast),
+            "balanced" => Ok(QualityPreset::Balanced),
+            "quality" => Ok(QualityPreset::Quality),
+            "ultrafast" => Ok(QualityPreset::UltraFast),
+            "archive" => Ok(QualityPreset::Archive),
+            _ => Err(anyhow!(
+                "Unknown quality preset '{name}'. Available presets: fast, balanced, quality, ultrafast, archive"
+            )),
+        }
+    }
+
+    /// Get all available preset names
+    #[allow(dead_code)]
+    pub fn all_names() -> Vec<&'static str> {
+        vec!["fast", "balanced", "quality", "ultrafast", "archive"]
+    }
+
+    /// Get the preset name as string
+    #[allow(dead_code)]
+    pub fn name(&self) -> &'static str {
+        match self {
+            QualityPreset::Fast => "fast",
+            QualityPreset::Balanced => "balanced",
+            QualityPreset::Quality => "quality",
+            QualityPreset::UltraFast => "ultrafast",
+            QualityPreset::Archive => "archive",
         }
     }
 }
@@ -191,6 +291,10 @@ impl Default for PostProcessingSettings {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    // Mutex to serialize environment variable tests to prevent race conditions
+    static ENV_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_webm_job_creation() {
@@ -214,18 +318,21 @@ mod tests {
         let post_processing = PostProcessingSettings::default();
         let job = Job::new(
             PathBuf::from("video.mkv"),
-            MediaFileType::MKV,
+            MediaFileType::Mkv,
             quality,
             post_processing,
         );
         assert_eq!(job.input_path, PathBuf::from("video.mkv"));
-        assert_eq!(job.file_type, MediaFileType::MKV);
+        assert_eq!(job.file_type, MediaFileType::Mkv);
         assert_eq!(job.output_path, PathBuf::from("video.mp4"));
         assert_eq!(job.subtitle_path, None);
     }
 
     #[test]
     fn test_quality_settings_from_env() {
+        // Use a mutex to prevent environment variable tests from running concurrently
+        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+
         std::env::set_var("FFMPEG_PRESET", "fast");
         std::env::set_var("FFMPEG_CRF", "20");
         std::env::set_var("FFMPEG_AUDIO_BITRATE", "192k");
@@ -284,7 +391,7 @@ mod tests {
         let post_processing = PostProcessingSettings::default();
         let job = Job::new(
             PathBuf::from("relative/video.mkv"),
-            MediaFileType::MKV,
+            MediaFileType::Mkv,
             quality,
             post_processing,
         );
@@ -311,6 +418,84 @@ mod tests {
             job.full_output_path(None),
             PathBuf::from("relative/video.mp4")
         );
+    }
+
+    #[test]
+    fn test_quality_presets() {
+        // Test Fast preset
+        let fast = QualityPreset::Fast.to_quality_settings();
+        assert_eq!(fast.ffmpeg_preset, "veryfast");
+        assert_eq!(fast.ffmpeg_crf, "23");
+        assert_eq!(fast.ffmpeg_audio_bitrate, "128k");
+
+        // Test Quality preset
+        let quality = QualityPreset::Quality.to_quality_settings();
+        assert_eq!(quality.ffmpeg_preset, "slow");
+        assert_eq!(quality.ffmpeg_crf, "18");
+        assert_eq!(quality.ffmpeg_audio_bitrate, "256k");
+
+        // Test Balanced preset
+        let balanced = QualityPreset::Balanced.to_quality_settings();
+        assert_eq!(balanced.ffmpeg_preset, "medium");
+        assert_eq!(balanced.ffmpeg_crf, "20");
+        assert_eq!(balanced.ffmpeg_audio_bitrate, "192k");
+    }
+
+    #[test]
+    fn test_preset_from_name() {
+        assert_eq!(
+            QualityPreset::from_name("fast").unwrap(),
+            QualityPreset::Fast
+        );
+        assert_eq!(
+            QualityPreset::from_name("QUALITY").unwrap(),
+            QualityPreset::Quality
+        );
+        assert_eq!(
+            QualityPreset::from_name("Balanced").unwrap(),
+            QualityPreset::Balanced
+        );
+
+        // Test invalid preset name
+        assert!(QualityPreset::from_name("invalid").is_err());
+    }
+
+    #[test]
+    fn test_quality_settings_from_preset() {
+        let settings = QualitySettings::from_preset(QualityPreset::Quality);
+        assert_eq!(settings.ffmpeg_preset, "slow");
+        assert_eq!(settings.ffmpeg_crf, "18");
+        assert_eq!(settings.ffmpeg_audio_bitrate, "256k");
+    }
+
+    #[test]
+    fn test_quality_settings_from_preset_name() {
+        let settings = QualitySettings::from_preset_name("balanced").unwrap();
+        assert_eq!(settings.ffmpeg_preset, "medium");
+        assert_eq!(settings.ffmpeg_crf, "20");
+        assert_eq!(settings.ffmpeg_audio_bitrate, "192k");
+
+        // Test invalid name
+        assert!(QualitySettings::from_preset_name("invalid").is_err());
+    }
+
+    #[test]
+    fn test_preset_with_env_override() {
+        // Use a mutex to prevent environment variable tests from running concurrently
+        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+
+        // Set environment variables
+        std::env::set_var("FFMPEG_PRESET", "custom");
+        std::env::set_var("FFMPEG_CRF", "25");
+
+        let settings = QualitySettings::from_preset(QualityPreset::Quality);
+        assert_eq!(settings.ffmpeg_preset, "custom"); // Overridden by env
+        assert_eq!(settings.ffmpeg_crf, "25"); // Overridden by env
+        assert_eq!(settings.ffmpeg_audio_bitrate, "256k"); // From preset
+
+        // Clean up
+        std::env::remove_var("FFMPEG_PRESET");
+        std::env::remove_var("FFMPEG_CRF");
     }
 
     #[test]
