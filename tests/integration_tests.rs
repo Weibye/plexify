@@ -1,10 +1,28 @@
 use std::fs;
 use std::process::Command;
+use std::sync::Once;
 use tempfile::TempDir;
+
+use serial_test::serial;
+
+static INIT: Once = Once::new();
+
+/// Build the binary once for all tests
+fn build_plexify() {
+    INIT.call_once(|| {
+        let build_output = Command::new("cargo")
+            .args(["build", "--bin", "plexify"])
+            .output()
+            .expect("Failed to build plexify");
+        assert!(build_output.status.success(), "Failed to build plexify binary");
+    });
+}
 
 /// Test the complete scan -> clean workflow
 #[test]
+#[serial]
 fn test_scan_and_clean_workflow() {
+    build_plexify();
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path();
 
@@ -14,16 +32,6 @@ fn test_scan_and_clean_workflow() {
     fs::write(temp_path.join("video2.mkv"), "").unwrap();
     fs::write(temp_path.join("video3.webm"), "").unwrap(); // No .vtt file
 
-    // Build the binary first
-    let build_output = Command::new("cargo")
-        .args(["build", "--bin", "plexify"])
-        .output()
-        .expect("Failed to build plexify");
-
-    assert!(
-        build_output.status.success(),
-        "Failed to build plexify binary"
-    );
 
     // Test scan command (use temp_path as both media dir and queue dir)
     let scan_output = Command::new("./target/debug/plexify")
@@ -98,7 +106,9 @@ fn test_scan_and_clean_workflow() {
 
 /// Test help commands work
 #[test]
+#[serial]
 fn test_help_commands() {
+    build_plexify();
     let help_output = Command::new("./target/debug/plexify")
         .arg("--help")
         .output()
@@ -127,7 +137,9 @@ fn test_help_commands() {
 
 /// Test that invalid paths are handled gracefully
 #[test]
+#[serial]
 fn test_invalid_paths() {
+    build_plexify();
     // Test scan with non-existent directory
     let scan_output = Command::new("./target/debug/plexify")
         .args(["scan", "/non/existent/path"])
@@ -164,17 +176,9 @@ fn test_invalid_paths() {
 
 /// Test that job files contain all work details
 #[test]
+#[serial]
 fn test_job_files_contain_complete_details() {
-    // Build the binary first
-    let build_output = Command::new("cargo")
-        .args(["build", "--bin", "plexify"])
-        .output()
-        .expect("Failed to build plexify");
-
-    assert!(
-        build_output.status.success(),
-        "Failed to build plexify binary"
-    );
+    build_plexify();
 
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path();
@@ -298,17 +302,9 @@ fn test_job_files_contain_complete_details() {
 
 /// Test complete workflow including work folder functionality
 #[test]
+#[serial]
 fn test_work_folder_workflow() {
-    // Build the binary first
-    let build_output = Command::new("cargo")
-        .args(["build", "--bin", "plexify"])
-        .output()
-        .expect("Failed to build plexify");
-
-    assert!(
-        build_output.status.success(),
-        "Failed to build plexify binary"
-    );
+    build_plexify();
 
     let temp_dir = TempDir::new().unwrap();
     let media_path = temp_dir.path().join("media");
@@ -374,7 +370,9 @@ fn test_work_folder_workflow() {
 
 /// Test hierarchical directory scanning functionality
 #[test]
+#[serial]
 fn test_hierarchical_directory_scanning() {
+    build_plexify();
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path();
 
