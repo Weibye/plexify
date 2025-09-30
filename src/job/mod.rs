@@ -291,6 +291,10 @@ impl Default for PostProcessingSettings {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    // Mutex to serialize environment variable tests to prevent race conditions
+    static ENV_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_webm_job_creation() {
@@ -326,6 +330,9 @@ mod tests {
 
     #[test]
     fn test_quality_settings_from_env() {
+        // Use a mutex to prevent environment variable tests from running concurrently
+        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+
         std::env::set_var("FFMPEG_PRESET", "fast");
         std::env::set_var("FFMPEG_CRF", "20");
         std::env::set_var("FFMPEG_AUDIO_BITRATE", "192k");
@@ -474,6 +481,9 @@ mod tests {
 
     #[test]
     fn test_preset_with_env_override() {
+        // Use a mutex to prevent environment variable tests from running concurrently
+        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+
         // Set environment variables
         std::env::set_var("FFMPEG_PRESET", "custom");
         std::env::set_var("FFMPEG_CRF", "25");
