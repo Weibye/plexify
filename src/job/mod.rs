@@ -82,6 +82,42 @@ impl Job {
         }
     }
 
+    /// Create a new job for a media file with configuration, converting relative paths to absolute
+    pub fn new_with_media_root(
+        input_path: PathBuf,
+        file_type: MediaFileType,
+        quality_settings: QualitySettings,
+        post_processing: PostProcessingSettings,
+        media_root: &Path,
+    ) -> Self {
+        // Convert relative path to absolute path
+        let absolute_input_path = if input_path.is_absolute() {
+            input_path
+        } else {
+            media_root.join(&input_path)
+        };
+
+        let output_path = match file_type {
+            MediaFileType::WebM => absolute_input_path.with_extension("mp4"),
+            MediaFileType::Mkv => absolute_input_path.with_extension("mp4"),
+        };
+
+        let subtitle_path = match file_type {
+            MediaFileType::WebM => Some(absolute_input_path.with_extension("vtt")),
+            MediaFileType::Mkv => None, // MKV uses embedded subtitles
+        };
+
+        Self {
+            id: Uuid::new_v4().to_string(),
+            input_path: absolute_input_path,
+            output_path,
+            subtitle_path,
+            file_type,
+            quality_settings,
+            post_processing,
+        }
+    }
+
     /// Get the job file name for the queue
     pub fn job_filename(&self) -> String {
         format!("{}.job", self.id)
@@ -578,5 +614,74 @@ mod tests {
     fn test_post_processing_defaults() {
         let settings = PostProcessingSettings::default();
         assert!(settings.disable_source_files);
+    }
+
+    #[test]
+    fn test_job_creation_with_media_root() {
+        let quality = QualitySettings::default();
+        let post_processing = PostProcessingSettings::default();
+        let media_root = PathBuf::from("/media/root");
+
+        // Test relative path gets converted to absolute
+        let job = Job::new_with_media_root(
+            PathBuf::from("Season_01/episode.mkv"),
+            MediaFileType::Mkv,
+            quality,
+            post_processing,
+            &media_root,
+        );
+
+        assert_eq!(
+            job.input_path,
+            PathBuf::from("/media/root/Season_01/episode.mkv")
+        );
+        assert_eq!(
+            job.output_path,
+            PathBuf::from("/media/root/Season_01/episode.mp4")
+        );
+        assert_eq!(job.subtitle_path, None);
+    }
+
+    #[test]
+    fn test_job_creation_with_media_root_absolute_path() {
+        let quality = QualitySettings::default();
+        let post_processing = PostProcessingSettings::default();
+        let media_root = PathBuf::from("/media/root");
+
+        // Test absolute path stays absolute (ignores media_root)
+        let job = Job::new_with_media_root(
+            PathBuf::from("/absolute/path/episode.mkv"),
+            MediaFileType::Mkv,
+            quality,
+            post_processing,
+            &media_root,
+        );
+
+        assert_eq!(job.input_path, PathBuf::from("/absolute/path/episode.mkv"));
+        assert_eq!(job.output_path, PathBuf::from("/absolute/path/episode.mp4"));
+        assert_eq!(job.subtitle_path, None);
+    }
+
+    #[test]
+    fn test_job_creation_with_media_root_webm() {
+        let quality = QualitySettings::default();
+        let post_processing = PostProcessingSettings::default();
+        let media_root = PathBuf::from("/media/root");
+
+        // Test WebM with subtitles
+        let job = Job::new_with_media_root(
+            PathBuf::from("video.webm"),
+            MediaFileType::WebM,
+            quality,
+            post_processing,
+            &media_root,
+        );
+
+        assert_eq!(job.input_path, PathBuf::from("/media/root/video.webm"));
+        assert_eq!(job.output_path, PathBuf::from("/media/root/video.mp4"));
+        assert_eq!(
+            job.subtitle_path,
+            Some(PathBuf::from("/media/root/video.vtt"))
+        );
     }
 }
