@@ -42,6 +42,7 @@ pub enum QualityPreset {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PostProcessingSettings {
     pub disable_source_files: bool,
+    pub move_from_work_folder: bool,
 }
 
 /// Supported media file types
@@ -144,6 +145,17 @@ impl Job {
                 None => self.output_path.clone(),
             }
         }
+    }
+
+    /// Get the work folder output path (where the file is written during transcoding)
+    pub fn work_folder_output_path(&self, work_folder: &Path) -> PathBuf {
+        // Create a unique filename for the work folder based on job ID and original filename
+        let output_filename = self
+            .output_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("output.mp4");
+        work_folder.join(format!("{}_{}", self.id, output_filename))
     }
 
     /// Get the full subtitle path if it exists (for absolute paths, returns as-is; for relative paths, joins with media_root)
@@ -283,6 +295,7 @@ impl Default for PostProcessingSettings {
     fn default() -> Self {
         Self {
             disable_source_files: true,
+            move_from_work_folder: true,
         }
     }
 }
@@ -507,6 +520,7 @@ mod tests {
         };
         let post_processing = PostProcessingSettings {
             disable_source_files: false,
+            move_from_work_folder: true,
         };
         let job = Job::new(
             PathBuf::from("test.webm"),
@@ -531,5 +545,46 @@ mod tests {
             job.post_processing.disable_source_files,
             deserialized.post_processing.disable_source_files
         );
+        assert_eq!(
+            job.post_processing.move_from_work_folder,
+            deserialized.post_processing.move_from_work_folder
+        );
+    }
+
+    #[test]
+    fn test_work_folder_output_path() {
+        let quality = QualitySettings::default();
+        let post_processing = PostProcessingSettings::default();
+        let job = Job::new(
+            PathBuf::from("videos/movie.mkv"),
+            MediaFileType::Mkv,
+            quality,
+            post_processing,
+        );
+
+        let work_folder = PathBuf::from("/tmp/work");
+        let work_output_path = job.work_folder_output_path(&work_folder);
+
+        // Should include job ID and original filename
+        assert!(work_output_path.starts_with(&work_folder));
+        assert!(work_output_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains(&job.id));
+        assert!(work_output_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .ends_with("movie.mp4"));
+    }
+
+    #[test]
+    fn test_post_processing_defaults() {
+        let settings = PostProcessingSettings::default();
+        assert!(settings.disable_source_files);
+        assert!(settings.move_from_work_folder);
     }
 }

@@ -262,6 +262,7 @@ fn test_job_files_contain_complete_details() {
         // Verify post-processing settings
         let post_processing = job.get("post_processing").unwrap();
         assert_eq!(post_processing.get("disable_source_files").unwrap(), true);
+        assert_eq!(post_processing.get("move_from_work_folder").unwrap(), true);
 
         // Verify paths are consistent
         let input_path = job.get("input_path").unwrap().as_str().unwrap();

@@ -110,9 +110,26 @@ impl WorkCommand {
             };
 
             let job_name = claimed_job.job_name().to_string();
-            match processor.process_job(job, media_root).await {
+            let work_folder = &queue.in_progress_dir;
+
+            match processor
+                .process_job(job, media_root, Some(work_folder))
+                .await
+            {
                 Ok(_) => {
-                    // Conversion successful - disable source files if configured and mark job complete
+                    // Move file from work folder to media folder if configured
+                    if job.post_processing.move_from_work_folder {
+                        if let Err(e) = processor
+                            .move_from_work_folder(job, media_root, work_folder)
+                            .await
+                        {
+                            error!("Failed to move file from work folder: {}", e);
+                            claimed_job.return_to_queue().await?;
+                            return Ok(true);
+                        }
+                    }
+
+                    // Disable source files if configured
                     if job.post_processing.disable_source_files {
                         if let Err(e) = processor.disable_source_files(job, media_root).await {
                             warn!("Failed to disable source files: {}", e);
