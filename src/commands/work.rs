@@ -11,15 +11,15 @@ use crate::queue::JobQueue;
 /// Command to process jobs from the queue
 pub struct WorkCommand {
     media_root: PathBuf,
-    queue_root: PathBuf,
+    work_root: PathBuf,
     background_mode: bool,
 }
 
 impl WorkCommand {
-    pub fn new(media_root: PathBuf, queue_root: PathBuf, background_mode: bool) -> Self {
+    pub fn new(media_root: PathBuf, work_root: PathBuf, background_mode: bool) -> Self {
         Self {
             media_root,
-            queue_root,
+            work_root,
             background_mode,
         }
     }
@@ -44,9 +44,9 @@ impl WorkCommand {
         };
 
         info!("✅ Starting worker in {} mode.", mode);
-        info!("Watching for jobs in: {:?}", self.queue_root.join("_queue"));
+        info!("Watching for jobs in: {:?}", self.work_root.join("_queue"));
 
-        let queue = JobQueue::new(self.media_root.clone(), self.queue_root.clone());
+        let queue = JobQueue::new(self.media_root.clone(), self.work_root.clone());
         queue.init().await?;
 
         let processor = FFmpegProcessor::new(config.clone(), self.background_mode);
@@ -117,16 +117,14 @@ impl WorkCommand {
                 .await
             {
                 Ok(_) => {
-                    // Move file from work folder to media folder if configured
-                    if job.post_processing.move_from_work_folder {
-                        if let Err(e) = processor
-                            .move_from_work_folder(job, media_root, work_folder)
-                            .await
-                        {
-                            error!("Failed to move file from work folder: {}", e);
-                            claimed_job.return_to_queue().await?;
-                            return Ok(true);
-                        }
+                    // Move file from work folder to media folder
+                    if let Err(e) = processor
+                        .move_to_destination(job, media_root, work_folder)
+                        .await
+                    {
+                        error!("Failed to move file from work folder: {}", e);
+                        claimed_job.return_to_queue().await?;
+                        return Ok(true);
                     }
 
                     // Disable source files if configured

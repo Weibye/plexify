@@ -30,7 +30,7 @@ fn test_scan_and_clean_workflow() {
         .args([
             "scan",
             temp_path.to_str().unwrap(),
-            "--queue-dir",
+            "--work-dir",
             temp_path.to_str().unwrap(),
         ])
         .output()
@@ -82,7 +82,7 @@ fn test_scan_and_clean_workflow() {
         .args([
             "clean",
             temp_path.to_str().unwrap(),
-            "--queue-dir",
+            "--work-dir",
             temp_path.to_str().unwrap(),
         ])
         .output()
@@ -203,7 +203,7 @@ fn test_job_files_contain_complete_details() {
         .args([
             "scan",
             temp_path.to_str().unwrap(),
-            "--queue-dir",
+            "--work-dir",
             temp_path.to_str().unwrap(),
         ])
         .output()
@@ -262,7 +262,6 @@ fn test_job_files_contain_complete_details() {
         // Verify post-processing settings
         let post_processing = job.get("post_processing").unwrap();
         assert_eq!(post_processing.get("disable_source_files").unwrap(), true);
-        assert_eq!(post_processing.get("move_from_work_folder").unwrap(), true);
 
         // Verify paths are consistent
         let input_path = job.get("input_path").unwrap().as_str().unwrap();
@@ -329,7 +328,7 @@ fn test_work_folder_workflow() {
         .args([
             "scan",
             media_path.to_str().unwrap(),
-            "--queue-dir",
+            "--work-dir",
             work_path.to_str().unwrap(),
         ])
         .output()
@@ -357,11 +356,11 @@ fn test_work_folder_workflow() {
         "Should have created at least one job file"
     );
 
-    // Verify job contains move_from_work_folder setting
+    // Verify job contains the expected settings
     let job_content = fs::read_to_string(&job_files[0]).unwrap();
     let job_json: serde_json::Value = serde_json::from_str(&job_content).unwrap();
     let post_processing = job_json.get("post_processing").unwrap();
-    assert_eq!(post_processing.get("move_from_work_folder").unwrap(), true);
+    assert_eq!(post_processing.get("disable_source_files").unwrap(), true);
 
     // Note: We can't actually test the work command with a real FFmpeg conversion
     // in CI because FFmpeg might not be available, but we've verified:
@@ -400,7 +399,7 @@ fn test_hierarchical_directory_scanning() {
         .args([
             "scan",
             temp_path.to_str().unwrap(),
-            "--queue-dir",
+            "--work-dir",
             temp_path.to_str().unwrap(),
         ])
         .output()
@@ -453,7 +452,7 @@ fn test_hierarchical_directory_scanning() {
         .args([
             "clean",
             temp_path.to_str().unwrap(),
-            "--queue-dir",
+            "--work-dir",
             temp_path.to_str().unwrap(),
         ])
         .output()

@@ -42,7 +42,6 @@ pub enum QualityPreset {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PostProcessingSettings {
     pub disable_source_files: bool,
-    pub move_from_work_folder: bool,
 }
 
 /// Supported media file types
@@ -295,7 +294,6 @@ impl Default for PostProcessingSettings {
     fn default() -> Self {
         Self {
             disable_source_files: true,
-            move_from_work_folder: true,
         }
     }
 }
@@ -520,7 +518,6 @@ mod tests {
         };
         let post_processing = PostProcessingSettings {
             disable_source_files: false,
-            move_from_work_folder: true,
         };
         let job = Job::new(
             PathBuf::from("test.webm"),
@@ -544,10 +541,6 @@ mod tests {
         assert_eq!(
             job.post_processing.disable_source_files,
             deserialized.post_processing.disable_source_files
-        );
-        assert_eq!(
-            job.post_processing.move_from_work_folder,
-            deserialized.post_processing.move_from_work_folder
         );
     }
 
@@ -585,6 +578,5 @@ mod tests {
     fn test_post_processing_defaults() {
         let settings = PostProcessingSettings::default();
         assert!(settings.disable_source_files);
-        assert!(settings.move_from_work_folder);
     }
 }

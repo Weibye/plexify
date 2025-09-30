@@ -65,9 +65,9 @@ enum Commands {
     Scan {
         /// Path to the media directory to scan
         path: PathBuf,
-        /// Path to the queue directory (defaults to current working directory)
-        #[arg(long, short = 'q')]
-        queue_dir: Option<PathBuf>,
+        /// Path to the work directory (defaults to current working directory)
+        #[arg(long, short = 'w')]
+        work_dir: Option<PathBuf>,
         /// Quality preset for encoding. Available: fast, balanced, quality, ultrafast, archive
         #[arg(long, short = 'p')]
         preset: Option<String>,
@@ -76,9 +76,9 @@ enum Commands {
     Work {
         /// Path to the media directory containing the media files
         path: PathBuf,
-        /// Path to the queue directory (defaults to current working directory)
-        #[arg(long, short = 'q')]
-        queue_dir: Option<PathBuf>,
+        /// Path to the work directory (defaults to current working directory)
+        #[arg(long, short = 'w')]
+        work_dir: Option<PathBuf>,
         /// Run worker in background with low priority
         #[arg(long, short)]
         background: bool,
@@ -87,9 +87,9 @@ enum Commands {
     Clean {
         /// Path to the media directory
         path: PathBuf,
-        /// Path to the queue directory (defaults to current working directory)
-        #[arg(long, short = 'q')]
-        queue_dir: Option<PathBuf>,
+        /// Path to the work directory (defaults to current working directory)
+        #[arg(long, short = 'w')]
+        work_dir: Option<PathBuf>,
     },
     /// Validate Plex naming scheme conformity
     Validate {
@@ -114,37 +114,37 @@ async fn main() -> Result<()> {
     let result = match cli.command {
         Commands::Scan {
             path,
-            queue_dir,
+            work_dir,
             preset,
         } => {
-            let queue_root = queue_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
+            let work_root = work_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
             info!(
-                "Starting scan command for path: {:?}, queue: {:?}, preset: {:?}",
-                path, queue_root, preset
+                "Starting scan command for path: {:?}, work: {:?}, preset: {:?}",
+                path, work_root, preset
             );
-            ScanCommand::new(path, queue_root, preset).execute().await
+            ScanCommand::new(path, work_root, preset).execute().await
         }
         Commands::Work {
             path,
-            queue_dir,
+            work_dir,
             background,
         } => {
-            let queue_root = queue_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
+            let work_root = work_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
             info!(
-                "Starting work command for path: {:?}, queue: {:?}, background: {}",
-                path, queue_root, background
+                "Starting work command for path: {:?}, work: {:?}, background: {}",
+                path, work_root, background
             );
-            WorkCommand::new(path, queue_root, background)
+            WorkCommand::new(path, work_root, background)
                 .execute()
                 .await
         }
-        Commands::Clean { path, queue_dir } => {
-            let queue_root = queue_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
+        Commands::Clean { path, work_dir } => {
+            let work_root = work_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
             info!(
-                "Starting clean command for path: {:?}, queue: {:?}",
-                path, queue_root
+                "Starting clean command for path: {:?}, work: {:?}",
+                path, work_root
             );
-            CleanCommand::new(path, queue_root).execute().await
+            CleanCommand::new(path, work_root).execute().await
         }
         Commands::Validate { path } => {
             info!("Starting validate command for path: {:?}", path);

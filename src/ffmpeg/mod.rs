@@ -30,12 +30,8 @@ impl FFmpegProcessor {
         work_folder: Option<&Path>,
     ) -> Result<()> {
         let input_path = job.full_input_path(media_root);
-        let output_path = if job.post_processing.move_from_work_folder {
-            if let Some(work_folder) = work_folder {
-                job.work_folder_output_path(work_folder)
-            } else {
-                job.full_output_path(media_root)
-            }
+        let output_path = if let Some(work_folder) = work_folder {
+            job.work_folder_output_path(work_folder)
         } else {
             job.full_output_path(media_root)
         };
@@ -129,7 +125,7 @@ impl FFmpegProcessor {
     }
 
     /// Move completed file from work folder to media folder
-    pub async fn move_from_work_folder(
+    pub async fn move_to_destination(
         &self,
         job: &Job,
         media_root: Option<&Path>,
@@ -223,7 +219,6 @@ mod tests {
         let quality = QualitySettings::default();
         let post_processing = PostProcessingSettings {
             disable_source_files: false,
-            move_from_work_folder: true,
         };
         let job = Job::new(
             PathBuf::from("test.mkv"),
@@ -251,7 +246,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_move_from_work_folder() {
+    async fn test_move_to_destination() {
         let temp_dir = TempDir::new().unwrap();
         let work_folder = temp_dir.path().join("work");
         let media_folder = temp_dir.path().join("media");
@@ -262,7 +257,6 @@ mod tests {
         let quality = QualitySettings::default();
         let post_processing = PostProcessingSettings {
             disable_source_files: false,
-            move_from_work_folder: true,
         };
         let job = Job::new(
             PathBuf::from("test.mkv"),
@@ -282,7 +276,7 @@ mod tests {
 
         // Move the file
         processor
-            .move_from_work_folder(&job, Some(&media_folder), &work_folder)
+            .move_to_destination(&job, Some(&media_folder), &work_folder)
             .await
             .unwrap();
 
