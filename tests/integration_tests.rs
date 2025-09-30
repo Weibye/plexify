@@ -14,7 +14,10 @@ fn build_plexify() {
             .args(["build", "--bin", "plexify"])
             .output()
             .expect("Failed to build plexify");
-        assert!(build_output.status.success(), "Failed to build plexify binary");
+        assert!(
+            build_output.status.success(),
+            "Failed to build plexify binary"
+        );
     });
 }
 
@@ -31,7 +34,6 @@ fn test_scan_and_clean_workflow() {
     fs::write(temp_path.join("video1.vtt"), "").unwrap();
     fs::write(temp_path.join("video2.mkv"), "").unwrap();
     fs::write(temp_path.join("video3.webm"), "").unwrap(); // No .vtt file
-
 
     // Test scan command (use temp_path as both media dir and queue dir)
     let scan_output = Command::new("./target/debug/plexify")
