@@ -272,35 +272,32 @@ impl ValidateCommand {
     fn suggest_path(&self, path_str: &str, issue_type: &IssueType) -> Option<PathBuf> {
         // This is a simplified suggestion system
         // In a full implementation, this would be more sophisticated
-        match issue_type {
-            IssueType::DirectoryStructure => {
-                // If it's not in Movies/ or TV Shows/, suggest moving to Movies/
-                if let Some(filename) = Path::new(path_str).file_name() {
-                    let filename_str = filename.to_string_lossy();
-                    // Try to extract year from filename
-                    if let Some(_year_match) = Regex::new(r"\((\d{4})\)")
-                        .ok()
-                        .and_then(|re| re.find(&filename_str))
-                    {
-                        let filename_string = filename_str.to_string();
-                        let base_name = filename_string.replace(
-                            &format!(
-                                ".{}",
-                                Path::new(&filename_string)
-                                    .extension()
-                                    .and_then(|ext| ext.to_str())
-                                    .unwrap_or("")
-                            ),
-                            "",
-                        );
-                        return Some(PathBuf::from(format!(
-                            "Movies/{}/{}",
-                            base_name, filename_str
-                        )));
-                    }
+        if let IssueType::DirectoryStructure = issue_type {
+            // If it's not in Movies/ or TV Shows/, suggest moving to Movies/
+            if let Some(filename) = Path::new(path_str).file_name() {
+                let filename_str = filename.to_string_lossy();
+                // Try to extract year from filename
+                if let Some(_year_match) = Regex::new(r"\((\d{4})\)")
+                    .ok()
+                    .and_then(|re| re.find(&filename_str))
+                {
+                    let filename_string = filename_str.to_string();
+                    let base_name = filename_string.replace(
+                        &format!(
+                            ".{}",
+                            Path::new(&filename_string)
+                                .extension()
+                                .and_then(|ext| ext.to_str())
+                                .unwrap_or("")
+                        ),
+                        "",
+                    );
+                    return Some(PathBuf::from(format!(
+                        "Movies/{}/{}",
+                        base_name, filename_str
+                    )));
                 }
             }
-            _ => {}
         }
         None
     }
