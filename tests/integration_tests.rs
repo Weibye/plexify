@@ -329,7 +329,7 @@ fn test_hierarchical_directory_scanning() {
         "Should mention recursive scanning, got: {scan_output_text}"
     );
 
-    // Verify that it found files in subdirectories (now only need to check forward slash variants)
+    // Verify that it found files in subdirectories
     assert!(
         scan_output_text.contains("Movies/Action/action1.mkv"),
         "Should find files in Movies/Action subdirectory, got: {scan_output_text}"
