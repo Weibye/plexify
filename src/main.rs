@@ -23,6 +23,9 @@
 //!
 //! # Clean up temporary files
 //! plexify clean /path/to/media
+//!
+//! # Validate Plex naming scheme conformity
+//! plexify validate /path/to/media
 //! ```
 
 use anyhow::Result;
