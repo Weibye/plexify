@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 use std::sync::Once;
 use tempfile::TempDir;
@@ -459,4 +460,128 @@ fn test_hierarchical_directory_scanning() {
         .expect("Failed to execute clean command");
 
     assert!(clean_output.status.success(), "Clean command failed");
+}
+
+/// Test that jobs created from different directories contain absolute paths
+#[test]
+fn test_absolute_paths_in_jobs() {
+    let temp_dir = TempDir::new().unwrap();
+    let media_path = temp_dir.path().join("media");
+    let work_path = temp_dir.path().join("work");
+    let scan_from_path = temp_dir.path().join("scan_from");
+
+    // Create directory structure
+    fs::create_dir_all(&media_path).unwrap();
+    fs::create_dir_all(&work_path).unwrap();
+    fs::create_dir_all(&scan_from_path).unwrap();
+
+    // Create test media files
+    fs::create_dir_all(media_path.join("Season_01")).unwrap();
+    fs::write(
+        media_path.join("Season_01/episode1.mkv"),
+        "dummy mkv content",
+    )
+    .unwrap();
+    fs::write(
+        media_path.join("Season_01/episode2.webm"),
+        "dummy webm content",
+    )
+    .unwrap();
+    fs::write(
+        media_path.join("Season_01/episode2.vtt"),
+        "dummy subtitle content",
+    )
+    .unwrap();
+
+    // Get absolute path to binary before changing directory
+    let binary_path = std::env::current_dir()
+        .unwrap()
+        .join("target/debug/plexify");
+
+    // Change to a different directory before scanning
+    let original_dir = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&scan_from_path).unwrap();
+
+    // Run scan command from the different directory
+    let scan_output = Command::new(&binary_path)
+        .args([
+            "scan",
+            media_path.to_str().unwrap(),
+            "--work-dir",
+            work_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute scan command");
+
+    // Restore original directory
+    std::env::set_current_dir(original_dir).unwrap();
+
+    assert!(scan_output.status.success(), "Scan command failed");
+
+    // Verify jobs were created
+    let queue_dir = work_path.join("_queue");
+    let job_files: Vec<_> = fs::read_dir(&queue_dir)
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path.extension()? == "job" {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    assert_eq!(job_files.len(), 2, "Should have created 2 job files");
+
+    // Check that all jobs contain absolute paths
+    for job_file in job_files {
+        let job_content = fs::read_to_string(&job_file).unwrap();
+        let job_json: serde_json::Value = serde_json::from_str(&job_content).unwrap();
+
+        let input_path = job_json.get("input_path").unwrap().as_str().unwrap();
+        let output_path = job_json.get("output_path").unwrap().as_str().unwrap();
+
+        // Verify that paths are absolute
+        assert!(
+            Path::new(input_path).is_absolute(),
+            "Input path should be absolute: {}",
+            input_path
+        );
+        assert!(
+            Path::new(output_path).is_absolute(),
+            "Output path should be absolute: {}",
+            output_path
+        );
+
+        // Verify paths point to the correct media directory
+        assert!(
+            input_path.starts_with(media_path.to_str().unwrap()),
+            "Input path should start with media directory: {}",
+            input_path
+        );
+        assert!(
+            output_path.starts_with(media_path.to_str().unwrap()),
+            "Output path should start with media directory: {}",
+            output_path
+        );
+
+        // Check WebM subtitle paths are also absolute if present
+        if let Some(subtitle_path) = job_json.get("subtitle_path") {
+            if !subtitle_path.is_null() {
+                let subtitle_path_str = subtitle_path.as_str().unwrap();
+                assert!(
+                    Path::new(subtitle_path_str).is_absolute(),
+                    "Subtitle path should be absolute: {}",
+                    subtitle_path_str
+                );
+                assert!(
+                    subtitle_path_str.starts_with(media_path.to_str().unwrap()),
+                    "Subtitle path should start with media directory: {}",
+                    subtitle_path_str
+                );
+            }
+        }
+    }
 }

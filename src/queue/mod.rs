@@ -232,11 +232,13 @@ mod tests {
 
         let quality = QualitySettings::default();
         let post_processing = PostProcessingSettings::default();
+        let media_root = temp_dir.path();
         let job = Job::new(
             PathBuf::from("test.webm"),
             MediaFileType::WebM,
             quality,
             post_processing,
+            media_root,
         );
 
         // Enqueue job
@@ -244,7 +246,7 @@ mod tests {
 
         // Claim job
         let claimed = queue.claim_job().await.unwrap().unwrap();
-        assert_eq!(claimed.job.input_path, PathBuf::from("test.webm"));
+        assert!(claimed.job.input_path.ends_with("test.webm"));
         assert_eq!(claimed.job.file_type, MediaFileType::WebM);
 
         // Mark as complete

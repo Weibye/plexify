@@ -54,26 +54,34 @@ pub enum MediaFileType {
 }
 
 impl Job {
-    /// Create a new job for a media file with configuration
+    /// Create a new job for a media file with configuration, converting relative paths to absolute
     pub fn new(
         input_path: PathBuf,
         file_type: MediaFileType,
         quality_settings: QualitySettings,
         post_processing: PostProcessingSettings,
+        media_root: &Path,
     ) -> Self {
+        // Convert relative path to absolute path
+        let absolute_input_path = if input_path.is_absolute() {
+            input_path
+        } else {
+            media_root.join(&input_path)
+        };
+
         let output_path = match file_type {
-            MediaFileType::WebM => input_path.with_extension("mp4"),
-            MediaFileType::Mkv => input_path.with_extension("mp4"),
+            MediaFileType::WebM => absolute_input_path.with_extension("mp4"),
+            MediaFileType::Mkv => absolute_input_path.with_extension("mp4"),
         };
 
         let subtitle_path = match file_type {
-            MediaFileType::WebM => Some(input_path.with_extension("vtt")),
+            MediaFileType::WebM => Some(absolute_input_path.with_extension("vtt")),
             MediaFileType::Mkv => None, // MKV uses embedded subtitles
         };
 
         Self {
             id: Uuid::new_v4().to_string(),
-            input_path,
+            input_path: absolute_input_path,
             output_path,
             subtitle_path,
             file_type,
@@ -311,31 +319,38 @@ mod tests {
     fn test_webm_job_creation() {
         let quality = QualitySettings::default();
         let post_processing = PostProcessingSettings::default();
+        let media_root = PathBuf::from("/test/media");
         let job = Job::new(
             PathBuf::from("video.webm"),
             MediaFileType::WebM,
             quality,
             post_processing,
+            &media_root,
         );
-        assert_eq!(job.input_path, PathBuf::from("video.webm"));
+        assert_eq!(job.input_path, PathBuf::from("/test/media/video.webm"));
         assert_eq!(job.file_type, MediaFileType::WebM);
-        assert_eq!(job.output_path, PathBuf::from("video.mp4"));
-        assert_eq!(job.subtitle_path, Some(PathBuf::from("video.vtt")));
+        assert_eq!(job.output_path, PathBuf::from("/test/media/video.mp4"));
+        assert_eq!(
+            job.subtitle_path,
+            Some(PathBuf::from("/test/media/video.vtt"))
+        );
     }
 
     #[test]
     fn test_mkv_job_creation() {
         let quality = QualitySettings::default();
         let post_processing = PostProcessingSettings::default();
+        let media_root = PathBuf::from("/test/media");
         let job = Job::new(
             PathBuf::from("video.mkv"),
             MediaFileType::Mkv,
             quality,
             post_processing,
+            &media_root,
         );
-        assert_eq!(job.input_path, PathBuf::from("video.mkv"));
+        assert_eq!(job.input_path, PathBuf::from("/test/media/video.mkv"));
         assert_eq!(job.file_type, MediaFileType::Mkv);
-        assert_eq!(job.output_path, PathBuf::from("video.mp4"));
+        assert_eq!(job.output_path, PathBuf::from("/test/media/video.mp4"));
         assert_eq!(job.subtitle_path, None);
     }
 
@@ -363,14 +378,16 @@ mod tests {
     fn test_absolute_paths() {
         let quality = QualitySettings::default();
         let post_processing = PostProcessingSettings::default();
+        let media_root = PathBuf::from("/media/root");
         let job = Job::new(
             PathBuf::from("/absolute/path/video.webm"),
             MediaFileType::WebM,
             quality,
             post_processing,
+            &media_root,
         );
 
-        // Test that absolute paths work without media_root
+        // Test that absolute paths stay absolute (ignores media_root)
         assert_eq!(
             job.full_input_path(None),
             PathBuf::from("/absolute/path/video.webm")
@@ -384,14 +401,14 @@ mod tests {
             Some(PathBuf::from("/absolute/path/video.vtt"))
         );
 
-        // Test that absolute paths ignore media_root
-        let media_root = PathBuf::from("/different/root");
+        // Test that absolute paths ignore media_root parameter passed to full_* methods
+        let different_root = PathBuf::from("/different/root");
         assert_eq!(
-            job.full_input_path(Some(&media_root)),
+            job.full_input_path(Some(&different_root)),
             PathBuf::from("/absolute/path/video.webm")
         );
         assert_eq!(
-            job.full_output_path(Some(&media_root)),
+            job.full_output_path(Some(&different_root)),
             PathBuf::from("/absolute/path/video.mp4")
         );
     }
@@ -400,34 +417,34 @@ mod tests {
     fn test_relative_paths_with_media_root() {
         let quality = QualitySettings::default();
         let post_processing = PostProcessingSettings::default();
+        let media_root = PathBuf::from("/media/root");
         let job = Job::new(
             PathBuf::from("relative/video.mkv"),
             MediaFileType::Mkv,
             quality,
             post_processing,
+            &media_root,
         );
 
-        let media_root = PathBuf::from("/media/root");
-
-        // Test that relative paths are resolved with media_root
+        // Test that relative paths are converted to absolute during job creation
         assert_eq!(
-            job.full_input_path(Some(&media_root)),
+            job.input_path,
             PathBuf::from("/media/root/relative/video.mkv")
         );
         assert_eq!(
-            job.full_output_path(Some(&media_root)),
+            job.output_path,
             PathBuf::from("/media/root/relative/video.mp4")
         );
-        assert_eq!(job.full_subtitle_path(Some(&media_root)), None); // MKV has no external subtitles
+        assert_eq!(job.subtitle_path, None); // MKV has no external subtitles
 
-        // Test that relative paths work without media_root (use as-is)
+        // Test that full_* methods return the absolute paths directly
         assert_eq!(
             job.full_input_path(None),
-            PathBuf::from("relative/video.mkv")
+            PathBuf::from("/media/root/relative/video.mkv")
         );
         assert_eq!(
             job.full_output_path(None),
-            PathBuf::from("relative/video.mp4")
+            PathBuf::from("/media/root/relative/video.mp4")
         );
     }
 
@@ -519,11 +536,13 @@ mod tests {
         let post_processing = PostProcessingSettings {
             disable_source_files: false,
         };
+        let media_root = PathBuf::from("/test/media");
         let job = Job::new(
             PathBuf::from("test.webm"),
             MediaFileType::WebM,
             quality.clone(),
             post_processing.clone(),
+            &media_root,
         );
 
         // Test JSON serialization/deserialization
@@ -548,11 +567,13 @@ mod tests {
     fn test_work_folder_output_path() {
         let quality = QualitySettings::default();
         let post_processing = PostProcessingSettings::default();
+        let media_root = PathBuf::from("/media/root");
         let job = Job::new(
             PathBuf::from("videos/movie.mkv"),
             MediaFileType::Mkv,
             quality,
             post_processing,
+            &media_root,
         );
 
         let work_folder = PathBuf::from("/tmp/work");

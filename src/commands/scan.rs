@@ -120,6 +120,7 @@ impl ScanCommand {
                 MediaFileType::WebM,
                 quality_settings.clone(),
                 post_processing.clone(),
+                &self.media_root,
             );
 
             // Check if output already exists
@@ -153,6 +154,7 @@ impl ScanCommand {
                 MediaFileType::Mkv,
                 quality_settings.clone(),
                 post_processing.clone(),
+                &self.media_root,
             );
 
             // Check if output already exists
