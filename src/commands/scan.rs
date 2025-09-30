@@ -260,7 +260,7 @@ mod tests {
         fs::write(media_root.join("very/deep/nested/folder/deep.webm"), "").unwrap();
         fs::write(media_root.join("very/deep/nested/folder/deep.vtt"), "").unwrap();
 
-        let scan_cmd = ScanCommand::new(media_root.to_path_buf(), temp_dir.path().to_path_buf());
+        let scan_cmd = ScanCommand::new(media_root.to_path_buf(), temp_dir.path().to_path_buf(), Some("quality".to_string()));
         let result = scan_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -301,7 +301,7 @@ mod tests {
         fs::write(media_root.join("level1/l1.mkv"), "").unwrap();
         fs::write(deep_path.join("deep.mkv"), "").unwrap();
 
-        let scan_cmd = ScanCommand::new(media_root.to_path_buf(), temp_dir.path().to_path_buf());
+        let scan_cmd = ScanCommand::new(media_root.to_path_buf(), temp_dir.path().to_path_buf(), Some("quality".to_string()));
         let result = scan_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -342,7 +342,7 @@ mod tests {
         fs::write(media_root.join("mixed_folder/mixed1.vtt"), "").unwrap();
         fs::write(media_root.join("mixed_folder/mixed2.mkv"), "").unwrap();
 
-        let scan_cmd = ScanCommand::new(media_root.to_path_buf(), temp_dir.path().to_path_buf());
+        let scan_cmd = ScanCommand::new(media_root.to_path_buf(), temp_dir.path().to_path_buf(), Some("quality".to_string()));
         let result = scan_cmd.execute().await;
 
         assert!(result.is_ok());
