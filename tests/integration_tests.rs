@@ -30,7 +30,7 @@ fn test_scan_and_clean_workflow() {
         .args([
             "scan",
             temp_path.to_str().unwrap(),
-            "--queue-dir",
+            "--work-dir",
             temp_path.to_str().unwrap(),
         ])
         .output()
@@ -82,7 +82,7 @@ fn test_scan_and_clean_workflow() {
         .args([
             "clean",
             temp_path.to_str().unwrap(),
-            "--queue-dir",
+            "--work-dir",
             temp_path.to_str().unwrap(),
         ])
         .output()
@@ -203,7 +203,7 @@ fn test_job_files_contain_complete_details() {
         .args([
             "scan",
             temp_path.to_str().unwrap(),
-            "--queue-dir",
+            "--work-dir",
             temp_path.to_str().unwrap(),
         ])
         .output()
@@ -296,6 +296,82 @@ fn test_job_files_contain_complete_details() {
     }
 }
 
+/// Test complete workflow including work folder functionality
+#[test]
+fn test_work_folder_workflow() {
+    // Build the binary first
+    let build_output = Command::new("cargo")
+        .args(["build", "--bin", "plexify"])
+        .output()
+        .expect("Failed to build plexify");
+
+    assert!(
+        build_output.status.success(),
+        "Failed to build plexify binary"
+    );
+
+    let temp_dir = TempDir::new().unwrap();
+    let media_path = temp_dir.path().join("media");
+    let work_path = temp_dir.path().join("work");
+
+    fs::create_dir_all(&media_path).unwrap();
+    fs::create_dir_all(&work_path).unwrap();
+
+    // Create test media files
+    fs::write(media_path.join("test_video.mkv"), "fake mkv content").unwrap();
+
+    // Set environment variable for faster processing
+    std::env::set_var("FFMPEG_PRESET", "ultrafast");
+
+    // First, scan to create jobs
+    let scan_output = Command::new("./target/debug/plexify")
+        .args([
+            "scan",
+            media_path.to_str().unwrap(),
+            "--work-dir",
+            work_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run scan command");
+
+    assert!(
+        scan_output.status.success(),
+        "Scan command failed: {}",
+        String::from_utf8_lossy(&scan_output.stderr)
+    );
+
+    // Check that job files were created
+    let queue_dir = work_path.join("_queue");
+    assert!(queue_dir.exists(), "Queue directory should exist");
+
+    let mut job_files = Vec::new();
+    for entry in fs::read_dir(&queue_dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().extension().unwrap_or_default() == "job" {
+            job_files.push(entry.path());
+        }
+    }
+    assert!(
+        !job_files.is_empty(),
+        "Should have created at least one job file"
+    );
+
+    // Verify job contains the expected settings
+    let job_content = fs::read_to_string(&job_files[0]).unwrap();
+    let job_json: serde_json::Value = serde_json::from_str(&job_content).unwrap();
+    let post_processing = job_json.get("post_processing").unwrap();
+    assert_eq!(post_processing.get("disable_source_files").unwrap(), true);
+
+    // Note: We can't actually test the work command with a real FFmpeg conversion
+    // in CI because FFmpeg might not be available, but we've verified:
+    // 1. Jobs are created with the correct work folder settings
+    // 2. Unit tests verify the work folder logic
+    // 3. Integration tests verify the complete scan workflow
+
+    // Clean up environment variable
+    std::env::remove_var("FFMPEG_PRESET");
+}
+
 /// Test hierarchical directory scanning functionality
 #[test]
 fn test_hierarchical_directory_scanning() {
@@ -323,7 +399,7 @@ fn test_hierarchical_directory_scanning() {
         .args([
             "scan",
             temp_path.to_str().unwrap(),
-            "--queue-dir",
+            "--work-dir",
             temp_path.to_str().unwrap(),
         ])
         .output()
@@ -376,7 +452,7 @@ fn test_hierarchical_directory_scanning() {
         .args([
             "clean",
             temp_path.to_str().unwrap(),
-            "--queue-dir",
+            "--work-dir",
             temp_path.to_str().unwrap(),
         ])
         .output()

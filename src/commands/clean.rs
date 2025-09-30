@@ -7,14 +7,14 @@ use crate::queue::JobQueue;
 /// Command to clean up temporary files and directories
 pub struct CleanCommand {
     media_root: PathBuf,
-    queue_root: PathBuf,
+    work_root: PathBuf,
 }
 
 impl CleanCommand {
-    pub fn new(media_root: PathBuf, queue_root: PathBuf) -> Self {
+    pub fn new(media_root: PathBuf, work_root: PathBuf) -> Self {
         Self {
             media_root,
-            queue_root,
+            work_root,
         }
     }
 
@@ -32,7 +32,7 @@ impl CleanCommand {
 
         info!("🧹 Cleaning up temporary files...");
 
-        let queue = JobQueue::new(self.media_root.clone(), self.queue_root.clone());
+        let queue = JobQueue::new(self.media_root.clone(), self.work_root.clone());
         queue.clean().await?;
 
         // Also clean up worker log if it exists

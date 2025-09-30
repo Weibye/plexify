@@ -11,15 +11,15 @@ use crate::queue::JobQueue;
 /// Command to process jobs from the queue
 pub struct WorkCommand {
     media_root: PathBuf,
-    queue_root: PathBuf,
+    work_root: PathBuf,
     background_mode: bool,
 }
 
 impl WorkCommand {
-    pub fn new(media_root: PathBuf, queue_root: PathBuf, background_mode: bool) -> Self {
+    pub fn new(media_root: PathBuf, work_root: PathBuf, background_mode: bool) -> Self {
         Self {
             media_root,
-            queue_root,
+            work_root,
             background_mode,
         }
     }
@@ -44,9 +44,9 @@ impl WorkCommand {
         };
 
         info!("✅ Starting worker in {} mode.", mode);
-        info!("Watching for jobs in: {:?}", self.queue_root.join("_queue"));
+        info!("Watching for jobs in: {:?}", self.work_root.join("_queue"));
 
-        let queue = JobQueue::new(self.media_root.clone(), self.queue_root.clone());
+        let queue = JobQueue::new(self.media_root.clone(), self.work_root.clone());
         queue.init().await?;
 
         let processor = FFmpegProcessor::new(config.clone(), self.background_mode);
@@ -110,9 +110,24 @@ impl WorkCommand {
             };
 
             let job_name = claimed_job.job_name().to_string();
-            match processor.process_job(job, media_root).await {
+            let work_folder = &queue.in_progress_dir;
+
+            match processor
+                .process_job(job, media_root, Some(work_folder))
+                .await
+            {
                 Ok(_) => {
-                    // Conversion successful - disable source files if configured and mark job complete
+                    // Move file from work folder to media folder
+                    if let Err(e) = processor
+                        .move_to_destination(job, media_root, work_folder)
+                        .await
+                    {
+                        error!("Failed to move file from work folder: {}", e);
+                        claimed_job.return_to_queue().await?;
+                        return Ok(true);
+                    }
+
+                    // Disable source files if configured
                     if job.post_processing.disable_source_files {
                         if let Err(e) = processor.disable_source_files(job, media_root).await {
                             warn!("Failed to disable source files: {}", e);

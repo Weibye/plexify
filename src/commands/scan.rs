@@ -9,15 +9,15 @@ use crate::queue::JobQueue;
 /// Command to scan a directory for media files and create jobs
 pub struct ScanCommand {
     media_root: PathBuf,
-    queue_root: PathBuf,
+    work_root: PathBuf,
     preset: Option<String>,
 }
 
 impl ScanCommand {
-    pub fn new(media_root: PathBuf, queue_root: PathBuf, preset: Option<String>) -> Self {
+    pub fn new(media_root: PathBuf, work_root: PathBuf, preset: Option<String>) -> Self {
         Self {
             media_root,
-            queue_root,
+            work_root,
             preset,
         }
     }
@@ -37,7 +37,7 @@ impl ScanCommand {
         info!("🔎 Scanning directory: {:?}", self.media_root);
         info!("📁 Recursively scanning all subdirectories...");
 
-        let queue = JobQueue::new(self.media_root.clone(), self.queue_root.clone());
+        let queue = JobQueue::new(self.media_root.clone(), self.work_root.clone());
         queue.init().await?;
 
         let mut webm_files = Vec::new();

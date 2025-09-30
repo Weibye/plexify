@@ -23,9 +23,18 @@ impl FFmpegProcessor {
     }
 
     /// Process a job using FFmpeg
-    pub async fn process_job(&self, job: &Job, media_root: Option<&Path>) -> Result<()> {
+    pub async fn process_job(
+        &self,
+        job: &Job,
+        media_root: Option<&Path>,
+        work_folder: Option<&Path>,
+    ) -> Result<()> {
         let input_path = job.full_input_path(media_root);
-        let output_path = job.full_output_path(media_root);
+        let output_path = if let Some(work_folder) = work_folder {
+            job.work_folder_output_path(work_folder)
+        } else {
+            job.full_output_path(media_root)
+        };
 
         info!("🚀 Starting conversion for: {:?}", input_path);
 
@@ -115,7 +124,38 @@ impl FFmpegProcessor {
         Ok(())
     }
 
-    /// Rename original files to .disabled after successful conversion
+    /// Move completed file from work folder to media folder
+    pub async fn move_to_destination(
+        &self,
+        job: &Job,
+        media_root: Option<&Path>,
+        work_folder: &Path,
+    ) -> Result<()> {
+        let work_output_path = job.work_folder_output_path(work_folder);
+        let final_output_path = job.full_output_path(media_root);
+
+        // Ensure the work folder output file exists
+        if !work_output_path.exists() {
+            return Err(anyhow!(
+                "Work folder output file does not exist: {work_output_path:?}"
+            ));
+        }
+
+        // Create final output directory if it doesn't exist
+        if let Some(parent) = final_output_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        // Move the file from work folder to final location
+        tokio::fs::rename(&work_output_path, &final_output_path).await?;
+
+        info!(
+            "📁 Moved completed file: {:?} -> {:?}",
+            work_output_path, final_output_path
+        );
+
+        Ok(())
+    }
     pub async fn disable_source_files(&self, job: &Job, media_root: Option<&Path>) -> Result<()> {
         let input_path = job.full_input_path(media_root);
         let disabled_input = input_path.with_extension(format!(
@@ -153,6 +193,9 @@ impl FFmpegProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job::{Job, MediaFileType, PostProcessingSettings, QualitySettings};
+    use std::path::PathBuf;
+    use tempfile::TempDir;
 
     #[tokio::test]
     async fn test_ffmpeg_processor_creation() {
@@ -166,5 +209,83 @@ mod tests {
         let config = Config::default();
         let processor = FFmpegProcessor::new(config, true);
         assert!(processor.background_mode);
+    }
+
+    #[tokio::test]
+    async fn test_work_folder_output_path_generation() {
+        let temp_dir = TempDir::new().unwrap();
+        let work_folder = temp_dir.path();
+
+        let quality = QualitySettings::default();
+        let post_processing = PostProcessingSettings {
+            disable_source_files: false,
+        };
+        let job = Job::new(
+            PathBuf::from("test.mkv"),
+            MediaFileType::Mkv,
+            quality,
+            post_processing,
+        );
+
+        let work_output_path = job.work_folder_output_path(work_folder);
+
+        // Verify the path structure
+        assert!(work_output_path.starts_with(work_folder));
+        assert!(work_output_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains(&job.id));
+        assert!(work_output_path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .ends_with("test.mp4"));
+    }
+
+    #[tokio::test]
+    async fn test_move_to_destination() {
+        let temp_dir = TempDir::new().unwrap();
+        let work_folder = temp_dir.path().join("work");
+        let media_folder = temp_dir.path().join("media");
+
+        tokio::fs::create_dir_all(&work_folder).await.unwrap();
+        tokio::fs::create_dir_all(&media_folder).await.unwrap();
+
+        let quality = QualitySettings::default();
+        let post_processing = PostProcessingSettings {
+            disable_source_files: false,
+        };
+        let job = Job::new(
+            PathBuf::from("test.mkv"),
+            MediaFileType::Mkv,
+            quality,
+            post_processing,
+        );
+
+        // Create a dummy file in the work folder
+        let work_output_path = job.work_folder_output_path(&work_folder);
+        tokio::fs::write(&work_output_path, "test content")
+            .await
+            .unwrap();
+
+        let config = Config::default();
+        let processor = FFmpegProcessor::new(config, false);
+
+        // Move the file
+        processor
+            .move_to_destination(&job, Some(&media_folder), &work_folder)
+            .await
+            .unwrap();
+
+        // Verify the file was moved
+        assert!(!work_output_path.exists());
+        let final_path = job.full_output_path(Some(&media_folder));
+        assert!(final_path.exists());
+
+        let content = tokio::fs::read_to_string(&final_path).await.unwrap();
+        assert_eq!(content, "test content");
     }
 }
