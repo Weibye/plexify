@@ -245,8 +245,7 @@ impl QualityPreset {
             "ultrafast" => Ok(QualityPreset::UltraFast),
             "archive" => Ok(QualityPreset::Archive),
             _ => Err(anyhow!(
-                "Unknown quality preset '{}'. Available presets: fast, balanced, quality, ultrafast, archive",
-                name
+                "Unknown quality preset '{name}'. Available presets: fast, balanced, quality, ultrafast, archive"
             )),
         }
     }
