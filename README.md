@@ -90,6 +90,9 @@ plexify work /path/to/media --background
 
 # Clean up temporary files
 plexify clean /path/to/media
+
+# Validate Plex naming scheme conformity
+plexify validate /path/to/media
 ```
 
 ### Hierarchical Directory Support
@@ -173,6 +176,56 @@ plexify work /home/user/Videos --background
 ```bash
 plexify clean /home/user/Videos
 ```
+
+5. **Validate**: Check Plex naming scheme conformity (optional)
+```bash
+plexify validate /home/user/Videos
+```
+
+## Plex Naming Scheme Validation
+
+The `validate` command checks your media files against Plex naming conventions and generates a detailed report:
+
+```bash
+plexify validate /path/to/media
+```
+
+### Supported Naming Patterns
+
+**TV Shows:**
+- `TV Shows/Show Name/Season NN/Show Name - sNNeNN - Episode Name.ext`
+- `TV Shows/Show Name/Season NN/Show Name SNNeNN Episode Name.ext`  
+- `TV Shows/Show Name/Season NN/SNNeNN - Episode Name.ext`
+
+**Movies:**
+- `Movies/Movie Name (Year)/Movie Name (Year).ext`
+- `Movies/Collection Name/Movie Name (Year).ext`
+
+### Example Output
+
+```
+📊 Plex Naming Scheme Validation Report
+═══════════════════════════════════════
+📂 Scanned directory: /home/user/Videos
+📁 Files scanned: 12
+⚠️  Issues found: 3
+
+🔍 Issues Found:
+─────────────────
+
+❌ /home/user/Videos/random/movie.mkv
+   Issue: File is not in a recognized directory structure (Movies/ or TV Shows/)
+
+❌ /home/user/Videos/TV Shows/Show/episode.mkv
+   Issue: TV show file doesn't match expected naming pattern
+
+📈 Issue Summary:
+─────────────────
+• Directory Structure: 1 files
+• TV Show Naming: 2 files
+```
+
+The report helps you identify files that need to be renamed for optimal Plex organization.
 
 ## Configuration
 

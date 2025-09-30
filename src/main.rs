@@ -23,6 +23,9 @@
 //!
 //! # Clean up temporary files
 //! plexify clean /path/to/media
+//!
+//! # Validate Plex naming scheme conformity
+//! plexify validate /path/to/media
 //! ```
 
 use anyhow::Result;
@@ -38,7 +41,9 @@ mod job;
 mod queue;
 mod worker;
 
-use commands::{clean::CleanCommand, scan::ScanCommand, work::WorkCommand};
+use commands::{
+    clean::CleanCommand, scan::ScanCommand, validate::ValidateCommand, work::WorkCommand,
+};
 
 /// Plexify - A simple, distributed media transcoding CLI
 #[derive(Parser)]
@@ -85,6 +90,11 @@ enum Commands {
         /// Path to the queue directory (defaults to current working directory)
         #[arg(long, short = 'q')]
         queue_dir: Option<PathBuf>,
+    },
+    /// Validate Plex naming scheme conformity
+    Validate {
+        /// Path to the media directory to validate
+        path: PathBuf,
     },
 }
 
@@ -135,6 +145,17 @@ async fn main() -> Result<()> {
                 path, queue_root
             );
             CleanCommand::new(path, queue_root).execute().await
+        }
+        Commands::Validate { path } => {
+            info!("Starting validate command for path: {:?}", path);
+            let validate_cmd = ValidateCommand::new(path);
+            match validate_cmd.execute().await {
+                Ok(report) => {
+                    validate_cmd.print_report(&report);
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
         }
     };
 
