@@ -3,6 +3,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use tracing::{debug, info};
 use walkdir::WalkDir;
 
@@ -30,13 +31,15 @@ pub struct NamingPatterns {
     pub patterns: Vec<NamingPattern>,
 }
 
-/// Unified naming pattern
+/// Unified naming pattern with precompiled regex
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NamingPattern {
     pub description: String,
     pub pattern: String,
     pub example: String,
     pub content_type: ContentType,
+    #[serde(skip)]
+    pub compiled_regex: Option<Regex>,
 }
 
 /// Validation issue found in a media file
@@ -65,12 +68,22 @@ pub struct ValidationReport {
     pub issues: Vec<ValidationIssue>,
     pub patterns_used: NamingPatterns,
     pub scan_path: PathBuf,
+    pub validation_time: Duration,
 }
 
 /// Command to validate Plex naming scheme conformity
 pub struct ValidateCommand {
     media_root: PathBuf,
     patterns: NamingPatterns,
+    compiled_patterns: Vec<CompiledPattern>,
+}
+
+/// Internal structure for compiled regex patterns
+#[derive(Debug, Clone)]
+struct CompiledPattern {
+    description: String,
+    regex: Regex,
+    content_type: ContentType,
 }
 
 impl Default for NamingPatterns {
@@ -83,12 +96,14 @@ impl Default for NamingPatterns {
                     pattern: r"^Anime/[^/]+/Season \d{2}/[^/]+ - s\d{2}e\d{2} - [^/]+\.\w+$".to_string(),
                     example: "Anime/Attack on Titan/Season 01/Attack on Titan - s01e01 - To You, in 2000 Years.mkv".to_string(),
                     content_type: ContentType::Show,
+                    compiled_regex: None,
                 },
                 NamingPattern {
                     description: "Alternative Anime format".to_string(),
                     pattern: r"^Anime/[^/]+/Season \d{2}/[^/]+ S\d{2}E\d{2} [^/]+\.\w+$".to_string(),
                     example: "Anime/Attack on Titan/Season 01/Attack on Titan S01E01 To You, in 2000 Years.mkv".to_string(),
                     content_type: ContentType::Show,
+                    compiled_regex: None,
                 },
                 // Series patterns (shows)  
                 NamingPattern {
@@ -96,18 +111,21 @@ impl Default for NamingPatterns {
                     pattern: r"^Series/[^/]+/Season \d{2}/[^/]+ - s\d{2}e\d{2} - [^/]+\.\w+$".to_string(),
                     example: "Series/Breaking Bad/Season 01/Breaking Bad - s01e01 - Pilot.mkv".to_string(),
                     content_type: ContentType::Show,
+                    compiled_regex: None,
                 },
                 NamingPattern {
                     description: "Alternative Series format".to_string(),
                     pattern: r"^Series/[^/]+/Season \d{2}/[^/]+ S\d{2}E\d{2} [^/]+\.\w+$".to_string(),
                     example: "Series/Breaking Bad/Season 01/Breaking Bad S01E01 Pilot.mkv".to_string(),
                     content_type: ContentType::Show,
+                    compiled_regex: None,
                 },
                 NamingPattern {
                     description: "Simple Series format".to_string(),
                     pattern: r"^Series/[^/]+/Season \d{2}/S\d{2}E\d{2} - [^/]+\.\w+$".to_string(),
                     example: "Series/Breaking Bad/Season 01/S01E01 - Pilot.mkv".to_string(),
                     content_type: ContentType::Show,
+                    compiled_regex: None,
                 },
                 // Movie patterns
                 NamingPattern {
@@ -115,12 +133,14 @@ impl Default for NamingPatterns {
                     pattern: r"^Movies/[^/]+ \(\d{4}\)/[^/]+ \(\d{4}\)\.\w+$".to_string(),
                     example: "Movies/The Dark Knight (2008)/The Dark Knight (2008).mkv".to_string(),
                     content_type: ContentType::Movie,
+                    compiled_regex: None,
                 },
                 NamingPattern {
                     description: "Collection Movie format".to_string(),
                     pattern: r"^Movies/[^/]+ Collection/[^/]+ \(\d{4}\)\.\w+$".to_string(),
                     example: "Movies/Marvel Cinematic Universe Collection/Iron Man (2008).mkv".to_string(),
                     content_type: ContentType::Movie,
+                    compiled_regex: None,
                 },
             ],
         }
@@ -130,14 +150,41 @@ impl Default for NamingPatterns {
 impl ValidateCommand {
     /// Create a new validate command
     pub fn new(media_root: PathBuf) -> Self {
+        let patterns = NamingPatterns::default();
+        let compiled_patterns = Self::compile_patterns(&patterns);
+        
         Self {
             media_root,
-            patterns: NamingPatterns::default(),
+            patterns,
+            compiled_patterns,
         }
+    }
+
+    /// Compile all regex patterns once for better performance
+    fn compile_patterns(patterns: &NamingPatterns) -> Vec<CompiledPattern> {
+        patterns
+            .patterns
+            .iter()
+            .filter_map(|pattern| {
+                match Regex::new(&pattern.pattern) {
+                    Ok(regex) => Some(CompiledPattern {
+                        description: pattern.description.clone(),
+                        regex,
+                        content_type: pattern.content_type.clone(),
+                    }),
+                    Err(e) => {
+                        debug!("Failed to compile regex pattern '{}': {}", pattern.pattern, e);
+                        None
+                    }
+                }
+            })
+            .collect()
     }
 
     /// Execute the validation command
     pub async fn execute(&self) -> Result<ValidationReport> {
+        let start_time = Instant::now();
+        
         if !self.media_root.exists() {
             return Err(anyhow!(
                 "Media directory does not exist: {:?}",
@@ -157,7 +204,11 @@ impl ValidateCommand {
             issues: Vec::new(),
             patterns_used: self.patterns.clone(),
             scan_path: self.media_root.clone(),
+            validation_time: Duration::from_secs(0), // Will be set at the end
         };
+
+        // Create a lookup set for media extensions for faster checks
+        let media_extensions: std::collections::HashSet<&str> = MEDIA_EXTENSIONS.iter().copied().collect();
 
         // Walk through the directory to find media files
         for entry in WalkDir::new(&self.media_root)
@@ -175,7 +226,7 @@ impl ValidateCommand {
             // Check if it's a media file
             if let Some(extension) = path.extension() {
                 let ext = extension.to_string_lossy().to_lowercase();
-                if MEDIA_EXTENSIONS.contains(&ext.as_str()) {
+                if media_extensions.contains(ext.as_str()) {
                     report.scanned_files += 1;
 
                     // Get relative path from media root
@@ -189,10 +240,14 @@ impl ValidateCommand {
             }
         }
 
+        let validation_time = start_time.elapsed();
+        report.validation_time = validation_time;
+
         info!(
-            "✅ Validation complete. Scanned {} files, found {} issues",
+            "✅ Validation complete. Scanned {} files, found {} issues in {:.2}s",
             report.scanned_files,
-            report.issues.len()
+            report.issues.len(),
+            validation_time.as_secs_f64()
         );
 
         Ok(report)
@@ -208,20 +263,18 @@ impl ValidateCommand {
 
         debug!("Validating path: {}", path_str);
 
-        // Try all patterns
-        for pattern in &self.patterns.patterns {
-            if let Ok(regex) = Regex::new(&pattern.pattern) {
-                if regex.is_match(&path_str) {
-                    debug!(
-                        "Path matches {} pattern: {}",
-                        match pattern.content_type {
-                            ContentType::Show => "show",
-                            ContentType::Movie => "movie",
-                        },
-                        pattern.description
-                    );
-                    return None; // Valid
-                }
+        // Try all compiled patterns (much faster than recompiling regex each time)
+        for pattern in &self.compiled_patterns {
+            if pattern.regex.is_match(&path_str) {
+                debug!(
+                    "Path matches {} pattern: {}",
+                    match pattern.content_type {
+                        ContentType::Show => "show",
+                        ContentType::Movie => "movie",
+                    },
+                    pattern.description
+                );
+                return None; // Valid
             }
         }
 
@@ -309,6 +362,7 @@ impl ValidateCommand {
         println!("📂 Scanned directory: {}", report.scan_path.display());
         println!("📁 Files scanned: {}", report.scanned_files);
         println!("⚠️  Issues found: {}", report.issues.len());
+        println!("⏱️  Validation time: {:.2}s", report.validation_time.as_secs_f64());
 
         if report.issues.is_empty() {
             println!("\n✅ All files conform to Plex naming conventions!");
@@ -394,6 +448,7 @@ mod tests {
         let report = result.unwrap();
         assert_eq!(report.scanned_files, 0);
         assert_eq!(report.issues.len(), 0);
+        assert!(report.validation_time > Duration::from_secs(0));
     }
 
     #[tokio::test]

@@ -21,10 +21,17 @@ uuid = { version = "1.6", features = ["v4"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 regex = "1.0"
+rayon = "1.8"
 
 [dev-dependencies]
 serial_test = "3.2.0"
 tempfile = "3.8"
+criterion = { version = "0.5", features = ["html_reports"] }
+rayon = "1.8"
+
+[[bench]]
+name = "validate_bench"
+harness = false
 
 [profile.release]
 # Optimize for performance and small binary size
