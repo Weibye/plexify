@@ -243,10 +243,17 @@ plexify validate /path/to/media
 
 ### Supported Naming Patterns
 
-**TV Shows:**
-- `TV Shows/Show Name/Season NN/Show Name - sNNeNN - Episode Name.ext`
-- `TV Shows/Show Name/Season NN/Show Name SNNeNN Episode Name.ext`  
-- `TV Shows/Show Name/Season NN/SNNeNN - Episode Name.ext`
+**TV Series:**
+- `Series/Show Name/Season NN/Show Name - sNNeNN - Episode Name.ext`
+- `Series/Show Name/Season NN/Show Name SNNeNN Episode Name.ext`  
+- `Series/Show Name/Season NN/SNNeNN - Episode Name.ext`
+- `Series/Show Name {tvdb-XXXXXX}/Season NN/Show Name SNNeNN Episode Name.ext` (with TVDB id)
+- `Series/Show Name {tvdb-XXXXXX}/Season NN - Arc Name/Show Name - SNNeNN - Episode Name.ext` (with extended season name)
+
+**Anime:**
+- `Anime/Show Name/Season NN/Show Name - sNNeNN - Episode Name.ext`
+- `Anime/Show Name/Season NN/Show Name SNNeNN Episode Name.ext`
+- `Anime/Show Name {tvdb-XXXXXX}/Season NN/Show Name SNNeNN Episode Name.ext` (with TVDB id)
 
 **Movies:**
 - `Movies/Movie Name (Year)/Movie Name (Year).ext`
