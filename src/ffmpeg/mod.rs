@@ -31,9 +31,8 @@ impl FFmpegCommandBuilder {
         self
     }
 
-    /// Add format-specific flags for MKV files
-    /// Includes subtitle duration fixing for proper subtitle handling
-    pub fn with_mkv_flags(mut self) -> Self {
+    /// Add subtitle duration fixing flag
+    pub fn with_subtitle_duration_fix(mut self) -> Self {
         self.args.push("-fix_sub_duration".to_string());
         self
     }
@@ -46,41 +45,22 @@ impl FFmpegCommandBuilder {
         self
     }
 
-    /// Add video, audio, and subtitle inputs for WebM with external subtitles
-    /// Maps video from first input, audio from first input, and subtitles from second input
-    pub fn with_webm_inputs<P: AsRef<Path>>(mut self, video_path: P, subtitle_path: P) -> Self {
-        self.args.push("-i".to_string());
-        self.args
-            .push(video_path.as_ref().to_string_lossy().to_string());
-        self.args.push("-i".to_string());
-        self.args
-            .push(subtitle_path.as_ref().to_string_lossy().to_string());
+    /// Add multiple input files
+    pub fn with_inputs<P: AsRef<Path>>(mut self, input_paths: &[P]) -> Self {
+        for input_path in input_paths {
+            self.args.push("-i".to_string());
+            self.args
+                .push(input_path.as_ref().to_string_lossy().to_string());
+        }
         self
     }
 
-    /// Add stream mapping for WebM files (video from input 0, audio from input 0, subtitles from input 1)
-    pub fn with_webm_mapping(mut self) -> Self {
-        self.args.extend_from_slice(&[
-            "-map".to_string(),
-            "0:v:0".to_string(),
-            "-map".to_string(),
-            "0:a:0".to_string(),
-            "-map".to_string(),
-            "1:s:0".to_string(),
-        ]);
-        self
-    }
-
-    /// Add stream mapping for MKV files (video, audio, and subtitles all from input 0)
-    pub fn with_mkv_mapping(mut self) -> Self {
-        self.args.extend_from_slice(&[
-            "-map".to_string(),
-            "0:v:0".to_string(),
-            "-map".to_string(),
-            "0:a:0".to_string(),
-            "-map".to_string(),
-            "0:s:0".to_string(),
-        ]);
+    /// Add stream mapping arguments
+    pub fn with_stream_mapping(mut self, mappings: &[&str]) -> Self {
+        for mapping in mappings {
+            self.args.push("-map".to_string());
+            self.args.push(mapping.to_string());
+        }
         self
     }
 
@@ -154,7 +134,6 @@ impl FFmpegProcessor {
         }
     }
 
-    /// Process a job using FFmpeg with the builder pattern
     pub async fn process_job(
         &self,
         job: &Job,
@@ -180,7 +159,6 @@ impl FFmpegProcessor {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        // Build FFmpeg command using the builder pattern
         let mut ffmpeg_builder = FFmpegCommandBuilder::new()
             .with_common_flags()
             .with_video_encoding(&job.quality_settings)
@@ -199,16 +177,16 @@ impl FFmpegProcessor {
                     }
 
                     ffmpeg_builder
-                        .with_webm_inputs(&input_path, &vtt_path)
-                        .with_webm_mapping()
+                        .with_inputs(&[&input_path, &vtt_path])
+                        .with_stream_mapping(&["0:v:0", "0:a:0", "1:s:0"])
                 } else {
                     return Err(anyhow!("WebM job missing subtitle path"));
                 }
             }
             MediaFileType::Mkv => ffmpeg_builder
-                .with_mkv_flags()
+                .with_subtitle_duration_fix()
                 .with_input(&input_path)
-                .with_mkv_mapping(),
+                .with_stream_mapping(&["0:v:0", "0:a:0", "0:s:0"]),
         };
 
         // Create the base command (with optional nice for background mode)
@@ -363,8 +341,8 @@ mod tests {
 
         let args = FFmpegCommandBuilder::new()
             .with_common_flags()
-            .with_webm_inputs("/path/to/video.webm", "/path/to/video.vtt")
-            .with_webm_mapping()
+            .with_inputs(&["/path/to/video.webm", "/path/to/video.vtt"])
+            .with_stream_mapping(&["0:v:0", "0:a:0", "1:s:0"])
             .with_video_encoding(&quality)
             .with_audio_encoding(&quality)
             .with_subtitle_encoding()
@@ -416,9 +394,9 @@ mod tests {
 
         let args = FFmpegCommandBuilder::new()
             .with_common_flags()
-            .with_mkv_flags()
+            .with_subtitle_duration_fix()
             .with_input("/path/to/video.mkv")
-            .with_mkv_mapping()
+            .with_stream_mapping(&["0:v:0", "0:a:0", "0:s:0"])
             .with_video_encoding(&quality)
             .with_audio_encoding(&quality)
             .with_subtitle_encoding()
@@ -481,9 +459,9 @@ mod tests {
 
         let _builder = FFmpegCommandBuilder::new()
             .with_common_flags()
-            .with_mkv_flags()
+            .with_subtitle_duration_fix()
             .with_input("test.mkv")
-            .with_mkv_mapping()
+            .with_stream_mapping(&["0:v:0", "0:a:0", "0:s:0"])
             .with_video_encoding(&quality)
             .with_audio_encoding(&quality)
             .with_subtitle_encoding()
@@ -500,7 +478,7 @@ mod tests {
         let output_path = PathBuf::from("/test/output.mp4");
 
         let args = FFmpegCommandBuilder::new()
-            .with_webm_inputs(&input_path, &subtitle_path)
+            .with_inputs(&[&input_path, &subtitle_path])
             .with_output(&output_path)
             .build();
 
