@@ -95,14 +95,14 @@ impl Default for NamingPatterns {
                 // Anime patterns (shows)
                 NamingPattern {
                     description: "Standard Anime format".to_string(),
-                    pattern: r"^Anime/[^/]+/Season \d{2}/[^/]+ - s\d{2}e\d{2} - [^/]+\.\w+$".to_string(),
+                    pattern: r"^Anime/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/[^/]+ - s\d{2}e\d{2} - [^/]+\.\w+$".to_string(),
                     example: "Anime/Attack on Titan/Season 01/Attack on Titan - s01e01 - To You, in 2000 Years.mkv".to_string(),
                     content_type: ContentType::Show,
                     compiled_regex: None,
                 },
                 NamingPattern {
                     description: "Alternative Anime format".to_string(),
-                    pattern: r"^Anime/[^/]+/Season \d{2}/[^/]+ S\d{2}E\d{2} [^/]+\.\w+$".to_string(),
+                    pattern: r"^Anime/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/[^/]+ S\d{2}E\d{2} [^/]+\.\w+$".to_string(),
                     example: "Anime/Attack on Titan/Season 01/Attack on Titan S01E01 To You, in 2000 Years.mkv".to_string(),
                     content_type: ContentType::Show,
                     compiled_regex: None,
@@ -110,21 +110,21 @@ impl Default for NamingPatterns {
                 // Series patterns (shows)  
                 NamingPattern {
                     description: "Standard Series format".to_string(),
-                    pattern: r"^Series/[^/]+/Season \d{2}/[^/]+ - s\d{2}e\d{2} - [^/]+\.\w+$".to_string(),
+                    pattern: r"^Series/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/[^/]+ - s\d{2}e\d{2} - [^/]+\.\w+$".to_string(),
                     example: "Series/Breaking Bad/Season 01/Breaking Bad - s01e01 - Pilot.mkv".to_string(),
                     content_type: ContentType::Show,
                     compiled_regex: None,
                 },
                 NamingPattern {
                     description: "Alternative Series format".to_string(),
-                    pattern: r"^Series/[^/]+/Season \d{2}/[^/]+ S\d{2}E\d{2} [^/]+\.\w+$".to_string(),
-                    example: "Series/Breaking Bad/Season 01/Breaking Bad S01E01 Pilot.mkv".to_string(),
+                    pattern: r"^Series/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/[^/]+ S\d{2}E\d{2} [^/]+\.\w+$".to_string(),
+                    example: "Series/Breaking Bad (2008) {tvdb-296861}/Season 01/Breaking Bad S01E01 Pilot.mkv".to_string(),
                     content_type: ContentType::Show,
                     compiled_regex: None,
                 },
                 NamingPattern {
                     description: "Simple Series format".to_string(),
-                    pattern: r"^Series/[^/]+/Season \d{2}/S\d{2}E\d{2} - [^/]+\.\w+$".to_string(),
+                    pattern: r"^Series/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/S\d{2}E\d{2} - [^/]+\.\w+$".to_string(),
                     example: "Series/Breaking Bad/Season 01/S01E01 - Pilot.mkv".to_string(),
                     content_type: ContentType::Show,
                     compiled_regex: None,
@@ -655,5 +655,107 @@ mod tests {
         // Should ignore: test.tmp (root pattern), Series/old/old_episode.mkv (nested pattern)
         assert_eq!(report.scanned_files, 2);
         assert_eq!(report.issues.len(), 1); // Only Series/good_show.mkv has incorrect naming
+    }
+
+    #[tokio::test]
+    async fn test_validate_series_with_tvdb_id() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        // Test 1: Simple case with TVDB id that should match "Alternative Series format"
+        let series_path1 = media_root.join("Series/Critical Role (2015) {tvdb-296861}/Season 01");
+        fs::create_dir_all(&series_path1).unwrap();
+        fs::write(
+            series_path1.join("Critical Role S01E01 Arrival at Kraghammer.mp4"),
+            "",
+        )
+        .unwrap();
+
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let result = validate_cmd.execute().await;
+
+        assert!(result.is_ok());
+        let report = result.unwrap();
+        assert_eq!(report.scanned_files, 1);
+
+        // Print debug info to understand what's happening
+        for issue in &report.issues {
+            println!(
+                "Issue: {} - {}",
+                issue.file_path.display(),
+                issue.description
+            );
+        }
+
+        // Now this should pass - TVDB id in series name should be valid
+        assert_eq!(
+            report.issues.len(),
+            0,
+            "TVDB id in series name should be valid, but found {} issues",
+            report.issues.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_complex_series_with_tvdb_id() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        // Test the exact case from the issue with extended season name and brackets
+        let series_path =
+            media_root.join("Series/Critical Role (2015) {tvdb-296861}/Season 01 - Vox Machina");
+        fs::create_dir_all(&series_path).unwrap();
+        fs::write(
+            series_path.join("Critical Role - S01E01 - Arrival at Kraghammer - [1080p30].mp4"),
+            "",
+        )
+        .unwrap();
+
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let result = validate_cmd.execute().await;
+
+        assert!(result.is_ok());
+        let report = result.unwrap();
+        assert_eq!(report.scanned_files, 1);
+
+        // Print debug info
+        for issue in &report.issues {
+            println!(
+                "Complex case issue: {} - {}",
+                issue.file_path.display(),
+                issue.description
+            );
+        }
+
+        // This should now pass with updated patterns
+        assert_eq!(
+            report.issues.len(),
+            0,
+            "Complex TVDB case should be valid, but found {} issues",
+            report.issues.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_anime_with_tvdb_id() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        // Test anime with TVDB id
+        let anime_path = media_root.join("Anime/Attack on Titan {tvdb-123456}/Season 01");
+        fs::create_dir_all(&anime_path).unwrap();
+        fs::write(
+            anime_path.join("Attack on Titan S01E01 To You in 2000 Years.mkv"),
+            "",
+        )
+        .unwrap();
+
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let result = validate_cmd.execute().await;
+
+        assert!(result.is_ok());
+        let report = result.unwrap();
+        assert_eq!(report.scanned_files, 1);
+        assert_eq!(report.issues.len(), 0, "Anime with TVDB id should be valid");
     }
 }
