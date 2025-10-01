@@ -150,7 +150,10 @@ impl JobQueue {
     /// Recover stale jobs from in_progress directory back to the queue
     /// This is called on worker startup to handle jobs that were being processed
     /// when the previous worker was shut down unexpectedly
-    pub async fn recover_stale_jobs(&self, processor: Option<&crate::ffmpeg::FFmpegProcessor>) -> Result<usize> {
+    pub async fn recover_stale_jobs(
+        &self,
+        processor: Option<&crate::ffmpeg::FFmpegProcessor>,
+    ) -> Result<usize> {
         let mut recovered_count = 0;
 
         if !self.in_progress_dir.exists() {
@@ -175,11 +178,16 @@ impl JobQueue {
                     // Check for partial transcoding progress if processor is available
                     let mut has_partial = false;
                     if let Some(proc) = processor {
-                        has_partial = proc.detect_partial_progress(&mut job, &self.in_progress_dir).await?;
-                        
+                        has_partial = proc
+                            .detect_partial_progress(&mut job, &self.in_progress_dir)
+                            .await?;
+
                         if has_partial {
-                            info!("🔄 Found partial transcoding progress for job: {}", job_name);
-                            
+                            info!(
+                                "🔄 Found partial transcoding progress for job: {}",
+                                job_name
+                            );
+
                             // Update job file with progress information
                             let updated_content = serde_json::to_string_pretty(&job)?;
                             async_fs::write(&in_progress_path, updated_content).await?;

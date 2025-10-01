@@ -47,7 +47,7 @@ pub struct PostProcessingSettings {
 }
 
 /// Progress information for resuming interrupted transcoding
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct TranscodingProgress {
     /// Whether this job has been started before
     pub started: bool,
@@ -55,16 +55,6 @@ pub struct TranscodingProgress {
     pub partial_duration_seconds: Option<f64>,
     /// Path to partial output file in work folder
     pub partial_output_path: Option<PathBuf>,
-}
-
-impl Default for TranscodingProgress {
-    fn default() -> Self {
-        Self {
-            started: false,
-            partial_duration_seconds: None,
-            partial_output_path: None,
-        }
-    }
 }
 
 /// Supported media file types
