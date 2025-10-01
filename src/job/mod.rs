@@ -13,6 +13,8 @@ pub struct Job {
     pub file_type: MediaFileType,
     pub quality_settings: QualitySettings,
     pub post_processing: PostProcessingSettings,
+    /// Progress information for resuming interrupted transcoding
+    pub progress: TranscodingProgress,
 }
 
 /// Quality settings for video encoding
@@ -42,6 +44,27 @@ pub enum QualityPreset {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PostProcessingSettings {
     pub disable_source_files: bool,
+}
+
+/// Progress information for resuming interrupted transcoding
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TranscodingProgress {
+    /// Whether this job has been started before
+    pub started: bool,
+    /// Duration of partial output file in seconds (for resuming)
+    pub partial_duration_seconds: Option<f64>,
+    /// Path to partial output file in work folder
+    pub partial_output_path: Option<PathBuf>,
+}
+
+impl Default for TranscodingProgress {
+    fn default() -> Self {
+        Self {
+            started: false,
+            partial_duration_seconds: None,
+            partial_output_path: None,
+        }
+    }
 }
 
 /// Supported media file types
@@ -87,6 +110,7 @@ impl Job {
             file_type,
             quality_settings,
             post_processing,
+            progress: TranscodingProgress::default(),
         }
     }
 

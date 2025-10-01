@@ -49,16 +49,16 @@ impl WorkCommand {
         let queue = JobQueue::new(self.media_root.clone(), self.work_root.clone());
         queue.init().await?;
 
+        let processor = FFmpegProcessor::new(config.clone(), self.background_mode);
+
         // Recover any stale jobs from previous worker sessions
-        let recovered_count = queue.recover_stale_jobs().await?;
+        let recovered_count = queue.recover_stale_jobs(Some(&processor)).await?;
         if recovered_count > 0 {
             info!(
                 "🔄 Found and recovered {} stale job(s) from previous session",
                 recovered_count
             );
         }
-
-        let processor = FFmpegProcessor::new(config.clone(), self.background_mode);
 
         // Set up signal handling for graceful shutdown
         tokio::pin! {

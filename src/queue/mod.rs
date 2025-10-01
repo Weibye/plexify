@@ -150,7 +150,7 @@ impl JobQueue {
     /// Recover stale jobs from in_progress directory back to the queue
     /// This is called on worker startup to handle jobs that were being processed
     /// when the previous worker was shut down unexpectedly
-    pub async fn recover_stale_jobs(&self) -> Result<usize> {
+    pub async fn recover_stale_jobs(&self, processor: Option<&crate::ffmpeg::FFmpegProcessor>) -> Result<usize> {
         let mut recovered_count = 0;
 
         if !self.in_progress_dir.exists() {
@@ -168,12 +168,34 @@ impl JobQueue {
                         .and_then(|n| n.to_str())
                         .ok_or_else(|| anyhow!("Invalid job filename"))?;
 
+                    // Read and deserialize job content
+                    let content = async_fs::read_to_string(&in_progress_path).await?;
+                    let mut job: crate::job::Job = serde_json::from_str(&content)?;
+
+                    // Check for partial transcoding progress if processor is available
+                    let mut has_partial = false;
+                    if let Some(proc) = processor {
+                        has_partial = proc.detect_partial_progress(&mut job, &self.in_progress_dir).await?;
+                        
+                        if has_partial {
+                            info!("🔄 Found partial transcoding progress for job: {}", job_name);
+                            
+                            // Update job file with progress information
+                            let updated_content = serde_json::to_string_pretty(&job)?;
+                            async_fs::write(&in_progress_path, updated_content).await?;
+                        }
+                    }
+
                     let queue_path = self.queue_dir.join(job_name);
 
                     // Move the job from in_progress back to queue
                     match async_fs::rename(&in_progress_path, &queue_path).await {
                         Ok(_) => {
-                            warn!("🔄 Recovered stale job: {}", job_name);
+                            if has_partial {
+                                warn!("🔄 Recovered stale job with partial progress: {}", job_name);
+                            } else {
+                                warn!("🔄 Recovered stale job: {}", job_name);
+                            }
                             recovered_count += 1;
                         }
                         Err(e) => {
@@ -341,7 +363,7 @@ mod tests {
         assert_eq!(in_progress_count, 1); // One job stuck in progress
 
         // Now recover stale jobs
-        let recovered_count = queue.recover_stale_jobs().await.unwrap();
+        let recovered_count = queue.recover_stale_jobs(None).await.unwrap();
         assert_eq!(recovered_count, 1);
 
         // Verify job is back in queue
@@ -368,7 +390,7 @@ mod tests {
         queue.init().await.unwrap();
 
         // Should recover 0 jobs when in_progress is empty
-        let recovered_count = queue.recover_stale_jobs().await.unwrap();
+        let recovered_count = queue.recover_stale_jobs(None).await.unwrap();
         assert_eq!(recovered_count, 0);
     }
 
@@ -379,7 +401,7 @@ mod tests {
         // Don't call init() to simulate missing in_progress directory
 
         // Should handle missing in_progress directory gracefully
-        let recovered_count = queue.recover_stale_jobs().await.unwrap();
+        let recovered_count = queue.recover_stale_jobs(None).await.unwrap();
         assert_eq!(recovered_count, 0);
     }
 }
