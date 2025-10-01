@@ -371,6 +371,110 @@ fn test_work_folder_workflow() {
     std::env::remove_var("FFMPEG_PRESET");
 }
 
+/// Test the add command with individual files
+#[test]
+#[serial]
+fn test_add_command_individual_files() {
+    build_plexify();
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+
+    // Create test files
+    let mkv_file = temp_path.join("movie.mkv");
+    let webm_file = temp_path.join("video.webm");
+    let vtt_file = temp_path.join("video.vtt");
+
+    fs::write(&mkv_file, "test mkv content").unwrap();
+    fs::write(&webm_file, "test webm content").unwrap();
+    fs::write(&vtt_file, "test vtt content").unwrap();
+
+    // Test add command with MKV (no subtitles needed)
+    let add_mkv_output = Command::new("./target/debug/plexify")
+        .args([
+            "add",
+            mkv_file.to_str().unwrap(),
+            "--work-dir",
+            temp_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute add command for MKV");
+
+    assert!(add_mkv_output.status.success(), "Add MKV command failed");
+    let add_mkv_stdout = String::from_utf8_lossy(&add_mkv_output.stdout);
+    assert!(
+        add_mkv_stdout.contains("Successfully created transcoding job"),
+        "Should create job for MKV file"
+    );
+
+    // Test add command with WebM (with subtitles)
+    let add_webm_output = Command::new("./target/debug/plexify")
+        .args([
+            "add",
+            webm_file.to_str().unwrap(),
+            "--work-dir",
+            temp_path.to_str().unwrap(),
+            "--preset",
+            "quality",
+        ])
+        .output()
+        .expect("Failed to execute add command for WebM");
+
+    assert!(add_webm_output.status.success(), "Add WebM command failed");
+    let add_webm_stdout = String::from_utf8_lossy(&add_webm_output.stdout);
+    assert!(
+        add_webm_stdout.contains("Successfully created transcoding job"),
+        "Should create job for WebM file with subtitles"
+    );
+
+    // Verify queue directory and job files were created
+    let queue_dir = temp_path.join("_queue");
+    assert!(queue_dir.exists(), "Queue directory should exist");
+
+    let job_count = fs::read_dir(&queue_dir)
+        .unwrap()
+        .filter(|entry| entry.as_ref().unwrap().path().extension() == Some("job".as_ref()))
+        .count();
+    assert_eq!(job_count, 2, "Should have created 2 job files");
+
+    // Test error case: WebM without subtitle
+    let webm_no_sub = temp_path.join("nosub.webm");
+    fs::write(&webm_no_sub, "webm without sub").unwrap();
+
+    let add_nosub_output = Command::new("./target/debug/plexify")
+        .args([
+            "add",
+            webm_no_sub.to_str().unwrap(),
+            "--work-dir",
+            temp_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute add command for WebM without subtitle");
+
+    assert!(
+        !add_nosub_output.status.success(),
+        "Add command should fail for WebM without subtitle"
+    );
+
+    // Test error case: unsupported file type
+    let mp4_file = temp_path.join("video.mp4");
+    fs::write(&mp4_file, "mp4 content").unwrap();
+
+    let add_mp4_output = Command::new("./target/debug/plexify")
+        .args([
+            "add",
+            mp4_file.to_str().unwrap(),
+            "--work-dir",
+            temp_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute add command for unsupported file");
+
+    assert!(
+        !add_mp4_output.status.success(),
+        "Add command should fail for unsupported file type"
+    );
+}
+
 /// Test hierarchical directory scanning functionality
 #[test]
 #[serial]
