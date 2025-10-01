@@ -147,7 +147,8 @@ impl FFmpegProcessor {
         }
 
         // Move the file from work folder to final location
-        tokio::fs::rename(&work_output_path, &final_output_path).await?;
+        tokio::fs::copy(&work_output_path, &final_output_path).await?;
+        tokio::fs::remove_file(&work_output_path).await?;
 
         info!(
             "📁 Moved completed file: {:?} -> {:?}",
