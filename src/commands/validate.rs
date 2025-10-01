@@ -6,8 +6,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use walkdir::WalkDir;
+
+use crate::ignore::IgnoreFilter;
 
 /// Media file extensions that should be validated
 const MEDIA_EXTENSIONS: &[&str] = &["mkv", "mp4", "avi", "webm", "mov", "m4v"];
@@ -196,12 +198,23 @@ impl ValidateCommand {
         info!("🔍 Validating Plex naming scheme in: {:?}", self.media_root);
         info!("📁 Recursively scanning all subdirectories...");
 
+        // Initialize ignore filter
+        let ignore_filter = match IgnoreFilter::new(self.media_root.clone()) {
+            Ok(filter) => Some(filter),
+            Err(e) => {
+                warn!("Failed to load .plexifyignore patterns: {}", e);
+                None
+            }
+        };
+
         // Create a lookup set for media extensions for faster checks
         let media_extensions: std::collections::HashSet<&str> =
             MEDIA_EXTENSIONS.iter().copied().collect();
 
         // First, collect all media files
         let mut media_files = Vec::new();
+        let mut ignored_count = 0;
+
         for entry in WalkDir::new(&self.media_root)
             .follow_links(false)
             .into_iter()
@@ -212,6 +225,15 @@ impl ValidateCommand {
             // Skip directories and non-media files
             if path.is_dir() {
                 continue;
+            }
+
+            // Check if this path should be ignored
+            if let Some(ref filter) = ignore_filter {
+                if filter.should_ignore(path) {
+                    debug!("🚫 Ignoring path: {:?}", path);
+                    ignored_count += 1;
+                    continue;
+                }
             }
 
             // Check if it's a media file
@@ -227,6 +249,13 @@ impl ValidateCommand {
             "🔍 Found {} media files, validating in parallel...",
             media_files.len()
         );
+
+        if ignored_count > 0 {
+            info!(
+                "📋 Ignored {} paths due to .plexifyignore patterns",
+                ignored_count
+            );
+        }
 
         // Create shared reference to self for parallel processing
         let media_root = Arc::new(&self.media_root);
@@ -553,5 +582,78 @@ mod tests {
 
         let result = validate_cmd.execute().await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_validate_with_plexifyignore() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        // Create .plexifyignore file
+        fs::write(
+            media_root.join(".plexifyignore"),
+            "Downloads/\n*.tmp\ntools",
+        )
+        .unwrap();
+
+        // Create directory structure with media files
+        fs::create_dir_all(media_root.join("Downloads")).unwrap();
+        fs::create_dir_all(media_root.join("tools")).unwrap();
+        fs::create_dir_all(media_root.join("Movies/Good Movie (2021)")).unwrap();
+
+        // Create media files - some should be ignored
+        fs::write(media_root.join("Downloads/bad_movie.mkv"), "").unwrap();
+        fs::write(media_root.join("tools/utility.mkv"), "").unwrap();
+        fs::write(media_root.join("temp.tmp"), "").unwrap();
+        fs::write(
+            media_root.join("Movies/Good Movie (2021)/Good Movie (2021).mkv"),
+            "",
+        )
+        .unwrap();
+
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let result = validate_cmd.execute().await;
+
+        assert!(result.is_ok());
+        let report = result.unwrap();
+
+        // Should only scan the non-ignored movie file
+        assert_eq!(report.scanned_files, 1);
+        assert_eq!(report.issues.len(), 0); // The movie is correctly named
+    }
+
+    #[tokio::test]
+    async fn test_validate_with_nested_plexifyignore() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        // Create root .plexifyignore
+        fs::write(media_root.join(".plexifyignore"), "*.tmp").unwrap();
+
+        // Create nested directory with its own .plexifyignore
+        fs::create_dir_all(media_root.join("Series/old")).unwrap();
+        fs::create_dir_all(media_root.join("Movies/Good Movie (2021)")).unwrap();
+        fs::write(media_root.join("Series/.plexifyignore"), "old/").unwrap();
+
+        // Create test files
+        fs::write(media_root.join("test.tmp"), "").unwrap();
+        fs::write(media_root.join("Series/good_show.mkv"), "").unwrap();
+        fs::write(media_root.join("Series/old/old_episode.mkv"), "").unwrap();
+        fs::write(
+            media_root.join("Movies/Good Movie (2021)/Good Movie (2021).mkv"),
+            "",
+        )
+        .unwrap();
+
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let result = validate_cmd.execute().await;
+
+        assert!(result.is_ok());
+        let report = result.unwrap();
+
+        // Should scan 2 files: Series/good_show.mkv and the movie
+        // Should ignore: test.tmp (root pattern), Series/old/old_episode.mkv (nested pattern)
+        assert_eq!(report.scanned_files, 2);
+        assert_eq!(report.issues.len(), 1); // Only Series/good_show.mkv has incorrect naming
     }
 }

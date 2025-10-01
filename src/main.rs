@@ -37,6 +37,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 mod commands;
 mod config;
 mod ffmpeg;
+mod ignore;
 mod job;
 mod queue;
 mod worker;

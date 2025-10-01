@@ -1,0 +1,64 @@
+# Example .plexifyignore file for Plexify
+# Copy this file to .plexifyignore in your media directory and customize as needed
+
+# System and temporary directories
+Downloads/
+InProgress/
+lost+found/
+.Trash/
+.recycle/
+System Volume Information/
+$RECYCLE.BIN/
+
+# Build and development artifacts
+node_modules/
+.git/
+.svn/
+.vscode/
+.idea/
+
+# Temporary and backup files
+*.tmp
+*.temp
+*.bak
+*.old
+*.backup
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Media processing artifacts
+*.log
+*.part
+*.aria2
+*.crdownload
+*.download
+
+# Subtitles that might not be needed
+*.idx
+*.sub
+*.sup
+
+# Other media formats you might want to skip
+*.iso
+*.img
+*.dmg
+
+# Example: Ignore old content but allow specifically named important files
+old_episodes/
+archive/
+!important_archive.mkv
+
+# Example: Only ignore temp files in root directory
+/temp.mkv
+/processing.webm
+
+# Example: Ignore specific show that has issues
+"Problematic Show Name/Season 01/"
+
+# Patterns can be combined - this ignores all .txt files except readme.txt
+*.txt
+!readme.txt

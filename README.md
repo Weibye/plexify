@@ -144,6 +144,57 @@ plexify scan --preset quality /path/to/media
 plexify scan --preset fast /path/to/media
 ```
 
+### .plexifyignore Support
+
+Plexify supports `.plexifyignore` files to exclude directories and files from scanning and validation. These files work similar to `.gitignore` files and can be placed at any level in your directory tree.
+
+#### Pattern Syntax
+
+- **Basic patterns**: `filename.ext`, `directory_name`
+- **Wildcards**: `*.tmp`, `*.log` 
+- **Directory patterns**: `Downloads/` (trailing slash matches directories only)
+- **Negation**: `!important.mkv` (include files that would otherwise be ignored)
+- **Path patterns**: `path/to/file` (relative to the .plexifyignore location)
+- **Root patterns**: `/Downloads` (absolute from the .plexifyignore location)
+
+#### Example .plexifyignore
+
+```
+# Ignore system directories
+Downloads/
+InProgress/
+lost+found/
+tools/
+
+# Ignore temporary and backup files
+*.tmp
+*.bak
+*.old
+*.DS_Store
+Thumbs.db
+
+# Ignore specific directories but allow important files
+old_episodes/
+!important_episode.mkv
+
+# Ignore files in root only
+/temp_file.mkv
+```
+
+#### Usage
+
+1. Create a `.plexifyignore` file in your media root or any subdirectory
+2. Add patterns for files/directories you want to exclude
+3. Run `plexify scan` or `plexify validate` - ignored paths will be skipped automatically
+
+The `scan` and `validate` commands will show how many paths were ignored:
+
+```
+📋 Ignored 15 paths due to .plexifyignore patterns
+```
+
+**Note**: Nested `.plexifyignore` files are supported - patterns from parent directories apply to child directories, with child patterns taking precedence.
+
 Environment variables can override preset values:
 ```bash
 # Use quality preset but override CRF to 20
