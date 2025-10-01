@@ -681,7 +681,7 @@ mod tests {
     async fn test_validate_series_with_tvdb_id() {
         let temp_dir = TempDir::new().unwrap();
         let media_root = temp_dir.path();
-        
+
         // Test 1: Simple case with TVDB id that should match "Alternative Series format"
         let series_path1 = media_root.join("Series/Critical Role (2015) {tvdb-296861}/Season 01");
         fs::create_dir_all(&series_path1).unwrap();
@@ -697,7 +697,7 @@ mod tests {
         assert!(result.is_ok());
         let report = result.unwrap();
         assert_eq!(report.scanned_files, 1);
-        
+
         // Print debug info to understand what's happening
         for issue in &report.issues {
             println!(
@@ -706,7 +706,7 @@ mod tests {
                 issue.description
             );
         }
-        
+
         // Now this should pass - TVDB id in series name should be valid
         assert_eq!(
             report.issues.len(),
@@ -715,7 +715,7 @@ mod tests {
             report.issues.len()
         );
     }
-    
+
     #[tokio::test]
     async fn test_validate_complex_series_with_tvdb_id() {
         let temp_dir = TempDir::new().unwrap();
@@ -807,13 +807,14 @@ mod tests {
         fs::write(
             media_root.join("Movies/Good Movie (2021)/Good Movie (2021).mkv"),
             "",
-        ).unwrap();
+        )
+        .unwrap();
 
         let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
         let result = validate_cmd.execute().await;
         assert!(result.is_ok());
         let report = result.unwrap();
-        
+
         // Should only scan 1 file (the movie), not the 200+ files in ignored directories
         assert_eq!(report.scanned_files, 1);
         assert_eq!(report.issues.len(), 0); // The movie is correctly named
