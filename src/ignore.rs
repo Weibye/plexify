@@ -196,6 +196,80 @@ impl IgnoreFilter {
         );
         ignored
     }
+
+    /// Check if a directory should be skipped during traversal
+    /// This is an optimized version for directory-level checking that doesn't
+    /// perform parent directory lookups to avoid infinite recursion during walkdir
+    pub fn should_skip_dir(&self, path: &Path) -> bool {
+        if !path.is_dir() {
+            return false;
+        }
+
+        let relative_path = match path.strip_prefix(&self.root) {
+            Ok(rel) => rel,
+            Err(_) => {
+                // Path is not under root, don't skip
+                return false;
+            }
+        };
+
+        // Convert to forward slashes for consistent matching
+        let path_str = relative_path.to_string_lossy().replace("\\", "/");
+
+        trace!("Checking if directory should be skipped: {}", path_str);
+
+        // Check patterns from all applicable directories, starting from root to specific
+        let mut ignored = false;
+
+        // Get all directories that could have patterns affecting this path
+        let mut applicable_dirs: Vec<_> = self
+            .patterns_by_dir
+            .keys()
+            .filter(|dir| {
+                // Include if the pattern directory is an ancestor of the path
+                path.starts_with(dir) || dir == &&self.root
+            })
+            .collect();
+
+        // Sort by depth (root first, then deeper directories)
+        applicable_dirs.sort_by_key(|dir| dir.components().count());
+
+        for dir in applicable_dirs {
+            if let Some(patterns) = self.patterns_by_dir.get(dir) {
+                // Calculate relative path from this pattern directory
+                let pattern_relative_path = if dir == &self.root {
+                    path_str.clone()
+                } else {
+                    match path.strip_prefix(dir) {
+                        Ok(rel) => rel.to_string_lossy().replace("\\", "/"),
+                        Err(_) => path_str.clone(), // Fallback to full relative path
+                    }
+                };
+
+                for pattern in patterns {
+                    if pattern.matches(&pattern_relative_path, true)
+                        || pattern.matches(&path_str, true)
+                    {
+                        ignored = !pattern.negation;
+                        trace!(
+                            "Pattern '{}' from {} {} directory '{}'",
+                            pattern.original,
+                            dir.display(),
+                            if ignored { "ignores" } else { "includes" },
+                            path_str
+                        );
+                    }
+                }
+            }
+        }
+
+        trace!(
+            "Directory skip decision for '{}': {}",
+            path_str,
+            if ignored { "SKIP" } else { "CONTINUE" }
+        );
+        ignored
+    }
 }
 
 impl IgnorePattern {
@@ -385,5 +459,31 @@ mod tests {
         assert_eq!(convert_gitignore_to_glob("/Downloads"), "Downloads");
         assert_eq!(convert_gitignore_to_glob("tools"), "**/tools");
         assert_eq!(convert_gitignore_to_glob("path/to/file"), "**/path/to/file");
+    }
+
+    #[test]
+    fn test_should_skip_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        // Create .plexifyignore file
+        fs::write(root.join(".plexifyignore"), "Downloads/\n*.tmp\ntools").unwrap();
+
+        // Create test directory structure
+        fs::create_dir_all(root.join("Downloads")).unwrap();
+        fs::create_dir_all(root.join("tools")).unwrap();
+        fs::create_dir_all(root.join("Anime")).unwrap();
+
+        let filter = IgnoreFilter::new(root.to_path_buf()).unwrap();
+
+        // Should skip ignored directories
+        assert!(filter.should_skip_dir(&root.join("Downloads")));
+        assert!(filter.should_skip_dir(&root.join("tools")));
+
+        // Should not skip non-ignored directories
+        assert!(!filter.should_skip_dir(&root.join("Anime")));
+
+        // Should not skip root directory
+        assert!(!filter.should_skip_dir(root));
     }
 }
