@@ -522,7 +522,10 @@ mod tests {
             }
         }
         let old_duration = start.elapsed();
-        println!("Old approach visited {} entries in {:?}", old_approach_count, old_duration);
+        println!(
+            "Old approach visited {} entries in {:?}",
+            old_approach_count, old_duration
+        );
 
         // Test new approach (skipping directories entirely)
         let start = Instant::now();
@@ -546,7 +549,10 @@ mod tests {
             }
         }
         let new_duration = start.elapsed();
-        println!("New approach visited {} entries in {:?}", new_approach_count, new_duration);
+        println!(
+            "New approach visited {} entries in {:?}",
+            new_approach_count, new_duration
+        );
 
         // New approach should visit far fewer entries (ignores the 1000 files in ignored_dir)
         assert!(new_approach_count < old_approach_count);
