@@ -585,3 +585,114 @@ fn test_absolute_paths_in_jobs() {
         }
     }
 }
+
+/// Test stale job recovery workflow
+#[test]
+#[serial]
+fn test_stale_job_recovery_workflow() {
+    build_plexify();
+    let temp_dir = TempDir::new().unwrap();
+    let media_path = temp_dir.path().join("media");
+    let queue_path = temp_dir.path().join("queue");
+
+    // Create media directories and files
+    fs::create_dir_all(&media_path).unwrap();
+
+    let webm_file = media_path.join("test.webm");
+    let vtt_file = media_path.join("test.vtt");
+
+    fs::write(&webm_file, "fake webm content").unwrap();
+    fs::write(&vtt_file, "fake vtt content").unwrap();
+
+    // Run scan to create jobs
+    let scan_output = Command::new(env!("CARGO_BIN_EXE_plexify"))
+        .args([
+            "scan",
+            media_path.to_str().unwrap(),
+            "--work-dir",
+            queue_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute scan command");
+
+    assert!(
+        scan_output.status.success(),
+        "Scan command failed: {}",
+        String::from_utf8_lossy(&scan_output.stderr)
+    );
+
+    // Verify job was created in queue
+    let queue_dir = queue_path.join("_queue");
+    let in_progress_dir = queue_path.join("_in_progress");
+
+    let job_files: Vec<_> = fs::read_dir(&queue_dir)
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path.extension()? == "job" {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    assert_eq!(job_files.len(), 1, "Should have 1 job file");
+
+    // Manually move job from queue to in_progress to simulate a stale job
+    let job_file = &job_files[0];
+    let job_name = job_file.file_name().unwrap();
+    let stale_job_path = in_progress_dir.join(job_name);
+
+    fs::create_dir_all(&in_progress_dir).unwrap();
+    fs::rename(job_file, &stale_job_path).unwrap();
+
+    // Verify job is now in in_progress and not in queue
+    assert!(!job_file.exists(), "Job should not be in queue anymore");
+    assert!(stale_job_path.exists(), "Job should be in in_progress");
+
+    // Now start a worker - it should recover the stale job immediately
+    // We'll use a very short sleep interval and kill it quickly
+    let mut work_command = Command::new(env!("CARGO_BIN_EXE_plexify"))
+        .args([
+            "work",
+            media_path.to_str().unwrap(),
+            "--work-dir",
+            queue_path.to_str().unwrap(),
+        ])
+        .env("SLEEP_INTERVAL", "1") // Short sleep for quick exit
+        .spawn()
+        .expect("Failed to start work command");
+
+    // Give worker time to start and recover the stale job
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // Kill the worker
+    let _ = work_command.kill();
+    let _ = work_command.wait();
+
+    // Check that the job is back in the queue
+    let recovered_jobs: Vec<_> = fs::read_dir(&queue_dir)
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path.extension()? == "job" {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    assert_eq!(
+        recovered_jobs.len(),
+        1,
+        "Stale job should have been recovered to queue"
+    );
+    assert!(
+        !stale_job_path.exists(),
+        "Job should no longer be in in_progress"
+    );
+}

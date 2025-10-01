@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 use tokio::fs as async_fs;
-use tracing::{debug, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::job::Job;
 
@@ -146,6 +146,54 @@ impl JobQueue {
 
         Ok(count)
     }
+
+    /// Recover stale jobs from in_progress directory back to the queue
+    /// This is called on worker startup to handle jobs that were being processed
+    /// when the previous worker was shut down unexpectedly
+    pub async fn recover_stale_jobs(&self) -> Result<usize> {
+        let mut recovered_count = 0;
+
+        if !self.in_progress_dir.exists() {
+            return Ok(0);
+        }
+
+        let mut entries = async_fs::read_dir(&self.in_progress_dir).await?;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let in_progress_path = entry.path();
+            if let Some(extension) = in_progress_path.extension() {
+                if extension == "job" {
+                    let job_name = in_progress_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .ok_or_else(|| anyhow!("Invalid job filename"))?;
+
+                    let queue_path = self.queue_dir.join(job_name);
+
+                    // Move the job from in_progress back to queue
+                    match async_fs::rename(&in_progress_path, &queue_path).await {
+                        Ok(_) => {
+                            warn!("🔄 Recovered stale job: {}", job_name);
+                            recovered_count += 1;
+                        }
+                        Err(e) => {
+                            error!("Failed to recover stale job {}: {}", job_name, e);
+                            // Continue with other jobs
+                        }
+                    }
+                }
+            }
+        }
+
+        if recovered_count > 0 {
+            info!(
+                "🔄 Recovered {} stale job(s) from previous worker session",
+                recovered_count
+            );
+        }
+
+        Ok(recovered_count)
+    }
 }
 
 /// Represents a job that has been claimed by a worker
@@ -254,5 +302,84 @@ mod tests {
 
         // Should be no more jobs
         assert!(queue.claim_job().await.unwrap().is_none());
+    }
+
+    #[test]
+    async fn test_stale_job_recovery() {
+        let temp_dir = TempDir::new().unwrap();
+        let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        queue.init().await.unwrap();
+
+        let quality = QualitySettings::default();
+        let post_processing = PostProcessingSettings::default();
+        let media_root = temp_dir.path();
+        let job = Job::new(
+            PathBuf::from("stale_test.webm"),
+            MediaFileType::WebM,
+            quality,
+            post_processing,
+            media_root,
+        );
+
+        // Enqueue and claim job to simulate a worker taking it
+        queue.enqueue_job(&job).await.unwrap();
+        let claimed = queue.claim_job().await.unwrap().unwrap();
+
+        // Drop the claimed job without completing it, simulating worker shutdown
+        // This leaves the job in the in_progress directory
+        drop(claimed);
+
+        // Verify job is in in_progress directory
+        assert_eq!(queue.pending_count().await.unwrap(), 0); // No jobs in queue
+
+        // Check in_progress directory has one file
+        let mut in_progress_entries = async_fs::read_dir(&queue.in_progress_dir).await.unwrap();
+        let mut in_progress_count = 0;
+        while let Some(_entry) = in_progress_entries.next_entry().await.unwrap() {
+            in_progress_count += 1;
+        }
+        assert_eq!(in_progress_count, 1); // One job stuck in progress
+
+        // Now recover stale jobs
+        let recovered_count = queue.recover_stale_jobs().await.unwrap();
+        assert_eq!(recovered_count, 1);
+
+        // Verify job is back in queue
+        assert_eq!(queue.pending_count().await.unwrap(), 1);
+
+        // Check in_progress directory is now empty
+        let mut in_progress_entries_after =
+            async_fs::read_dir(&queue.in_progress_dir).await.unwrap();
+        let mut in_progress_count_after = 0;
+        while let Some(_entry) = in_progress_entries_after.next_entry().await.unwrap() {
+            in_progress_count_after += 1;
+        }
+        assert_eq!(in_progress_count_after, 0); // No jobs left in progress
+
+        // Should be able to claim the recovered job
+        let recovered_job = queue.claim_job().await.unwrap().unwrap();
+        assert!(recovered_job.job.input_path.ends_with("stale_test.webm"));
+    }
+
+    #[test]
+    async fn test_recover_stale_jobs_empty_directory() {
+        let temp_dir = TempDir::new().unwrap();
+        let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        queue.init().await.unwrap();
+
+        // Should recover 0 jobs when in_progress is empty
+        let recovered_count = queue.recover_stale_jobs().await.unwrap();
+        assert_eq!(recovered_count, 0);
+    }
+
+    #[test]
+    async fn test_recover_stale_jobs_no_in_progress_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        // Don't call init() to simulate missing in_progress directory
+
+        // Should handle missing in_progress directory gracefully
+        let recovered_count = queue.recover_stale_jobs().await.unwrap();
+        assert_eq!(recovered_count, 0);
     }
 }
