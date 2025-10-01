@@ -88,6 +88,9 @@ plexify work /path/to/media
 # Process jobs in background with low priority
 plexify work /path/to/media --background
 
+# Process jobs with episode prioritization (series episodes first, in order)
+plexify work /path/to/media --priority episode
+
 # Clean up temporary files
 plexify clean /path/to/media
 
@@ -121,6 +124,37 @@ Plexify automatically scans through your entire media directory hierarchy, findi
 ```
 
 Running `plexify scan /media` will find and queue jobs for **all** media files regardless of their depth in the directory structure.
+
+### Episode Prioritization
+
+Plexify supports intelligent job prioritization for TV series episodes:
+
+```bash
+# Process jobs with episode prioritization
+plexify work /path/to/media --priority episode
+
+# Default behavior - process jobs in order found
+plexify work /path/to/media --priority none  # or just omit --priority
+```
+
+**Episode Priority Mode:**
+- **Series episodes are processed first**, sorted alphabetically by series name
+- **Within each series**, episodes are processed in ascending order (S01E01, S01E02, S01E03...)
+- **Non-episode content** (movies, etc.) is processed after all episodes
+- **Perfect for binge-watching scenarios** - get your episodes in the right order
+
+**Example processing order with `--priority episode`:**
+1. Series/Better Call Saul/Season 01/Better Call Saul S01E01 Uno.mkv
+2. Series/Better Call Saul/Season 01/Better Call Saul S01E02 Mijo.mkv  
+3. Series/Breaking Bad/Season 01/Breaking Bad S01E01 Pilot.mkv
+4. Series/Breaking Bad/Season 01/Breaking Bad S01E03 Gray Matter.mkv
+5. Movies/The Matrix (1999)/The Matrix (1999).mkv
+
+**Supported episode formats:**
+- `Series/Show Name/Season XX/Show Name SxxExx Episode Title.ext`
+- `Series/Show Name {tvdb-12345}/Season XX/Show Name SxxExx Episode Title.ext`
+- `Series/Show Name/Season XX - Extra Info/Show Name SxxExx Episode Title.ext`
+- `Anime/Show Name/Season XX/Show Name SxxExx Episode Title.ext`
 
 ### Quality Presets
 

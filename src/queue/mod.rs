@@ -66,47 +66,129 @@ impl JobQueue {
         }
     }
 
-    /// Atomically claim a job from the queue
-    pub async fn claim_job(&self) -> Result<Option<ClaimedJob<'_>>> {
+    /// Atomically claim a job from the queue with optional prioritization
+    pub async fn claim_job(
+        &self,
+        priority: Option<crate::JobPriority>,
+    ) -> Result<Option<ClaimedJob<'_>>> {
+        match priority {
+            Some(crate::JobPriority::Episode) => self.claim_prioritized_job().await,
+            _ => self.claim_first_available_job().await,
+        }
+    }
+
+    /// Claim the first available job (original behavior)
+    async fn claim_first_available_job(&self) -> Result<Option<ClaimedJob<'_>>> {
         let mut entries = async_fs::read_dir(&self.queue_dir).await?;
 
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
             if let Some(extension) = path.extension() {
                 if extension == "job" {
-                    let job_name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .ok_or_else(|| anyhow!("Invalid job filename"))?;
-
-                    let in_progress_path = self.in_progress_dir.join(job_name);
-
-                    // Atomically move job from queue to in_progress
-                    match async_fs::rename(&path, &in_progress_path).await {
-                        Ok(_) => {
-                            debug!("Claimed job: {}", job_name);
-
-                            // Read and deserialize job content
-                            let content = async_fs::read_to_string(&in_progress_path).await?;
-                            let job: Job = serde_json::from_str(&content)?;
-
-                            return Ok(Some(ClaimedJob {
-                                queue: self,
-                                job_name: job_name.to_string(),
-                                job,
-                                in_progress_path,
-                            }));
-                        }
-                        Err(_) => {
-                            // Job was claimed by another worker, continue
-                            continue;
-                        }
+                    if let Some(claimed_job) = self.try_claim_job_file(&path).await? {
+                        return Ok(Some(claimed_job));
                     }
                 }
             }
         }
 
         Ok(None)
+    }
+
+    /// Claim a job with episode prioritization
+    async fn claim_prioritized_job(&self) -> Result<Option<ClaimedJob<'_>>> {
+        // First, collect all available job files
+        let mut job_files = Vec::new();
+        let mut entries = async_fs::read_dir(&self.queue_dir).await?;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if let Some(extension) = path.extension() {
+                if extension == "job" {
+                    job_files.push(path);
+                }
+            }
+        }
+
+        if job_files.is_empty() {
+            return Ok(None);
+        }
+
+        // Load all jobs and extract metadata for sorting
+        let mut jobs_with_metadata = Vec::new();
+        for job_path in job_files {
+            // Try to read the job file
+            if let Ok(content) = async_fs::read_to_string(&job_path).await {
+                if let Ok(job) = serde_json::from_str::<Job>(&content) {
+                    let metadata = job.extract_episode_metadata();
+                    jobs_with_metadata.push((job_path, job, metadata));
+                }
+            }
+        }
+
+        // Sort jobs by priority:
+        // 1. Episode jobs first (with metadata)
+        // 2. Within episodes: by series name, then season, then episode
+        // 3. Non-episode jobs last (maintain original order)
+        jobs_with_metadata.sort_by(|a, b| {
+            match (&a.2, &b.2) {
+                (Some(meta_a), Some(meta_b)) => {
+                    // Both have metadata - sort by series, season, episode
+                    meta_a
+                        .series_name
+                        .cmp(&meta_b.series_name)
+                        .then(meta_a.season_number.cmp(&meta_b.season_number))
+                        .then(meta_a.episode_number.cmp(&meta_b.episode_number))
+                }
+                (Some(_), None) => std::cmp::Ordering::Less, // Episode jobs first
+                (None, Some(_)) => std::cmp::Ordering::Greater, // Episode jobs first
+                (None, None) => std::cmp::Ordering::Equal,   // Maintain order for non-episodes
+            }
+        });
+
+        // Try to claim jobs in priority order
+        for (job_path, _, _) in jobs_with_metadata {
+            if let Some(claimed_job) = self.try_claim_job_file(&job_path).await? {
+                return Ok(Some(claimed_job));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Try to atomically claim a specific job file
+    async fn try_claim_job_file(
+        &self,
+        job_path: &std::path::Path,
+    ) -> Result<Option<ClaimedJob<'_>>> {
+        let job_name = job_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| anyhow!("Invalid job filename"))?;
+
+        let in_progress_path = self.in_progress_dir.join(job_name);
+
+        // Atomically move job from queue to in_progress
+        match async_fs::rename(job_path, &in_progress_path).await {
+            Ok(_) => {
+                debug!("Claimed job: {}", job_name);
+
+                // Read and deserialize job content
+                let content = async_fs::read_to_string(&in_progress_path).await?;
+                let job: Job = serde_json::from_str(&content)?;
+
+                Ok(Some(ClaimedJob {
+                    queue: self,
+                    job_name: job_name.to_string(),
+                    job,
+                    in_progress_path,
+                }))
+            }
+            Err(_) => {
+                // Job was claimed by another worker
+                Ok(None)
+            }
+        }
     }
 
     /// Check if a job already exists in the queue
@@ -245,7 +327,7 @@ mod tests {
         queue.enqueue_job(&job).await.unwrap();
 
         // Claim job
-        let claimed = queue.claim_job().await.unwrap().unwrap();
+        let claimed = queue.claim_job(None).await.unwrap().unwrap();
         assert!(claimed.job.input_path.ends_with("test.webm"));
         assert_eq!(claimed.job.file_type, MediaFileType::WebM);
 
@@ -253,6 +335,142 @@ mod tests {
         claimed.complete().await.unwrap();
 
         // Should be no more jobs
-        assert!(queue.claim_job().await.unwrap().is_none());
+        assert!(queue.claim_job(None).await.unwrap().is_none());
+    }
+
+    #[test]
+    async fn test_episode_prioritization() {
+        let temp_dir = TempDir::new().unwrap();
+        let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        queue.init().await.unwrap();
+
+        let quality = QualitySettings::default();
+        let post_processing = PostProcessingSettings::default();
+        let media_root = temp_dir.path();
+
+        // Create jobs in non-sorted order
+        let jobs = vec![
+            // Breaking Bad Season 1 (older series)
+            Job::new(
+                PathBuf::from("Series/Breaking Bad/Season 01/Breaking Bad S01E03 Gray Matter.mkv"),
+                MediaFileType::Mkv,
+                quality.clone(),
+                post_processing.clone(),
+                media_root,
+            ),
+            Job::new(
+                PathBuf::from("Series/Breaking Bad/Season 01/Breaking Bad S01E01 Pilot.mkv"),
+                MediaFileType::Mkv,
+                quality.clone(),
+                post_processing.clone(),
+                media_root,
+            ),
+            // Better Call Saul Season 1 (newer series)
+            Job::new(
+                PathBuf::from("Series/Better Call Saul/Season 01/Better Call Saul S01E02 Mijo.mkv"),
+                MediaFileType::Mkv,
+                quality.clone(),
+                post_processing.clone(),
+                media_root,
+            ),
+            Job::new(
+                PathBuf::from("Series/Better Call Saul/Season 01/Better Call Saul S01E01 Uno.mkv"),
+                MediaFileType::Mkv,
+                quality.clone(),
+                post_processing.clone(),
+                media_root,
+            ),
+            // Non-episode job (movie)
+            Job::new(
+                PathBuf::from("Movies/The Matrix (1999)/The Matrix (1999).mkv"),
+                MediaFileType::Mkv,
+                quality.clone(),
+                post_processing.clone(),
+                media_root,
+            ),
+        ];
+
+        // Enqueue jobs in non-priority order
+        for job in jobs {
+            queue.enqueue_job(&job).await.unwrap();
+        }
+
+        // Claim jobs with episode prioritization
+        let mut claimed_order = Vec::new();
+        while let Some(claimed) = queue
+            .claim_job(Some(crate::JobPriority::Episode))
+            .await
+            .unwrap()
+        {
+            let path_str = claimed.job.input_path.to_string_lossy().to_string();
+            claimed_order.push(path_str);
+            claimed.complete().await.unwrap();
+        }
+
+        // Should have 5 jobs
+        assert_eq!(claimed_order.len(), 5);
+
+        // Episodes should come first, sorted by series name then episode number
+        // Better Call Saul comes before Breaking Bad alphabetically
+        assert!(claimed_order[0].contains("Better Call Saul S01E01"));
+        assert!(claimed_order[1].contains("Better Call Saul S01E02"));
+        assert!(claimed_order[2].contains("Breaking Bad S01E01"));
+        assert!(claimed_order[3].contains("Breaking Bad S01E03"));
+        // Movie should come last
+        assert!(claimed_order[4].contains("The Matrix"));
+    }
+
+    #[test]
+    async fn test_no_prioritization() {
+        let temp_dir = TempDir::new().unwrap();
+        let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        queue.init().await.unwrap();
+
+        let quality = QualitySettings::default();
+        let post_processing = PostProcessingSettings::default();
+        let media_root = temp_dir.path();
+
+        // Create a few jobs
+        let jobs = vec![
+            Job::new(
+                PathBuf::from("Series/Breaking Bad/Season 01/Breaking Bad S01E03 Gray Matter.mkv"),
+                MediaFileType::Mkv,
+                quality.clone(),
+                post_processing.clone(),
+                media_root,
+            ),
+            Job::new(
+                PathBuf::from("Series/Breaking Bad/Season 01/Breaking Bad S01E01 Pilot.mkv"),
+                MediaFileType::Mkv,
+                quality.clone(),
+                post_processing.clone(),
+                media_root,
+            ),
+        ];
+
+        // Enqueue jobs
+        for job in jobs {
+            queue.enqueue_job(&job).await.unwrap();
+        }
+
+        // With no prioritization, jobs should be claimed in directory order
+        let claimed1 = queue.claim_job(None).await.unwrap().unwrap();
+        let claimed2 = queue.claim_job(None).await.unwrap().unwrap();
+
+        // Both jobs should be claimed regardless of episode order
+        assert!(claimed1
+            .job
+            .input_path
+            .to_string_lossy()
+            .contains("Breaking Bad"));
+        assert!(claimed2
+            .job
+            .input_path
+            .to_string_lossy()
+            .contains("Breaking Bad"));
+
+        // Clean up
+        claimed1.complete().await.unwrap();
+        claimed2.complete().await.unwrap();
     }
 }

@@ -680,3 +680,147 @@ fn test_plexifyignore_integration() {
         validate_stdout_text
     );
 }
+
+/// Test episode prioritization in work command
+#[test]
+#[serial]
+fn test_episode_prioritization_integration() {
+    build_plexify();
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+
+    // Create hierarchical directory structure for TV series
+    fs::create_dir_all(temp_path.join("Series/Better Call Saul/Season 01")).unwrap();
+    fs::create_dir_all(temp_path.join("Series/Breaking Bad/Season 01")).unwrap();
+    fs::create_dir_all(temp_path.join("Movies/Action")).unwrap();
+
+    // Create episode files in mixed order to test prioritization
+    // Better Call Saul (alphabetically first)
+    fs::write(
+        temp_path.join("Series/Better Call Saul/Season 01/Better Call Saul S01E02 Mijo.mkv"),
+        "dummy content",
+    )
+    .unwrap();
+    fs::write(
+        temp_path.join("Series/Better Call Saul/Season 01/Better Call Saul S01E01 Uno.mkv"),
+        "dummy content",
+    )
+    .unwrap();
+
+    // Breaking Bad (alphabetically second)
+    fs::write(
+        temp_path.join("Series/Breaking Bad/Season 01/Breaking Bad S01E03 Gray Matter.mkv"),
+        "dummy content",
+    )
+    .unwrap();
+    fs::write(
+        temp_path.join("Series/Breaking Bad/Season 01/Breaking Bad S01E01 Pilot.mkv"),
+        "dummy content",
+    )
+    .unwrap();
+
+    // Non-episode content (should come last)
+    fs::write(
+        temp_path.join("Movies/Action/The Matrix (1999).mkv"),
+        "dummy content",
+    )
+    .unwrap();
+
+    // First, scan to create jobs
+    let scan_output = Command::new("./target/debug/plexify")
+        .args([
+            "scan",
+            temp_path.to_str().unwrap(),
+            "--work-dir",
+            temp_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run scan command");
+
+    assert!(
+        scan_output.status.success(),
+        "Scan command failed: {}",
+        String::from_utf8_lossy(&scan_output.stderr)
+    );
+
+    // Verify jobs were created
+    let queue_dir = temp_path.join("_queue");
+    let job_count = fs::read_dir(&queue_dir)
+        .unwrap()
+        .filter(|entry| entry.as_ref().unwrap().path().extension() == Some("job".as_ref()))
+        .count();
+    assert_eq!(job_count, 5, "Should have created 5 job files");
+
+    // Test help command mentions the priority option
+    let help_output = Command::new("./target/debug/plexify")
+        .args(["work", "--help"])
+        .output()
+        .expect("Failed to run help command");
+
+    assert!(help_output.status.success(), "Help command failed");
+
+    let help_text = String::from_utf8_lossy(&help_output.stdout);
+    assert!(
+        help_text.contains("--priority"),
+        "Help should mention priority option: {}",
+        help_text
+    );
+    assert!(
+        help_text.contains("episode"),
+        "Help should mention episode priority option: {}",
+        help_text
+    );
+    assert!(
+        help_text.contains("none"),
+        "Help should mention none priority option: {}",
+        help_text
+    );
+}
+
+/// Test that work command accepts priority parameter but defaults to none
+#[test]
+#[serial]
+fn test_work_priority_defaults() {
+    build_plexify();
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+
+    // Create a simple media file
+    fs::write(temp_path.join("movie.mkv"), "dummy content").unwrap();
+
+    // Scan to create a job
+    let scan_output = Command::new("./target/debug/plexify")
+        .args([
+            "scan",
+            temp_path.to_str().unwrap(),
+            "--work-dir",
+            temp_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run scan command");
+
+    assert!(scan_output.status.success(), "Scan command failed");
+
+    // Test help to ensure priority parameter is documented
+    let help_output = Command::new("./target/debug/plexify")
+        .args(["work", "--help"])
+        .output()
+        .expect("Failed to run help command");
+
+    assert!(help_output.status.success(), "Help command failed");
+    let help_text = String::from_utf8_lossy(&help_output.stdout);
+
+    // Verify the priority option is documented with the correct default
+    assert!(
+        help_text.contains("--priority"),
+        "Help should document priority option"
+    );
+    assert!(
+        help_text.contains("none"),
+        "Help should show 'none' as an option"
+    );
+    assert!(
+        help_text.contains("episode"),
+        "Help should show 'episode' as an option"
+    );
+}

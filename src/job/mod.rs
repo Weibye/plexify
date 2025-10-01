@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -51,6 +52,22 @@ pub enum MediaFileType {
     WebM,
     /// MKV file with embedded subtitles
     Mkv,
+}
+
+/// Episode metadata extracted from file paths for prioritization
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EpisodeMetadata {
+    pub series_name: String,
+    pub season_number: u32,
+    pub episode_number: u32,
+    pub content_type: ContentType,
+}
+
+/// Content type for media files
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ContentType {
+    Movie,
+    Show,
 }
 
 impl Job {
@@ -188,6 +205,53 @@ impl Job {
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");
         format!("{stem}.job")
+    }
+
+    /// Extract episode metadata from the job's input path for prioritization
+    pub fn extract_episode_metadata(&self) -> Option<EpisodeMetadata> {
+        let path_str = self.input_path.to_str()?;
+
+        // Try to match different episode patterns
+        if let Some(metadata) = Self::try_parse_series_pattern(path_str, "Series") {
+            return Some(metadata);
+        }
+        if let Some(metadata) = Self::try_parse_series_pattern(path_str, "Anime") {
+            return Some(metadata);
+        }
+
+        None
+    }
+
+    /// Try to parse series pattern from path string
+    fn try_parse_series_pattern(path_str: &str, content_prefix: &str) -> Option<EpisodeMetadata> {
+        // Pattern to match series episodes with different formats
+        // Matches: /path/Series/Show Name/Season XX/... SxxExx ...
+        // Matches: /path/Series/Show Name {tvdb-123}/Season XX/... SxxExx ...
+        // Matches: /path/Series/Show Name/Season XX - Extra/... SxxExx ...
+        let pattern = format!(
+            r"{}/([^/]+?)(?:\s*\{{tvdb-\d+\}})?/Season\s+(\d{{2}})(?:\s*-[^/]*)?/.*?[Ss](\d{{2}})[Ee](\d{{2}})",
+            regex::escape(content_prefix)
+        );
+
+        let re = Regex::new(&pattern).ok()?;
+        let captures = re.captures(path_str)?;
+
+        let series_name = captures.get(1)?.as_str().trim().to_string();
+        let season_number: u32 = captures.get(2)?.as_str().parse().ok()?;
+        let episode_season: u32 = captures.get(3)?.as_str().parse().ok()?;
+        let episode_number: u32 = captures.get(4)?.as_str().parse().ok()?;
+
+        // Validate that season numbers match
+        if season_number != episode_season {
+            return None;
+        }
+
+        Some(EpisodeMetadata {
+            series_name,
+            season_number,
+            episode_number,
+            content_type: ContentType::Show,
+        })
     }
 }
 
@@ -599,5 +663,135 @@ mod tests {
     fn test_post_processing_defaults() {
         let settings = PostProcessingSettings::default();
         assert!(settings.disable_source_files);
+    }
+
+    #[test]
+    fn test_episode_metadata_extraction_series() {
+        let quality = QualitySettings::default();
+        let post_processing = PostProcessingSettings::default();
+        let media_root = PathBuf::from("/media");
+
+        // Test standard series format
+        let job = Job::new(
+            PathBuf::from("Series/Breaking Bad/Season 01/Breaking Bad - s01e03 - Gray Matter.mkv"),
+            MediaFileType::Mkv,
+            quality.clone(),
+            post_processing.clone(),
+            &media_root,
+        );
+
+        let metadata = job.extract_episode_metadata().unwrap();
+        assert_eq!(metadata.series_name, "Breaking Bad");
+        assert_eq!(metadata.season_number, 1);
+        assert_eq!(metadata.episode_number, 3);
+        assert_eq!(metadata.content_type, ContentType::Show);
+    }
+
+    #[test]
+    fn test_episode_metadata_extraction_series_with_tvdb() {
+        let quality = QualitySettings::default();
+        let post_processing = PostProcessingSettings::default();
+        let media_root = PathBuf::from("/media");
+
+        // Test series with TVDB ID
+        let job = Job::new(
+            PathBuf::from(
+                "Series/Breaking Bad (2008) {tvdb-296861}/Season 01/Breaking Bad S01E01 Pilot.mkv",
+            ),
+            MediaFileType::Mkv,
+            quality.clone(),
+            post_processing.clone(),
+            &media_root,
+        );
+
+        let metadata = job.extract_episode_metadata().unwrap();
+        assert_eq!(metadata.series_name, "Breaking Bad (2008)");
+        assert_eq!(metadata.season_number, 1);
+        assert_eq!(metadata.episode_number, 1);
+        assert_eq!(metadata.content_type, ContentType::Show);
+    }
+
+    #[test]
+    fn test_episode_metadata_extraction_anime() {
+        let quality = QualitySettings::default();
+        let post_processing = PostProcessingSettings::default();
+        let media_root = PathBuf::from("/media");
+
+        // Test anime format
+        let job = Job::new(
+            PathBuf::from(
+                "Anime/Attack on Titan/Season 01/Attack on Titan S01E05 First Battle.mkv",
+            ),
+            MediaFileType::Mkv,
+            quality.clone(),
+            post_processing.clone(),
+            &media_root,
+        );
+
+        let metadata = job.extract_episode_metadata().unwrap();
+        assert_eq!(metadata.series_name, "Attack on Titan");
+        assert_eq!(metadata.season_number, 1);
+        assert_eq!(metadata.episode_number, 5);
+        assert_eq!(metadata.content_type, ContentType::Show);
+    }
+
+    #[test]
+    fn test_episode_metadata_extraction_season_with_extra_info() {
+        let quality = QualitySettings::default();
+        let post_processing = PostProcessingSettings::default();
+        let media_root = PathBuf::from("/media");
+
+        // Test season with extra information
+        let job = Job::new(
+            PathBuf::from("Series/Critical Role (2015) {tvdb-296861}/Season 01 - Vox Machina/Critical Role S01E12 Arrival at Kraghammer.mkv"),
+            MediaFileType::Mkv,
+            quality.clone(),
+            post_processing.clone(),
+            &media_root,
+        );
+
+        let metadata = job.extract_episode_metadata().unwrap();
+        assert_eq!(metadata.series_name, "Critical Role (2015)");
+        assert_eq!(metadata.season_number, 1);
+        assert_eq!(metadata.episode_number, 12);
+        assert_eq!(metadata.content_type, ContentType::Show);
+    }
+
+    #[test]
+    fn test_episode_metadata_extraction_movie_returns_none() {
+        let quality = QualitySettings::default();
+        let post_processing = PostProcessingSettings::default();
+        let media_root = PathBuf::from("/media");
+
+        // Test movie format - should return None
+        let job = Job::new(
+            PathBuf::from("Movies/The Dark Knight (2008)/The Dark Knight (2008).mkv"),
+            MediaFileType::Mkv,
+            quality.clone(),
+            post_processing.clone(),
+            &media_root,
+        );
+
+        let metadata = job.extract_episode_metadata();
+        assert!(metadata.is_none());
+    }
+
+    #[test]
+    fn test_episode_metadata_extraction_invalid_format_returns_none() {
+        let quality = QualitySettings::default();
+        let post_processing = PostProcessingSettings::default();
+        let media_root = PathBuf::from("/media");
+
+        // Test invalid format - should return None
+        let job = Job::new(
+            PathBuf::from("Random/Path/file.mkv"),
+            MediaFileType::Mkv,
+            quality.clone(),
+            post_processing.clone(),
+            &media_root,
+        );
+
+        let metadata = job.extract_episode_metadata();
+        assert!(metadata.is_none());
     }
 }

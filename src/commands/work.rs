@@ -7,20 +7,28 @@ use tracing::{debug, error, info, warn};
 use crate::config::Config;
 use crate::ffmpeg::FFmpegProcessor;
 use crate::queue::JobQueue;
+use crate::JobPriority;
 
 /// Command to process jobs from the queue
 pub struct WorkCommand {
     media_root: PathBuf,
     work_root: PathBuf,
     background_mode: bool,
+    priority_mode: JobPriority,
 }
 
 impl WorkCommand {
-    pub fn new(media_root: PathBuf, work_root: PathBuf, background_mode: bool) -> Self {
+    pub fn new(
+        media_root: PathBuf,
+        work_root: PathBuf,
+        background_mode: bool,
+        priority_mode: JobPriority,
+    ) -> Self {
         Self {
             media_root,
             work_root,
             background_mode,
+            priority_mode,
         }
     }
 
@@ -96,7 +104,13 @@ impl WorkCommand {
         queue: &JobQueue,
         processor: &FFmpegProcessor,
     ) -> Result<bool> {
-        if let Some(claimed_job) = queue.claim_job().await? {
+        let priority = if self.priority_mode == JobPriority::None {
+            None
+        } else {
+            Some(self.priority_mode.clone())
+        };
+
+        if let Some(claimed_job) = queue.claim_job(priority).await? {
             info!("➡️ Claimed job: {}", claimed_job.job_name());
 
             // Get the job details directly from the job file
@@ -166,10 +180,12 @@ mod tests {
             temp_dir.path().to_path_buf(),
             temp_dir.path().to_path_buf(),
             false,
+            JobPriority::None,
         );
 
         assert_eq!(work_cmd.media_root, temp_dir.path());
         assert!(!work_cmd.background_mode);
+        assert_eq!(work_cmd.priority_mode, JobPriority::None);
     }
 
     #[tokio::test]
@@ -178,6 +194,7 @@ mod tests {
             PathBuf::from("/nonexistent/path"),
             PathBuf::from("/tmp"),
             false,
+            JobPriority::None,
         );
 
         let result = work_cmd.execute().await;
