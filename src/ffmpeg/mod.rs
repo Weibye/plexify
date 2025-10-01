@@ -5,7 +5,119 @@ use tokio::process::Command;
 use tracing::{debug, error, info};
 
 use crate::config::Config;
-use crate::job::{Job, MediaFileType};
+use crate::job::{Job, MediaFileType, QualitySettings};
+
+/// Builder for constructing FFmpeg commands with a fluent API
+#[derive(Debug, Default)]
+pub struct FFmpegCommandBuilder {
+    args: Vec<String>,
+}
+
+impl FFmpegCommandBuilder {
+    /// Create a new FFmpeg command builder
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add common FFmpeg flags for media processing
+    /// These flags ensure proper PTS generation and timestamp handling
+    pub fn with_common_flags(mut self) -> Self {
+        self.args.extend_from_slice(&[
+            "-fflags".to_string(),
+            "+genpts".to_string(),
+            "-avoid_negative_ts".to_string(),
+            "make_zero".to_string(),
+        ]);
+        self
+    }
+
+    /// Add subtitle duration fixing flag
+    pub fn with_subtitle_duration_fix(mut self) -> Self {
+        self.args.push("-fix_sub_duration".to_string());
+        self
+    }
+
+    /// Add a single input file
+    pub fn with_input<P: AsRef<Path>>(mut self, input_path: P) -> Self {
+        self.args.push("-i".to_string());
+        self.args
+            .push(input_path.as_ref().to_string_lossy().to_string());
+        self
+    }
+
+    /// Add multiple input files
+    pub fn with_inputs<P: AsRef<Path>>(mut self, input_paths: &[P]) -> Self {
+        for input_path in input_paths {
+            self.args.push("-i".to_string());
+            self.args
+                .push(input_path.as_ref().to_string_lossy().to_string());
+        }
+        self
+    }
+
+    /// Add stream mapping arguments
+    pub fn with_stream_mapping(mut self, mappings: &[&str]) -> Self {
+        for mapping in mappings {
+            self.args.push("-map".to_string());
+            self.args.push(mapping.to_string());
+        }
+        self
+    }
+
+    /// Add video encoding settings using H.264 with configurable preset and CRF
+    pub fn with_video_encoding(mut self, quality_settings: &QualitySettings) -> Self {
+        self.args.extend_from_slice(&[
+            "-c:v".to_string(),
+            "libx264".to_string(),
+            "-preset".to_string(),
+            quality_settings.ffmpeg_preset.clone(),
+            "-crf".to_string(),
+            quality_settings.ffmpeg_crf.clone(),
+        ]);
+        self
+    }
+
+    /// Add audio encoding settings using AAC with configurable bitrate
+    pub fn with_audio_encoding(mut self, quality_settings: &QualitySettings) -> Self {
+        self.args.extend_from_slice(&[
+            "-c:a".to_string(),
+            "aac".to_string(),
+            "-b:a".to_string(),
+            quality_settings.ffmpeg_audio_bitrate.clone(),
+        ]);
+        self
+    }
+
+    /// Add subtitle encoding settings using mov_text format for MP4 containers
+    pub fn with_subtitle_encoding(mut self) -> Self {
+        self.args
+            .extend_from_slice(&["-c:s".to_string(), "mov_text".to_string()]);
+        self
+    }
+
+    /// Enable output file overwriting
+    pub fn with_overwrite(mut self) -> Self {
+        self.args.push("-y".to_string());
+        self
+    }
+
+    /// Add the output file path
+    pub fn with_output<P: AsRef<Path>>(mut self, output_path: P) -> Self {
+        self.args
+            .push(output_path.as_ref().to_string_lossy().to_string());
+        self
+    }
+
+    /// Build the final command arguments as a vector of strings
+    pub fn build(self) -> Vec<String> {
+        self.args
+    }
+
+    /// Build the command arguments and apply them to a tokio Command
+    pub fn build_command(self, base_command: &mut Command) {
+        base_command.args(&self.args);
+    }
+}
 
 /// FFmpeg wrapper for media transcoding
 pub struct FFmpegProcessor {
@@ -22,7 +134,6 @@ impl FFmpegProcessor {
         }
     }
 
-    /// Process a job using FFmpeg
     pub async fn process_job(
         &self,
         job: &Job,
@@ -48,6 +159,37 @@ impl FFmpegProcessor {
             tokio::fs::create_dir_all(parent).await?;
         }
 
+        let mut ffmpeg_builder = FFmpegCommandBuilder::new()
+            .with_common_flags()
+            .with_video_encoding(&job.quality_settings)
+            .with_audio_encoding(&job.quality_settings)
+            .with_subtitle_encoding()
+            .with_overwrite()
+            .with_output(&output_path);
+
+        // Add format-specific flags, inputs, and mappings
+        ffmpeg_builder = match job.file_type {
+            MediaFileType::WebM => {
+                if let Some(vtt_path) = job.full_subtitle_path(media_root) {
+                    // Check if subtitle file exists
+                    if !vtt_path.exists() {
+                        return Err(anyhow!("Required subtitle file not found: {vtt_path:?}"));
+                    }
+
+                    ffmpeg_builder
+                        .with_inputs(&[&input_path, &vtt_path])
+                        .with_stream_mapping(&["0:v:0", "0:a:0", "1:s:0"])
+                } else {
+                    return Err(anyhow!("WebM job missing subtitle path"));
+                }
+            }
+            MediaFileType::Mkv => ffmpeg_builder
+                .with_subtitle_duration_fix()
+                .with_input(&input_path)
+                .with_stream_mapping(&["0:v:0", "0:a:0", "0:s:0"]),
+        };
+
+        // Create the base command (with optional nice for background mode)
         let mut cmd = if self.background_mode {
             let mut c = Command::new("nice");
             c.args(["-n", "19"]);
@@ -57,50 +199,8 @@ impl FFmpegProcessor {
             Command::new("ffmpeg")
         };
 
-        // Add common FFmpeg flags
-        cmd.args(["-fflags", "+genpts", "-avoid_negative_ts", "make_zero"]);
-
-        // Add format-specific flags and inputs
-        match job.file_type {
-            MediaFileType::WebM => {
-                if let Some(vtt_path) = job.full_subtitle_path(media_root) {
-                    // Check if subtitle file exists
-                    if !vtt_path.exists() {
-                        return Err(anyhow!("Required subtitle file not found: {vtt_path:?}"));
-                    }
-
-                    cmd.args(["-i", input_path.to_str().unwrap()]);
-                    cmd.args(["-i", vtt_path.to_str().unwrap()]);
-                    cmd.args(["-map", "0:v:0", "-map", "0:a:0", "-map", "1:s:0"]);
-                } else {
-                    return Err(anyhow!("WebM job missing subtitle path"));
-                }
-            }
-            MediaFileType::Mkv => {
-                cmd.args(["-fix_sub_duration"]);
-                cmd.args(["-i", input_path.to_str().unwrap()]);
-                cmd.args(["-map", "0:v:0", "-map", "0:a:0", "-map", "0:s:0"]);
-            }
-        }
-
-        // Add encoding settings using job's quality settings
-        cmd.args([
-            "-c:v",
-            "libx264",
-            "-preset",
-            &job.quality_settings.ffmpeg_preset,
-            "-crf",
-            &job.quality_settings.ffmpeg_crf,
-            "-c:a",
-            "aac",
-            "-b:a",
-            &job.quality_settings.ffmpeg_audio_bitrate,
-            "-c:s",
-            "mov_text",
-            "-y", // Overwrite output files
-        ]);
-
-        cmd.arg(output_path.to_str().unwrap());
+        // Apply the built arguments to the command
+        ffmpeg_builder.build_command(&mut cmd);
 
         // Set up stdio
         cmd.stdout(Stdio::piped());
@@ -210,6 +310,181 @@ mod tests {
         let config = Config::default();
         let processor = FFmpegProcessor::new(config, true);
         assert!(processor.background_mode);
+    }
+
+    #[test]
+    fn test_ffmpeg_command_builder_basic() {
+        let args = FFmpegCommandBuilder::new()
+            .with_common_flags()
+            .with_overwrite()
+            .build();
+
+        assert_eq!(
+            args,
+            vec![
+                "-fflags",
+                "+genpts",
+                "-avoid_negative_ts",
+                "make_zero",
+                "-y"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_ffmpeg_command_builder_webm() {
+        let quality = QualitySettings {
+            ffmpeg_preset: "fast".to_string(),
+            ffmpeg_crf: "20".to_string(),
+            ffmpeg_audio_bitrate: "192k".to_string(),
+        };
+
+        let args = FFmpegCommandBuilder::new()
+            .with_common_flags()
+            .with_inputs(&["/path/to/video.webm", "/path/to/video.vtt"])
+            .with_stream_mapping(&["0:v:0", "0:a:0", "1:s:0"])
+            .with_video_encoding(&quality)
+            .with_audio_encoding(&quality)
+            .with_subtitle_encoding()
+            .with_overwrite()
+            .with_output("/path/to/output.mp4")
+            .build();
+
+        let expected = vec![
+            "-fflags",
+            "+genpts",
+            "-avoid_negative_ts",
+            "make_zero",
+            "-i",
+            "/path/to/video.webm",
+            "-i",
+            "/path/to/video.vtt",
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0",
+            "-map",
+            "1:s:0",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "fast",
+            "-crf",
+            "20",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-c:s",
+            "mov_text",
+            "-y",
+            "/path/to/output.mp4",
+        ];
+
+        assert_eq!(args, expected);
+    }
+
+    #[test]
+    fn test_ffmpeg_command_builder_mkv() {
+        let quality = QualitySettings {
+            ffmpeg_preset: "veryfast".to_string(),
+            ffmpeg_crf: "23".to_string(),
+            ffmpeg_audio_bitrate: "128k".to_string(),
+        };
+
+        let args = FFmpegCommandBuilder::new()
+            .with_common_flags()
+            .with_subtitle_duration_fix()
+            .with_input("/path/to/video.mkv")
+            .with_stream_mapping(&["0:v:0", "0:a:0", "0:s:0"])
+            .with_video_encoding(&quality)
+            .with_audio_encoding(&quality)
+            .with_subtitle_encoding()
+            .with_overwrite()
+            .with_output("/path/to/output.mp4")
+            .build();
+
+        let expected = vec![
+            "-fflags",
+            "+genpts",
+            "-avoid_negative_ts",
+            "make_zero",
+            "-fix_sub_duration",
+            "-i",
+            "/path/to/video.mkv",
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0",
+            "-map",
+            "0:s:0",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-c:s",
+            "mov_text",
+            "-y",
+            "/path/to/output.mp4",
+        ];
+
+        assert_eq!(args, expected);
+    }
+
+    #[test]
+    fn test_ffmpeg_command_builder_build_command() {
+        let quality = QualitySettings::default();
+        let builder = FFmpegCommandBuilder::new()
+            .with_common_flags()
+            .with_video_encoding(&quality);
+
+        let mut cmd = Command::new("ffmpeg");
+        builder.build_command(&mut cmd);
+
+        // We can't easily test the internal state of Command, but we can verify
+        // the builder doesn't panic when applied to a command
+        assert_eq!(cmd.as_std().get_program(), "ffmpeg");
+    }
+
+    #[test]
+    fn test_builder_method_chaining() {
+        // Test that all methods return Self for fluent chaining
+        let quality = QualitySettings::default();
+
+        let _builder = FFmpegCommandBuilder::new()
+            .with_common_flags()
+            .with_subtitle_duration_fix()
+            .with_input("test.mkv")
+            .with_stream_mapping(&["0:v:0", "0:a:0", "0:s:0"])
+            .with_video_encoding(&quality)
+            .with_audio_encoding(&quality)
+            .with_subtitle_encoding()
+            .with_overwrite()
+            .with_output("test.mp4");
+
+        // If we get here without compile errors, method chaining works
+    }
+
+    #[test]
+    fn test_builder_path_handling() {
+        let input_path = PathBuf::from("/test/input.webm");
+        let subtitle_path = PathBuf::from("/test/input.vtt");
+        let output_path = PathBuf::from("/test/output.mp4");
+
+        let args = FFmpegCommandBuilder::new()
+            .with_inputs(&[&input_path, &subtitle_path])
+            .with_output(&output_path)
+            .build();
+
+        assert!(args.contains(&"/test/input.webm".to_string()));
+        assert!(args.contains(&"/test/input.vtt".to_string()));
+        assert!(args.contains(&"/test/output.mp4".to_string()));
     }
 
     #[tokio::test]
