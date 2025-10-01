@@ -218,6 +218,26 @@ impl ValidateCommand {
         for entry in WalkDir::new(&self.media_root)
             .follow_links(false)
             .into_iter()
+            .filter_entry(|e| {
+                let path = e.path();
+
+                // Always allow the root directory
+                if path == self.media_root {
+                    return true;
+                }
+
+                // Check if we should skip this directory and all its contents
+                if path.is_dir() {
+                    if let Some(ref filter) = ignore_filter {
+                        if filter.should_skip_dir(path) {
+                            debug!("🚫 Skipping entire directory: {:?}", path);
+                            return false; // This will cause WalkDir to skip the directory
+                        }
+                    }
+                }
+
+                true // Allow files and non-ignored directories
+            })
             .filter_map(|e| e.ok())
         {
             let path = entry.path();
@@ -227,7 +247,7 @@ impl ValidateCommand {
                 continue;
             }
 
-            // Check if this path should be ignored
+            // Check if this individual file should be ignored
             if let Some(ref filter) = ignore_filter {
                 if filter.should_ignore(path) {
                     debug!("🚫 Ignoring path: {:?}", path);
@@ -661,7 +681,7 @@ mod tests {
     async fn test_validate_series_with_tvdb_id() {
         let temp_dir = TempDir::new().unwrap();
         let media_root = temp_dir.path();
-
+        
         // Test 1: Simple case with TVDB id that should match "Alternative Series format"
         let series_path1 = media_root.join("Series/Critical Role (2015) {tvdb-296861}/Season 01");
         fs::create_dir_all(&series_path1).unwrap();
@@ -677,7 +697,7 @@ mod tests {
         assert!(result.is_ok());
         let report = result.unwrap();
         assert_eq!(report.scanned_files, 1);
-
+        
         // Print debug info to understand what's happening
         for issue in &report.issues {
             println!(
@@ -686,7 +706,7 @@ mod tests {
                 issue.description
             );
         }
-
+        
         // Now this should pass - TVDB id in series name should be valid
         assert_eq!(
             report.issues.len(),
@@ -695,7 +715,7 @@ mod tests {
             report.issues.len()
         );
     }
-
+    
     #[tokio::test]
     async fn test_validate_complex_series_with_tvdb_id() {
         let temp_dir = TempDir::new().unwrap();
@@ -757,5 +777,45 @@ mod tests {
         let report = result.unwrap();
         assert_eq!(report.scanned_files, 1);
         assert_eq!(report.issues.len(), 0, "Anime with TVDB id should be valid");
+    }
+
+    #[tokio::test]
+    async fn test_validate_skips_ignored_directories() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        // Create .plexifyignore file that ignores entire directories
+        fs::write(
+            media_root.join(".plexifyignore"),
+            "Downloads/\ntools/\n*.tmp",
+        )
+        .unwrap();
+
+        // Create directory structure with many files in ignored directories
+        fs::create_dir_all(media_root.join("Downloads")).unwrap();
+        fs::create_dir_all(media_root.join("tools")).unwrap();
+        fs::create_dir_all(media_root.join("Movies/Good Movie (2021)")).unwrap();
+
+        // Create many media files in ignored directories (simulate the performance issue)
+        for i in 0..100 {
+            fs::write(media_root.join(format!("Downloads/video_{}.mkv", i)), "").unwrap();
+            fs::write(media_root.join(format!("tools/tool_{}.mkv", i)), "").unwrap();
+        }
+
+        // Create some files that should be processed
+        fs::write(media_root.join("temp.tmp"), "").unwrap(); // Should be ignored by pattern
+        fs::write(
+            media_root.join("Movies/Good Movie (2021)/Good Movie (2021).mkv"),
+            "",
+        ).unwrap();
+
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let result = validate_cmd.execute().await;
+        assert!(result.is_ok());
+        let report = result.unwrap();
+        
+        // Should only scan 1 file (the movie), not the 200+ files in ignored directories
+        assert_eq!(report.scanned_files, 1);
+        assert_eq!(report.issues.len(), 0); // The movie is correctly named
     }
 }

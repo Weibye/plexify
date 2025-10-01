@@ -59,11 +59,31 @@ impl ScanCommand {
         for entry in WalkDir::new(&self.media_root)
             .follow_links(false)
             .into_iter()
+            .filter_entry(|e| {
+                let path = e.path();
+
+                // Always allow the root directory
+                if path == self.media_root {
+                    return true;
+                }
+
+                // Check if we should skip this directory and all its contents
+                if path.is_dir() {
+                    if let Some(ref filter) = ignore_filter {
+                        if filter.should_skip_dir(path) {
+                            debug!("🚫 Skipping entire directory: {:?}", path);
+                            return false; // This will cause WalkDir to skip the directory
+                        }
+                    }
+                }
+
+                true // Allow files and non-ignored directories
+            })
             .filter_map(|e| e.ok())
         {
             let path = entry.path();
 
-            // Check if this path should be ignored
+            // Check if this individual path should be ignored
             if let Some(ref filter) = ignore_filter {
                 if filter.should_ignore(path) {
                     debug!("🚫 Ignoring path: {:?}", path);

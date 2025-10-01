@@ -196,6 +196,80 @@ impl IgnoreFilter {
         );
         ignored
     }
+
+    /// Check if a directory should be skipped during traversal
+    /// This is an optimized version for directory-level checking that doesn't
+    /// perform parent directory lookups to avoid infinite recursion during walkdir
+    pub fn should_skip_dir(&self, path: &Path) -> bool {
+        if !path.is_dir() {
+            return false;
+        }
+
+        let relative_path = match path.strip_prefix(&self.root) {
+            Ok(rel) => rel,
+            Err(_) => {
+                // Path is not under root, don't skip
+                return false;
+            }
+        };
+
+        // Convert to forward slashes for consistent matching
+        let path_str = relative_path.to_string_lossy().replace("\\", "/");
+
+        trace!("Checking if directory should be skipped: {}", path_str);
+
+        // Check patterns from all applicable directories, starting from root to specific
+        let mut ignored = false;
+
+        // Get all directories that could have patterns affecting this path
+        let mut applicable_dirs: Vec<_> = self
+            .patterns_by_dir
+            .keys()
+            .filter(|dir| {
+                // Include if the pattern directory is an ancestor of the path
+                path.starts_with(dir) || dir == &&self.root
+            })
+            .collect();
+
+        // Sort by depth (root first, then deeper directories)
+        applicable_dirs.sort_by_key(|dir| dir.components().count());
+
+        for dir in applicable_dirs {
+            if let Some(patterns) = self.patterns_by_dir.get(dir) {
+                // Calculate relative path from this pattern directory
+                let pattern_relative_path = if dir == &self.root {
+                    path_str.clone()
+                } else {
+                    match path.strip_prefix(dir) {
+                        Ok(rel) => rel.to_string_lossy().replace("\\", "/"),
+                        Err(_) => path_str.clone(), // Fallback to full relative path
+                    }
+                };
+
+                for pattern in patterns {
+                    if pattern.matches(&pattern_relative_path, true)
+                        || pattern.matches(&path_str, true)
+                    {
+                        ignored = !pattern.negation;
+                        trace!(
+                            "Pattern '{}' from {} {} directory '{}'",
+                            pattern.original,
+                            dir.display(),
+                            if ignored { "ignores" } else { "includes" },
+                            path_str
+                        );
+                    }
+                }
+            }
+        }
+
+        trace!(
+            "Directory skip decision for '{}': {}",
+            path_str,
+            if ignored { "SKIP" } else { "CONTINUE" }
+        );
+        ignored
+    }
 }
 
 impl IgnorePattern {
@@ -385,5 +459,97 @@ mod tests {
         assert_eq!(convert_gitignore_to_glob("/Downloads"), "Downloads");
         assert_eq!(convert_gitignore_to_glob("tools"), "**/tools");
         assert_eq!(convert_gitignore_to_glob("path/to/file"), "**/path/to/file");
+    }
+
+    #[test]
+    fn test_should_skip_dir() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        // Create .plexifyignore file
+        fs::write(root.join(".plexifyignore"), "Downloads/\n*.tmp\ntools").unwrap();
+
+        // Create test directory structure
+        fs::create_dir_all(root.join("Downloads")).unwrap();
+        fs::create_dir_all(root.join("tools")).unwrap();
+        fs::create_dir_all(root.join("Anime")).unwrap();
+
+        let filter = IgnoreFilter::new(root.to_path_buf()).unwrap();
+
+        // Should skip ignored directories
+        assert!(filter.should_skip_dir(&root.join("Downloads")));
+        assert!(filter.should_skip_dir(&root.join("tools")));
+
+        // Should not skip non-ignored directories
+        assert!(!filter.should_skip_dir(&root.join("Anime")));
+
+        // Should not skip root directory
+        assert!(!filter.should_skip_dir(root));
+    }
+
+    #[test]
+    fn test_directory_skip_performance() {
+        use std::time::Instant;
+        use walkdir::WalkDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        // Create .plexifyignore file that ignores a large directory
+        fs::write(root.join(".plexifyignore"), "ignored_dir/").unwrap();
+
+        // Create a large ignored directory with many files
+        fs::create_dir_all(root.join("ignored_dir")).unwrap();
+        for i in 0..1000 {
+            fs::write(root.join(&format!("ignored_dir/file_{}.txt", i)), "content").unwrap();
+        }
+
+        // Create a small non-ignored directory
+        fs::create_dir_all(root.join("valid_dir")).unwrap();
+        fs::write(root.join("valid_dir/file.txt"), "content").unwrap();
+
+        let filter = IgnoreFilter::new(root.to_path_buf()).unwrap();
+
+        // Test old approach (checking every file individually)
+        let start = Instant::now();
+        let mut old_approach_count = 0;
+        for entry in WalkDir::new(&root).follow_links(false).into_iter() {
+            if let Ok(entry) = entry {
+                if filter.should_ignore(entry.path()) {
+                    // In the old approach, we'd still visit all files but ignore them
+                }
+                old_approach_count += 1;
+            }
+        }
+        let old_duration = start.elapsed();
+        println!("Old approach visited {} entries in {:?}", old_approach_count, old_duration);
+
+        // Test new approach (skipping directories entirely)
+        let start = Instant::now();
+        let mut new_approach_count = 0;
+        for entry in WalkDir::new(&root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| {
+                let path = e.path();
+                if path == root {
+                    return true;
+                }
+                if path.is_dir() && filter.should_skip_dir(path) {
+                    return false; // Skip entire directory
+                }
+                true
+            })
+        {
+            if let Ok(_entry) = entry {
+                new_approach_count += 1;
+            }
+        }
+        let new_duration = start.elapsed();
+        println!("New approach visited {} entries in {:?}", new_approach_count, new_duration);
+
+        // New approach should visit far fewer entries (ignores the 1000 files in ignored_dir)
+        assert!(new_approach_count < old_approach_count);
+        assert!(new_approach_count <= 10); // Should only visit root, valid_dir, and file.txt plus maybe a few others
     }
 }
