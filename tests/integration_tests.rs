@@ -585,3 +585,98 @@ fn test_absolute_paths_in_jobs() {
         }
     }
 }
+
+/// Test that .plexifyignore files work in integration
+#[test]
+#[serial]
+fn test_plexifyignore_integration() {
+    build_plexify();
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+
+    // Create .plexifyignore file
+    fs::write(temp_path.join(".plexifyignore"), "Downloads/\n*.tmp\ntools").unwrap();
+
+    // Create directory structure
+    fs::create_dir_all(temp_path.join("Downloads")).unwrap();
+    fs::create_dir_all(temp_path.join("tools")).unwrap();
+    fs::create_dir_all(temp_path.join("Anime")).unwrap();
+
+    // Create media files - some should be ignored
+    fs::write(temp_path.join("Downloads/video1.mkv"), "").unwrap();
+    fs::write(temp_path.join("tools/video2.mkv"), "").unwrap();
+    fs::write(temp_path.join("temp.tmp"), "").unwrap();
+    fs::write(temp_path.join("Anime/episode1.mkv"), "").unwrap();
+    fs::write(temp_path.join("movie.mkv"), "").unwrap();
+
+    // Test scan command with debug logging to see ignore messages
+    let scan_output = Command::new("./target/debug/plexify")
+        .env("RUST_LOG", "info")
+        .args([
+            "scan",
+            temp_path.to_str().unwrap(),
+            "--work-dir",
+            temp_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute scan command");
+
+    assert!(scan_output.status.success(), "Scan command failed");
+
+    let scan_output_text = String::from_utf8_lossy(&scan_output.stderr);
+    let scan_stdout_text = String::from_utf8_lossy(&scan_output.stdout);
+    println!("Scan stderr: {}", scan_output_text);
+    println!("Scan stdout: {}", scan_stdout_text);
+
+    // Check that ignored message appears in either stdout or stderr, or that the correct file count is present
+    let all_output = format!("{}{}", scan_output_text, scan_stdout_text);
+    assert!(
+        all_output.contains("Ignored") && all_output.contains("patterns")
+            || all_output.contains("2 .mkv files"),
+        "Expected ignore message or correct file count in output: stderr='{}' stdout='{}'",
+        scan_output_text,
+        scan_stdout_text
+    );
+
+    // Verify only non-ignored files were processed
+    let queue_dir = temp_path.join("_queue");
+    let job_files: Vec<_> = fs::read_dir(&queue_dir)
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path.extension()? == "job" {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Should only create jobs for Anime/episode1.mkv and movie.mkv (2 jobs)
+    assert_eq!(job_files.len(), 2, "Expected 2 job files to be created");
+
+    // Test validate command with debug logging
+    let validate_output = Command::new("./target/debug/plexify")
+        .env("RUST_LOG", "info")
+        .args(["validate", temp_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute validate command");
+
+    assert!(validate_output.status.success(), "Validate command failed");
+
+    let validate_output_text = String::from_utf8_lossy(&validate_output.stderr);
+    let validate_stdout_text = String::from_utf8_lossy(&validate_output.stdout);
+    println!("Validate stderr: {}", validate_output_text);
+    println!("Validate stdout: {}", validate_stdout_text);
+
+    // Should only validate 2 files (non-ignored ones)
+    let all_validate_output = format!("{}{}", validate_output_text, validate_stdout_text);
+    assert!(
+        all_validate_output.contains("2 media files")
+            || all_validate_output.contains("Ignored") && all_validate_output.contains("patterns"),
+        "Expected correct file count or ignore message in validate output: stderr='{}' stdout='{}'",
+        validate_output_text,
+        validate_stdout_text
+    );
+}

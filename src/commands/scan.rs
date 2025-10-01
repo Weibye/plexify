@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
+use crate::ignore::IgnoreFilter;
 use crate::job::{Job, MediaFileType, PostProcessingSettings, QualitySettings};
 use crate::queue::JobQueue;
 
@@ -37,12 +38,22 @@ impl ScanCommand {
         info!("🔎 Scanning directory: {:?}", self.media_root);
         info!("📁 Recursively scanning all subdirectories...");
 
+        // Initialize ignore filter
+        let ignore_filter = match IgnoreFilter::new(self.media_root.clone()) {
+            Ok(filter) => Some(filter),
+            Err(e) => {
+                warn!("Failed to load .plexifyignore patterns: {}", e);
+                None
+            }
+        };
+
         let queue = JobQueue::new(self.media_root.clone(), self.work_root.clone());
         queue.init().await?;
 
         let mut webm_files = Vec::new();
         let mut mkv_files = Vec::new();
         let mut directories_scanned = std::collections::HashSet::new();
+        let mut ignored_count = 0;
 
         // Walk through the directory to find media files
         for entry in WalkDir::new(&self.media_root)
@@ -51,6 +62,16 @@ impl ScanCommand {
             .filter_map(|e| e.ok())
         {
             let path = entry.path();
+
+            // Check if this path should be ignored
+            if let Some(ref filter) = ignore_filter {
+                if filter.should_ignore(path) {
+                    debug!("🚫 Ignoring path: {:?}", path);
+                    ignored_count += 1;
+                    // Skip this entry completely
+                    continue;
+                }
+            }
 
             // Track directories being scanned for better user feedback
             if path.is_dir() && path != self.media_root {
@@ -88,6 +109,13 @@ impl ScanCommand {
             webm_files.len(),
             mkv_files.len()
         );
+
+        if ignored_count > 0 {
+            info!(
+                "📋 Ignored {} paths due to .plexifyignore patterns",
+                ignored_count
+            );
+        }
 
         if !directories_scanned.is_empty() {
             debug!(
@@ -370,5 +398,94 @@ mod tests {
         // Should create jobs for: 2 webm files with VTT + 3 mkv files = 5 jobs
         // (video2.webm without VTT should be skipped)
         assert_eq!(job_count, 5);
+    }
+
+    #[tokio::test]
+    async fn test_scan_with_plexifyignore() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        // Create .plexifyignore file
+        fs::write(
+            media_root.join(".plexifyignore"),
+            "Downloads/\n*.tmp\ntools",
+        )
+        .unwrap();
+
+        // Create directory structure
+        fs::create_dir_all(media_root.join("Downloads")).unwrap();
+        fs::create_dir_all(media_root.join("tools")).unwrap();
+        fs::create_dir_all(media_root.join("Anime")).unwrap();
+
+        // Create media files - some should be ignored
+        fs::write(media_root.join("Downloads/video1.mkv"), "").unwrap();
+        fs::write(media_root.join("tools/video2.mkv"), "").unwrap();
+        fs::write(media_root.join("temp.tmp"), "").unwrap();
+        fs::write(media_root.join("Anime/episode1.mkv"), "").unwrap();
+        fs::write(media_root.join("movie.mkv"), "").unwrap();
+
+        let scan_cmd = ScanCommand::new(
+            media_root.to_path_buf(),
+            temp_dir.path().to_path_buf(),
+            None,
+        );
+        let result = scan_cmd.execute().await;
+
+        assert!(result.is_ok());
+
+        // Check job files - should only create jobs for non-ignored files
+        let queue_dir = temp_dir.path().join("_queue");
+        let job_count = fs::read_dir(&queue_dir)
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().path().extension() == Some("job".as_ref()))
+            .count();
+
+        // Should only create jobs for Anime/episode1.mkv and movie.mkv (2 jobs)
+        assert_eq!(job_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_scan_with_nested_plexifyignore() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        // Create root .plexifyignore
+        fs::write(media_root.join(".plexifyignore"), "*.tmp").unwrap();
+
+        // Create nested directory with its own .plexifyignore
+        fs::create_dir_all(media_root.join("Series")).unwrap();
+        fs::write(
+            media_root.join("Series/.plexifyignore"),
+            "old/\n!important.mkv",
+        )
+        .unwrap();
+
+        // Create test files
+        fs::create_dir_all(media_root.join("Series/old")).unwrap();
+        fs::write(media_root.join("test.tmp"), "").unwrap();
+        fs::write(media_root.join("Series/show.mkv"), "").unwrap();
+        fs::write(media_root.join("Series/old/episode.mkv"), "").unwrap();
+        fs::write(media_root.join("Series/important.mkv"), "").unwrap();
+        fs::write(media_root.join("movie.mkv"), "").unwrap();
+
+        let scan_cmd = ScanCommand::new(
+            media_root.to_path_buf(),
+            temp_dir.path().to_path_buf(),
+            None,
+        );
+        let result = scan_cmd.execute().await;
+
+        assert!(result.is_ok());
+
+        // Check job files
+        let queue_dir = temp_dir.path().join("_queue");
+        let job_count = fs::read_dir(&queue_dir)
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().path().extension() == Some("job".as_ref()))
+            .count();
+
+        // Should create jobs for: Series/show.mkv, Series/important.mkv, movie.mkv (3 jobs)
+        // Should ignore: test.tmp (root pattern), Series/old/episode.mkv (nested pattern)
+        assert_eq!(job_count, 3);
     }
 }
