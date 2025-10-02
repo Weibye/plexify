@@ -43,7 +43,8 @@ mod queue;
 mod worker;
 
 use commands::{
-    clean::CleanCommand, scan::ScanCommand, validate::ValidateCommand, work::WorkCommand,
+    add::AddCommand, clean::CleanCommand, scan::ScanCommand, validate::ValidateCommand,
+    work::WorkCommand,
 };
 use plexify::JobPriority;
 
@@ -63,6 +64,17 @@ struct Cli {
 /// Available commands
 #[derive(Subcommand)]
 enum Commands {
+    /// Create a transcoding job for an individual media file
+    Add {
+        /// Path to the media file to process
+        file: PathBuf,
+        /// Path to the work directory (defaults to current working directory)
+        #[arg(long, short = 'w')]
+        work_dir: Option<PathBuf>,
+        /// Quality preset for encoding. Available: fast, balanced, quality, ultrafast, archive
+        #[arg(long, short = 'p')]
+        preset: Option<String>,
+    },
     /// Scan a directory for media files and create transcoding jobs
     Scan {
         /// Path to the media directory to scan
@@ -117,6 +129,18 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let result = match cli.command {
+        Commands::Add {
+            file,
+            work_dir,
+            preset,
+        } => {
+            let work_root = work_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
+            info!(
+                "Starting add command for file: {:?}, work: {:?}, preset: {:?}",
+                file, work_root, preset
+            );
+            AddCommand::new(file, work_root, preset).execute().await
+        }
         Commands::Scan {
             path,
             work_dir,
