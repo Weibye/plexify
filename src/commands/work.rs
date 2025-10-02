@@ -80,9 +80,28 @@ impl WorkCommand {
                             continue;
                         }
                         Ok(false) => {
-                            // No job available, sleep
+                            // No job available, sleep with periodic heartbeat
                             debug!("💤 No jobs found. Sleeping for {} seconds.", config.sleep_interval);
-                            tokio::time::sleep(Duration::from_secs(config.sleep_interval)).await;
+
+                            // Show periodic heartbeat during long sleep intervals
+                            let sleep_duration = config.sleep_interval;
+                            if sleep_duration > 10 {
+                                // For sleep intervals longer than 10 seconds, show heartbeat every 30 seconds
+                                let heartbeat_interval = 30;
+                                let mut remaining = sleep_duration;
+
+                                while remaining > 0 {
+                                    let sleep_time = std::cmp::min(heartbeat_interval, remaining);
+                                    tokio::time::sleep(Duration::from_secs(sleep_time)).await;
+                                    remaining = remaining.saturating_sub(sleep_time);
+
+                                    if remaining > 0 {
+                                        info!("💓 Still watching for jobs... ({} seconds remaining)", remaining);
+                                    }
+                                }
+                            } else {
+                                tokio::time::sleep(Duration::from_secs(sleep_duration)).await;
+                            }
                         }
                         Err(e) => {
                             error!("Error processing job: {}", e);

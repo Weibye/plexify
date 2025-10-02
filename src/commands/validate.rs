@@ -214,6 +214,7 @@ impl ValidateCommand {
         // First, collect all media files
         let mut media_files = Vec::new();
         let mut ignored_count = 0;
+        let mut files_processed = 0;
 
         for entry in WalkDir::new(&self.media_root)
             .follow_links(false)
@@ -254,6 +255,13 @@ impl ValidateCommand {
                     ignored_count += 1;
                     continue;
                 }
+            }
+
+            files_processed += 1;
+
+            // Show progress every 1000 files
+            if files_processed % 1000 == 0 {
+                info!("📄 Scanned {} files so far...", files_processed);
             }
 
             // Check if it's a media file

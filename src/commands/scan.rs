@@ -56,6 +56,7 @@ impl ScanCommand {
         let mut mkv_files = Vec::new();
         let mut directories_scanned = std::collections::HashSet::new();
         let mut ignored_count = 0;
+        let mut files_processed = 0;
 
         // Walk through the directory to find media files
         for entry in WalkDir::new(&self.media_root)
@@ -100,12 +101,19 @@ impl ScanCommand {
                 if let Ok(relative_dir) = path.strip_prefix(&self.media_root) {
                     if !directories_scanned.contains(relative_dir) {
                         directories_scanned.insert(relative_dir.to_path_buf());
-                        debug!("📂 Scanning subdirectory: {:?}", relative_dir);
+                        info!("📂 Scanning: {:?}", relative_dir);
                     }
                 }
             }
 
             if path.is_file() {
+                files_processed += 1;
+
+                // Show progress every 500 files
+                if files_processed % 500 == 0 {
+                    info!("📄 Processed {} files so far...", files_processed);
+                }
+
                 if let Some(extension) = path.extension() {
                     let ext_str = extension.to_string_lossy().to_lowercase();
                     match ext_str.as_str() {
@@ -126,8 +134,9 @@ impl ScanCommand {
         }
 
         info!(
-            "📊 Scanned {} directories and found {} .webm files and {} .mkv files",
+            "📊 Scanned {} directories, processed {} files, and found {} .webm files and {} .mkv files",
             directories_scanned.len(),
+            files_processed,
             webm_files.len(),
             mkv_files.len()
         );
