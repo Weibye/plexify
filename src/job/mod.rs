@@ -67,7 +67,7 @@ pub struct EpisodeMetadata {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ContentType {
     Movie,
-    Show,
+    Series,
 }
 
 impl Job {
@@ -250,7 +250,7 @@ impl Job {
             series_name,
             season_number,
             episode_number,
-            content_type: ContentType::Show,
+            content_type: ContentType::Series,
         })
     }
 }
@@ -684,7 +684,7 @@ mod tests {
         assert_eq!(metadata.series_name, "Breaking Bad");
         assert_eq!(metadata.season_number, 1);
         assert_eq!(metadata.episode_number, 3);
-        assert_eq!(metadata.content_type, ContentType::Show);
+        assert_eq!(metadata.content_type, ContentType::Series);
     }
 
     #[test]
@@ -708,7 +708,7 @@ mod tests {
         assert_eq!(metadata.series_name, "Breaking Bad (2008)");
         assert_eq!(metadata.season_number, 1);
         assert_eq!(metadata.episode_number, 1);
-        assert_eq!(metadata.content_type, ContentType::Show);
+        assert_eq!(metadata.content_type, ContentType::Series);
     }
 
     #[test]
@@ -732,7 +732,7 @@ mod tests {
         assert_eq!(metadata.series_name, "Attack on Titan");
         assert_eq!(metadata.season_number, 1);
         assert_eq!(metadata.episode_number, 5);
-        assert_eq!(metadata.content_type, ContentType::Show);
+        assert_eq!(metadata.content_type, ContentType::Series);
     }
 
     #[test]
@@ -754,7 +754,7 @@ mod tests {
         assert_eq!(metadata.series_name, "Critical Role (2015)");
         assert_eq!(metadata.season_number, 1);
         assert_eq!(metadata.episode_number, 12);
-        assert_eq!(metadata.content_type, ContentType::Show);
+        assert_eq!(metadata.content_type, ContentType::Series);
     }
 
     #[test]

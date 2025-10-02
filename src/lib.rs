@@ -13,6 +13,6 @@ use clap::ValueEnum;
 pub enum JobPriority {
     /// No prioritization - process jobs in order found (default)
     None,
-    /// Prioritize episodes within series, older series first
+    /// Prioritize episodes within series, older created jobs first
     Episode,
 }
