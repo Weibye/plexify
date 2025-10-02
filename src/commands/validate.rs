@@ -17,14 +17,14 @@ const MEDIA_EXTENSIONS: &[&str] = &["mkv", "mp4", "avi", "webm", "mov", "m4v"];
 /// Content type for categorizing naming patterns
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ContentType {
-    Show,
+    Series,
     Movie,
 }
 
 /// Directory mapping configuration
 const DIRECTORY_MAPPING: &[(&str, ContentType)] = &[
-    ("Anime", ContentType::Show),
-    ("Series", ContentType::Show),
+    ("Anime", ContentType::Series),
+    ("Series", ContentType::Series),
     ("Movies", ContentType::Movie),
 ];
 
@@ -97,14 +97,14 @@ impl Default for NamingPatterns {
                     description: "Standard Anime format".to_string(),
                     pattern: r"^Anime/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/[^/]+ - s\d{2}e\d{2} - [^/]+\.\w+$".to_string(),
                     example: "Anime/Attack on Titan/Season 01/Attack on Titan - s01e01 - To You, in 2000 Years.mkv".to_string(),
-                    content_type: ContentType::Show,
+                    content_type: ContentType::Series,
                     compiled_regex: None,
                 },
                 NamingPattern {
                     description: "Alternative Anime format".to_string(),
                     pattern: r"^Anime/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/[^/]+ S\d{2}E\d{2} [^/]+\.\w+$".to_string(),
                     example: "Anime/Attack on Titan/Season 01/Attack on Titan S01E01 To You, in 2000 Years.mkv".to_string(),
-                    content_type: ContentType::Show,
+                    content_type: ContentType::Series,
                     compiled_regex: None,
                 },
                 // Series patterns (shows)  
@@ -112,21 +112,21 @@ impl Default for NamingPatterns {
                     description: "Standard Series format".to_string(),
                     pattern: r"^Series/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/[^/]+ - s\d{2}e\d{2} - [^/]+\.\w+$".to_string(),
                     example: "Series/Breaking Bad/Season 01/Breaking Bad - s01e01 - Pilot.mkv".to_string(),
-                    content_type: ContentType::Show,
+                    content_type: ContentType::Series,
                     compiled_regex: None,
                 },
                 NamingPattern {
                     description: "Alternative Series format".to_string(),
                     pattern: r"^Series/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/[^/]+ S\d{2}E\d{2} [^/]+\.\w+$".to_string(),
                     example: "Series/Breaking Bad (2008) {tvdb-296861}/Season 01/Breaking Bad S01E01 Pilot.mkv".to_string(),
-                    content_type: ContentType::Show,
+                    content_type: ContentType::Series,
                     compiled_regex: None,
                 },
                 NamingPattern {
                     description: "Simple Series format".to_string(),
                     pattern: r"^Series/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/S\d{2}E\d{2} - [^/]+\.\w+$".to_string(),
                     example: "Series/Breaking Bad/Season 01/S01E01 - Pilot.mkv".to_string(),
-                    content_type: ContentType::Show,
+                    content_type: ContentType::Series,
                     compiled_regex: None,
                 },
                 // Movie patterns
@@ -373,7 +373,7 @@ impl ValidateCommand {
         for (dir_name, content_type) in DIRECTORY_MAPPING {
             if path_str.starts_with(&format!("{}/", dir_name)) {
                 return match content_type {
-                    ContentType::Show => IssueType::ShowNaming,
+                    ContentType::Series => IssueType::ShowNaming,
                     ContentType::Movie => IssueType::MovieNaming,
                 };
             }
@@ -469,7 +469,7 @@ impl ValidateCommand {
             .patterns_used
             .patterns
             .iter()
-            .filter(|p| p.content_type == ContentType::Show)
+            .filter(|p| p.content_type == ContentType::Series)
             .collect();
         let movie_patterns: Vec<_> = report
             .patterns_used

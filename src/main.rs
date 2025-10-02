@@ -45,6 +45,7 @@ mod worker;
 use commands::{
     clean::CleanCommand, scan::ScanCommand, validate::ValidateCommand, work::WorkCommand,
 };
+use plexify::JobPriority;
 
 /// Plexify - A simple, distributed media transcoding CLI
 #[derive(Parser)]
@@ -83,6 +84,9 @@ enum Commands {
         /// Run worker in background with low priority
         #[arg(long, short)]
         background: bool,
+        /// Job prioritization method
+        #[arg(long, default_value = "none", value_enum)]
+        priority: JobPriority,
     },
     /// Remove all temporary files and directories
     Clean {
@@ -129,13 +133,14 @@ async fn main() -> Result<()> {
             path,
             work_dir,
             background,
+            priority,
         } => {
             let work_root = work_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
             info!(
-                "Starting work command for path: {:?}, work: {:?}, background: {}",
-                path, work_root, background
+                "Starting work command for path: {:?}, work: {:?}, background: {}, priority: {:?}",
+                path, work_root, background, priority
             );
-            WorkCommand::new(path, work_root, background)
+            WorkCommand::new(path, work_root, background, priority)
                 .execute()
                 .await
         }
