@@ -63,7 +63,7 @@ impl AddCommand {
             .map_err(|_| anyhow!("Unable to create relative path for: {:?}", self.file_path))?
             .to_path_buf();
 
-        // Process the file using shared logic
+        // Process the file
         let processor = JobProcessor::new(&queue, &config, &media_root);
         let result = processor
             .process_media_file(&relative_path, file_type.clone())
