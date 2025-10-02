@@ -190,37 +190,63 @@ impl ScanCommand {
         let processor = JobProcessor::new(&queue, &config, &self.media_root);
 
         // Process WebM files (require VTT subtitles)
-        for webm_path in webm_files {
+        for webm_path in &webm_files {
+            if let Some(ref pb) = job_pb {
+                pb.set_message(format!(
+                    "WebM: {:?}",
+                    webm_path.file_name().unwrap_or_default()
+                ));
+            }
+
             let result = processor
-                .process_media_file(&webm_path, MediaFileType::WebM)
+                .process_media_file(webm_path, MediaFileType::WebM)
                 .await?;
 
             match result {
                 JobProcessResult::Created => {
-                    processor.log_result(&webm_path, &MediaFileType::WebM, &result);
+                    processor.log_result(webm_path, &MediaFileType::WebM, &result);
                     job_count += 1;
                 }
                 _ => {
-                    processor.log_result(&webm_path, &MediaFileType::WebM, &result);
+                    processor.log_result(webm_path, &MediaFileType::WebM, &result);
                 }
+            }
+
+            if let Some(ref pb) = job_pb {
+                pb.inc(1);
             }
         }
 
         // Process MKV files (embedded subtitles)
-        for mkv_path in mkv_files {
+        for mkv_path in &mkv_files {
+            if let Some(ref pb) = job_pb {
+                pb.set_message(format!(
+                    "MKV: {:?}",
+                    mkv_path.file_name().unwrap_or_default()
+                ));
+            }
+
             let result = processor
-                .process_media_file(&mkv_path, MediaFileType::Mkv)
+                .process_media_file(mkv_path, MediaFileType::Mkv)
                 .await?;
 
             match result {
                 JobProcessResult::Created => {
-                    processor.log_result(&mkv_path, &MediaFileType::Mkv, &result);
+                    processor.log_result(mkv_path, &MediaFileType::Mkv, &result);
                     job_count += 1;
                 }
                 _ => {
-                    processor.log_result(&mkv_path, &MediaFileType::Mkv, &result);
+                    processor.log_result(mkv_path, &MediaFileType::Mkv, &result);
                 }
             }
+
+            if let Some(ref pb) = job_pb {
+                pb.inc(1);
+            }
+        }
+
+        if let Some(pb) = job_pb {
+            pb.finish_and_clear();
         }
 
         info!(
