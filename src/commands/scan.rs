@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
@@ -58,6 +59,16 @@ impl ScanCommand {
         let mut ignored_count = 0;
         let mut files_processed = 0;
 
+        // Create a progress bar for scanning
+        let scan_pb = ProgressBar::new_spinner();
+        scan_pb.set_style(
+            ProgressStyle::with_template("{spinner:.green} {msg}")
+                .unwrap()
+                .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ "),
+        );
+        scan_pb.set_message("Scanning directories...");
+        scan_pb.enable_steady_tick(std::time::Duration::from_millis(120));
+
         // Walk through the directory to find media files
         for entry in WalkDir::new(&self.media_root)
             .follow_links(false)
@@ -101,7 +112,7 @@ impl ScanCommand {
                 if let Ok(relative_dir) = path.strip_prefix(&self.media_root) {
                     if !directories_scanned.contains(relative_dir) {
                         directories_scanned.insert(relative_dir.to_path_buf());
-                        info!("📂 Scanning: {:?}", relative_dir);
+                        scan_pb.set_message(format!("Scanning: {:?}", relative_dir));
                     }
                 }
             }
@@ -109,9 +120,9 @@ impl ScanCommand {
             if path.is_file() {
                 files_processed += 1;
 
-                // Show progress every 500 files
-                if files_processed % 500 == 0 {
-                    info!("📄 Processed {} files so far...", files_processed);
+                // Update progress bar message periodically
+                if files_processed % 100 == 0 {
+                    scan_pb.set_message(format!("Processed {} files...", files_processed));
                 }
 
                 if let Some(extension) = path.extension() {
@@ -132,6 +143,8 @@ impl ScanCommand {
                 }
             }
         }
+
+        scan_pb.finish_and_clear();
 
         info!(
             "📊 Scanned {} directories, processed {} files, and found {} .webm files and {} .mkv files",
@@ -158,6 +171,19 @@ impl ScanCommand {
         info!("🔄 Now creating transcoding jobs...");
 
         let mut job_count = 0;
+        let total_files = webm_files.len() + mkv_files.len();
+
+        let job_pb = if total_files > 0 {
+            let pb = ProgressBar::new(total_files as u64);
+            pb.set_style(
+                ProgressStyle::with_template("Creating jobs {bar:30.cyan/blue} {pos}/{len} {msg}")
+                    .unwrap()
+                    .progress_chars("█▉▊▋▌▍▎▏ "),
+            );
+            Some(pb)
+        } else {
+            None
+        };
 
         // Get configuration settings for jobs
         let config = JobProcessorConfig::from_preset(self.preset.as_deref())?;
