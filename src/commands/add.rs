@@ -69,7 +69,7 @@ impl AddCommand {
             .process_media_file(&relative_path, file_type.clone())
             .await?;
 
-        // Handle the result with add-specific logic
+        // Handle the result
         match result {
             JobProcessResult::Created => match file_type {
                 MediaFileType::WebM => {
