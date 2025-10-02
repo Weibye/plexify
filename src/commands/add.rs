@@ -2,8 +2,10 @@ use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 use tracing::{info, warn};
 
-use crate::job::{Job, MediaFileType, PostProcessingSettings, QualitySettings};
+use crate::job::MediaFileType;
 use crate::queue::JobQueue;
+
+use super::job_processor::{JobProcessResult, JobProcessor, JobProcessorConfig};
 
 /// Command to create a job for an individual media file
 pub struct AddCommand {
@@ -33,24 +35,8 @@ impl AddCommand {
         info!("📄 Processing file: {:?}", self.file_path);
 
         // Determine file type from extension
-        let file_type = match self.file_path.extension() {
-            Some(ext) => match ext.to_string_lossy().to_lowercase().as_str() {
-                "webm" => MediaFileType::WebM,
-                "mkv" => MediaFileType::Mkv,
-                _ => {
-                    return Err(anyhow!(
-                        "Unsupported file type. Only .webm and .mkv files are supported. Got: {:?}",
-                        self.file_path
-                    ));
-                }
-            },
-            None => {
-                return Err(anyhow!(
-                    "File has no extension. Only .webm and .mkv files are supported: {:?}",
-                    self.file_path
-                ));
-            }
-        };
+        let file_type =
+            JobProcessor::determine_file_type(&self.file_path).map_err(|err| anyhow!(err))?;
 
         // Get the directory containing the file (this will be our media root)
         let media_root = self
@@ -68,17 +54,7 @@ impl AddCommand {
         queue.init().await?;
 
         // Get configuration settings for the job
-        let quality_settings = match &self.preset {
-            Some(preset_name) => {
-                info!("Using quality preset: '{}'", preset_name);
-                QualitySettings::from_preset_name(preset_name)?
-            }
-            None => {
-                info!("Using quality settings from environment variables");
-                QualitySettings::from_env()
-            }
-        };
-        let post_processing = PostProcessingSettings::default();
+        let config = JobProcessorConfig::from_preset(self.preset.as_deref())?;
 
         // Get relative path from media root
         let relative_path = self
@@ -87,52 +63,41 @@ impl AddCommand {
             .map_err(|_| anyhow!("Unable to create relative path for: {:?}", self.file_path))?
             .to_path_buf();
 
-        // Create the job
-        let job = Job::new(
-            relative_path.clone(),
-            file_type.clone(),
-            quality_settings,
-            post_processing,
-            &media_root,
-        );
+        // Process the file using shared logic
+        let processor = JobProcessor::new(&queue, &config, &media_root);
+        let result = processor
+            .process_media_file(&relative_path, file_type.clone())
+            .await?;
 
-        // Check if output already exists
-        if job.output_exists(Some(&media_root)) {
-            warn!("⚠️ Output file already exists for: {:?}", relative_path);
-            info!("✅ No action needed - output file already exists.");
-            return Ok(());
-        }
-
-        // Check if job already exists in queue
-        if queue.job_exists(&job).await? {
-            warn!("⚠️ Job already exists in queue for: {:?}", relative_path);
-            info!("✅ No action needed - job already queued.");
-            return Ok(());
-        }
-
-        // For WebM files, check if required subtitle file exists
-        if file_type == MediaFileType::WebM && !job.has_required_subtitle(Some(&media_root))? {
-            return Err(anyhow!(
-                "Missing required subtitle file (.vtt) for WebM file: {:?}",
-                self.file_path
-            ));
-        }
-
-        // Create the job
-        queue.enqueue_job(&job).await?;
-
-        match file_type {
-            MediaFileType::WebM => {
-                info!(
-                    "✅ Successfully created transcoding job for: {:?}",
-                    relative_path
-                );
+        // Handle the result with add-specific logic
+        match result {
+            JobProcessResult::Created => match file_type {
+                MediaFileType::WebM => {
+                    info!(
+                        "✅ Successfully created transcoding job for: {:?}",
+                        relative_path
+                    );
+                }
+                MediaFileType::Mkv => {
+                    info!(
+                        "✅ Successfully created transcoding job for: {:?} (embedded subs assumed)",
+                        relative_path
+                    );
+                }
+            },
+            JobProcessResult::OutputExists => {
+                warn!("⚠️ Output file already exists for: {:?}", relative_path);
+                info!("✅ No action needed - output file already exists.");
             }
-            MediaFileType::Mkv => {
-                info!(
-                    "✅ Successfully created transcoding job for: {:?} (embedded subs assumed)",
-                    relative_path
-                );
+            JobProcessResult::AlreadyQueued => {
+                warn!("⚠️ Job already exists in queue for: {:?}", relative_path);
+                info!("✅ No action needed - job already queued.");
+            }
+            JobProcessResult::MissingSubtitle => {
+                return Err(anyhow!(
+                    "Missing required subtitle file (.vtt) for WebM file: {:?}",
+                    self.file_path
+                ));
             }
         }
 

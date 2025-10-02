@@ -4,8 +4,10 @@ use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
 use crate::ignore::IgnoreFilter;
-use crate::job::{Job, MediaFileType, PostProcessingSettings, QualitySettings};
+use crate::job::MediaFileType;
 use crate::queue::JobQueue;
+
+use super::job_processor::{JobProcessResult, JobProcessor, JobProcessorConfig};
 
 /// Command to scan a directory for media files and create jobs
 pub struct ScanCommand {
@@ -149,81 +151,41 @@ impl ScanCommand {
         let mut job_count = 0;
 
         // Get configuration settings for jobs
-        let quality_settings = match &self.preset {
-            Some(preset_name) => {
-                info!("Using quality preset: '{}'", preset_name);
-                QualitySettings::from_preset_name(preset_name)?
-            }
-            None => {
-                info!("Using quality settings from environment variables");
-                QualitySettings::from_env()
-            }
-        };
-        let post_processing = PostProcessingSettings::default();
+        let config = JobProcessorConfig::from_preset(self.preset.as_deref())?;
+        let processor = JobProcessor::new(&queue, &config, &self.media_root);
 
         // Process WebM files (require VTT subtitles)
         for webm_path in webm_files {
-            let job = Job::new(
-                webm_path.clone(),
-                MediaFileType::WebM,
-                quality_settings.clone(),
-                post_processing.clone(),
-                &self.media_root,
-            );
+            let result = processor
+                .process_media_file(&webm_path, MediaFileType::WebM)
+                .await?;
 
-            // Check if output already exists
-            if job.output_exists(Some(&self.media_root)) {
-                debug!("Output already exists for: {:?}", webm_path);
-                continue;
+            match result {
+                JobProcessResult::Created => {
+                    processor.log_result(&webm_path, &MediaFileType::WebM, &result);
+                    job_count += 1;
+                }
+                _ => {
+                    processor.log_result(&webm_path, &MediaFileType::WebM, &result);
+                }
             }
-
-            // Check if job already exists in queue
-            if queue.job_exists(&job).await? {
-                debug!("Job already exists for: {:?}", webm_path);
-                continue;
-            }
-
-            // Check if required subtitle file exists
-            if !job.has_required_subtitle(Some(&self.media_root))? {
-                warn!("⚠️ SKIPPING: Missing subtitle file for '{:?}'", webm_path);
-                continue;
-            }
-
-            // Create the job
-            queue.enqueue_job(&job).await?;
-            info!("➕ Queueing job for: {:?}", webm_path);
-            job_count += 1;
         }
 
         // Process MKV files (embedded subtitles)
         for mkv_path in mkv_files {
-            let job = Job::new(
-                mkv_path.clone(),
-                MediaFileType::Mkv,
-                quality_settings.clone(),
-                post_processing.clone(),
-                &self.media_root,
-            );
+            let result = processor
+                .process_media_file(&mkv_path, MediaFileType::Mkv)
+                .await?;
 
-            // Check if output already exists
-            if job.output_exists(Some(&self.media_root)) {
-                debug!("Output already exists for: {:?}", mkv_path);
-                continue;
+            match result {
+                JobProcessResult::Created => {
+                    processor.log_result(&mkv_path, &MediaFileType::Mkv, &result);
+                    job_count += 1;
+                }
+                _ => {
+                    processor.log_result(&mkv_path, &MediaFileType::Mkv, &result);
+                }
             }
-
-            // Check if job already exists in queue
-            if queue.job_exists(&job).await? {
-                debug!("Job already exists for: {:?}", mkv_path);
-                continue;
-            }
-
-            // Create the job
-            queue.enqueue_job(&job).await?;
-            info!(
-                "➕ Queueing job for: {:?} (embedded subs assumed)",
-                mkv_path
-            );
-            job_count += 1;
         }
 
         info!(
