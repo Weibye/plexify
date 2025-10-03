@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -211,9 +212,19 @@ impl ValidateCommand {
         let media_extensions: std::collections::HashSet<&str> =
             MEDIA_EXTENSIONS.iter().copied().collect();
 
-        // First, collect all media files
+        // First, collect all media files with progress indicator
         let mut media_files = Vec::new();
         let mut ignored_count = 0;
+        let mut files_processed = 0;
+
+        let scan_pb = ProgressBar::new_spinner();
+        scan_pb.set_style(
+            ProgressStyle::with_template("{spinner:.green} {msg}")
+                .unwrap()
+                .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ "),
+        );
+        scan_pb.set_message("Collecting media files...");
+        scan_pb.enable_steady_tick(std::time::Duration::from_millis(120));
 
         for entry in WalkDir::new(&self.media_root)
             .follow_links(false)
@@ -256,6 +267,13 @@ impl ValidateCommand {
                 }
             }
 
+            files_processed += 1;
+
+            // Update progress message periodically
+            if files_processed % 500 == 0 {
+                scan_pb.set_message(format!("Scanned {} files...", files_processed));
+            }
+
             // Check if it's a media file
             if let Some(extension) = path.extension() {
                 let ext = extension.to_string_lossy().to_lowercase();
@@ -264,6 +282,8 @@ impl ValidateCommand {
                 }
             }
         }
+
+        scan_pb.finish_and_clear();
 
         info!(
             "🔍 Found {} media files, validating in parallel...",
@@ -276,9 +296,18 @@ impl ValidateCommand {
                 ignored_count
             );
         }
+        // Create validation progress bar
+        let validate_pb = ProgressBar::new(media_files.len() as u64);
+        validate_pb.set_style(
+            ProgressStyle::with_template("Validating {bar:30.cyan/blue} {pos}/{len} {msg}")
+                .unwrap()
+                .progress_chars("█▉▊▋▌▍▎▏ "),
+        );
+        validate_pb.set_message("files");
 
         // Create shared reference to self for parallel processing
         let media_root = Arc::new(&self.media_root);
+        let pb = Arc::new(validate_pb);
 
         // Process files in parallel using rayon
         let issues: Vec<ValidationIssue> = media_files
@@ -289,9 +318,14 @@ impl ValidateCommand {
                     Err(_) => return None,
                 };
 
-                self.validate_file_path_parallel(&self.compiled_patterns, relative_path, path)
+                let result =
+                    self.validate_file_path_parallel(&self.compiled_patterns, relative_path, path);
+                pb.inc(1);
+                result
             })
             .collect();
+
+        pb.finish_and_clear();
 
         let validation_time = start_time.elapsed();
 

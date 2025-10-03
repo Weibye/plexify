@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Result};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::signal;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::ffmpeg::FFmpegProcessor;
@@ -80,9 +81,29 @@ impl WorkCommand {
                             continue;
                         }
                         Ok(false) => {
-                            // No job available, sleep
-                            debug!("💤 No jobs found. Sleeping for {} seconds.", config.sleep_interval);
-                            tokio::time::sleep(Duration::from_secs(config.sleep_interval)).await;
+                            // No job available, sleep with progress bar
+                            let sleep_duration = config.sleep_interval;
+
+                            if sleep_duration > 5 {
+                                // Show progress bar for sleep intervals longer than 5 seconds
+                                let pb = ProgressBar::new(sleep_duration);
+                                pb.set_style(
+                                    ProgressStyle::with_template(
+                                        "💤 Waiting for jobs {bar:30.cyan/blue} {pos}/{len}s {msg}"
+                                    ).unwrap()
+                                    .progress_chars("█▉▊▋▌▍▎▏ ")
+                                );
+                                pb.set_message("Watching queue...");
+
+                                for _i in 0..sleep_duration {
+                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                    pb.inc(1);
+                                }
+
+                                pb.finish_and_clear();
+                            } else {
+                                tokio::time::sleep(Duration::from_secs(sleep_duration)).await;
+                            }
                         }
                         Err(e) => {
                             error!("Error processing job: {}", e);
@@ -126,33 +147,48 @@ impl WorkCommand {
             let job_name = claimed_job.job_name().to_string();
             let work_folder = &queue.in_progress_dir;
 
+            // Create a progress bar for job processing
+            let job_pb = ProgressBar::new_spinner();
+            job_pb.set_style(
+                ProgressStyle::with_template("{spinner:.green} {msg}")
+                    .unwrap()
+                    .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ "),
+            );
+            job_pb.set_message(format!("Processing: {}", job_name));
+            job_pb.enable_steady_tick(Duration::from_millis(120));
+
             match processor
                 .process_job(job, media_root, Some(work_folder))
                 .await
             {
                 Ok(_) => {
+                    job_pb.set_message("Moving output file...");
+
                     // Move file from work folder to media folder
                     if let Err(e) = processor
                         .move_to_destination(job, media_root, work_folder)
                         .await
                     {
                         error!("Failed to move file from work folder: {}", e);
+                        job_pb.finish_and_clear();
                         claimed_job.return_to_queue().await?;
                         return Ok(true);
                     }
 
                     // Disable source files if configured
                     if job.post_processing.disable_source_files {
+                        job_pb.set_message("Cleaning up source files...");
                         if let Err(e) = processor.disable_source_files(job, media_root).await {
                             warn!("Failed to disable source files: {}", e);
                             // Continue anyway, the conversion was successful
                         }
                     }
 
+                    job_pb.finish_with_message(format!("✅ Completed: {}", job_name));
                     claimed_job.complete().await?;
-                    info!("✅ Job completed successfully: {}", job_name);
                 }
                 Err(e) => {
+                    job_pb.finish_with_message(format!("❌ Failed: {}", job_name));
                     error!("❌ Conversion FAILED: {}", e);
                     claimed_job.return_to_queue().await?;
 

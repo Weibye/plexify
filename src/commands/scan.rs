@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
@@ -56,6 +57,17 @@ impl ScanCommand {
         let mut mkv_files = Vec::new();
         let mut directories_scanned = std::collections::HashSet::new();
         let mut ignored_count = 0;
+        let mut files_processed = 0;
+
+        // Create a progress bar for scanning
+        let scan_pb = ProgressBar::new_spinner();
+        scan_pb.set_style(
+            ProgressStyle::with_template("{spinner:.green} {msg}")
+                .unwrap()
+                .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ "),
+        );
+        scan_pb.set_message("Scanning directories...");
+        scan_pb.enable_steady_tick(std::time::Duration::from_millis(120));
 
         // Walk through the directory to find media files
         for entry in WalkDir::new(&self.media_root)
@@ -100,12 +112,19 @@ impl ScanCommand {
                 if let Ok(relative_dir) = path.strip_prefix(&self.media_root) {
                     if !directories_scanned.contains(relative_dir) {
                         directories_scanned.insert(relative_dir.to_path_buf());
-                        debug!("📂 Scanning subdirectory: {:?}", relative_dir);
+                        scan_pb.set_message(format!("Scanning: {:?}", relative_dir));
                     }
                 }
             }
 
             if path.is_file() {
+                files_processed += 1;
+
+                // Update progress bar message periodically
+                if files_processed % 100 == 0 {
+                    scan_pb.set_message(format!("Processed {} files...", files_processed));
+                }
+
                 if let Some(extension) = path.extension() {
                     let ext_str = extension.to_string_lossy().to_lowercase();
                     match ext_str.as_str() {
@@ -125,9 +144,12 @@ impl ScanCommand {
             }
         }
 
+        scan_pb.finish_and_clear();
+
         info!(
-            "📊 Scanned {} directories and found {} .webm files and {} .mkv files",
+            "📊 Scanned {} directories, processed {} files, and found {} .webm files and {} .mkv files",
             directories_scanned.len(),
+            files_processed,
             webm_files.len(),
             mkv_files.len()
         );
@@ -149,43 +171,82 @@ impl ScanCommand {
         info!("🔄 Now creating transcoding jobs...");
 
         let mut job_count = 0;
+        let total_files = webm_files.len() + mkv_files.len();
+
+        let job_pb = if total_files > 0 {
+            let pb = ProgressBar::new(total_files as u64);
+            pb.set_style(
+                ProgressStyle::with_template("Creating jobs {bar:30.cyan/blue} {pos}/{len} {msg}")
+                    .unwrap()
+                    .progress_chars("█▉▊▋▌▍▎▏ "),
+            );
+            Some(pb)
+        } else {
+            None
+        };
 
         // Get configuration settings for jobs
         let config = JobProcessorConfig::from_preset(self.preset.as_deref())?;
         let processor = JobProcessor::new(&queue, &config, &self.media_root);
 
         // Process WebM files (require VTT subtitles)
-        for webm_path in webm_files {
+        for webm_path in &webm_files {
+            if let Some(ref pb) = job_pb {
+                pb.set_message(format!(
+                    "WebM: {:?}",
+                    webm_path.file_name().unwrap_or_default()
+                ));
+            }
+
             let result = processor
-                .process_media_file(&webm_path, MediaFileType::WebM)
+                .process_media_file(webm_path, MediaFileType::WebM)
                 .await?;
 
             match result {
                 JobProcessResult::Created => {
-                    processor.log_result(&webm_path, &MediaFileType::WebM, &result);
+                    processor.log_result(webm_path, &MediaFileType::WebM, &result);
                     job_count += 1;
                 }
                 _ => {
-                    processor.log_result(&webm_path, &MediaFileType::WebM, &result);
+                    processor.log_result(webm_path, &MediaFileType::WebM, &result);
                 }
+            }
+
+            if let Some(ref pb) = job_pb {
+                pb.inc(1);
             }
         }
 
         // Process MKV files (embedded subtitles)
-        for mkv_path in mkv_files {
+        for mkv_path in &mkv_files {
+            if let Some(ref pb) = job_pb {
+                pb.set_message(format!(
+                    "MKV: {:?}",
+                    mkv_path.file_name().unwrap_or_default()
+                ));
+            }
+
             let result = processor
-                .process_media_file(&mkv_path, MediaFileType::Mkv)
+                .process_media_file(mkv_path, MediaFileType::Mkv)
                 .await?;
 
             match result {
                 JobProcessResult::Created => {
-                    processor.log_result(&mkv_path, &MediaFileType::Mkv, &result);
+                    processor.log_result(mkv_path, &MediaFileType::Mkv, &result);
                     job_count += 1;
                 }
                 _ => {
-                    processor.log_result(&mkv_path, &MediaFileType::Mkv, &result);
+                    processor.log_result(mkv_path, &MediaFileType::Mkv, &result);
                 }
             }
+
+            if let Some(ref pb) = job_pb {
+                pb.inc(1);
+            }
+        }
+
+        if let Some(pb) = job_pb {
+            pb.finish_and_clear();
         }
 
         info!(
