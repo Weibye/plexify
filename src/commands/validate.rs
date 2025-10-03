@@ -85,6 +85,14 @@ pub struct FixedFile {
     pub issue_type: IssueType,
 }
 
+/// Episode information parsed from filename
+#[derive(Debug)]
+struct EpisodeInfo {
+    season: u32,
+    episode: u32,
+    title: String,
+}
+
 /// Command to validate Plex naming scheme conformity
 pub struct ValidateCommand {
     media_root: PathBuf,
@@ -118,6 +126,15 @@ impl Default for NamingPatterns {
                     content_type: ContentType::Series,
                     compiled_regex: None,
                 },
+                // Extended anime patterns for high episode numbers (common in long-running anime)
+                NamingPattern {
+                    description: "Extended Anime format (high episode numbers)".to_string(),
+                    pattern: r"^Anime/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/[^/]+ - s\d{2}e\d{3} - [^/]+\.\w+$".to_string(),
+                    example: "Anime/One Piece/Season 11/One Piece - s11e397 - Episode 397.mkv".to_string(),
+                    content_type: ContentType::Series,
+                    compiled_regex: None,
+                },
+
                 // Series patterns (shows)  
                 NamingPattern {
                     description: "Standard Series format".to_string(),
@@ -140,6 +157,7 @@ impl Default for NamingPatterns {
                     content_type: ContentType::Series,
                     compiled_regex: None,
                 },
+
                 // Movie patterns
                 NamingPattern {
                     description: "Standard Movie format".to_string(),
@@ -517,71 +535,283 @@ impl ValidateCommand {
     /// Suggest a corrected path for a file
     fn suggest_path(&self, path_str: &str, issue_type: &IssueType) -> Option<PathBuf> {
         match issue_type {
-            IssueType::DirectoryStructure => {
-                // If it's not in Movies/Series/Anime, suggest moving to Movies/ as default
-                if let Some(filename) = Path::new(path_str).file_name() {
-                    let filename_str = filename.to_string_lossy();
-
-                    // Try to extract year from filename for movie detection
-                    if let Some(_year_match) = Regex::new(r"\((\d{4})\)")
-                        .ok()
-                        .and_then(|re| re.find(&filename_str))
-                    {
-                        let filename_string = filename_str.to_string();
-                        let base_name = filename_string.replace(
-                            &format!(
-                                ".{}",
-                                Path::new(&filename_string)
-                                    .extension()
-                                    .and_then(|ext| ext.to_str())
-                                    .unwrap_or("")
-                            ),
-                            "",
-                        );
-                        return Some(PathBuf::from(format!(
-                            "Movies/{}/{}",
-                            base_name, filename_str
-                        )));
-                    }
-
-                    // Check for episode patterns to suggest Series/
-                    if Regex::new(r"[sS]\d{1,2}[eE]\d{1,2}")
-                        .ok()
-                        .map(|re| re.is_match(&filename_str))
-                        .unwrap_or(false)
-                    {
-                        // Extract show name (rough heuristic)
-                        let show_name = filename_str
-                            .split(&['-', '.', '_'])
-                            .next()
-                            .unwrap_or("Unknown Show")
-                            .trim();
-                        return Some(PathBuf::from(format!(
-                            "Series/{}/Season 01/{}",
-                            show_name, filename_str
-                        )));
-                    }
-
-                    // Default to Movies/ for other files
-                    let filename_string = filename_str.to_string();
-                    let base_name = Path::new(&filename_string)
-                        .file_stem()
-                        .and_then(|stem| stem.to_str())
-                        .unwrap_or("Unknown Movie");
-                    return Some(PathBuf::from(format!(
-                        "Movies/{}/{}",
-                        base_name, filename_str
-                    )));
-                }
-                None
-            }
-            IssueType::ShowNaming | IssueType::MovieNaming => {
-                // For naming issues within correct directories, suggest proper format
-                // This is simplified - a full implementation would be more sophisticated
-                None
-            }
+            IssueType::DirectoryStructure => self.suggest_directory_structure_fix(path_str),
+            IssueType::ShowNaming => self.suggest_show_naming_fix(path_str),
+            IssueType::MovieNaming => self.suggest_movie_naming_fix(path_str),
             _ => None,
         }
+    }
+
+    /// Suggest fix for directory structure issues
+    fn suggest_directory_structure_fix(&self, path_str: &str) -> Option<PathBuf> {
+        if let Some(filename) = Path::new(path_str).file_name() {
+            let filename_str = filename.to_string_lossy();
+
+            // Try to extract year from filename for movie detection
+            if let Some(_year_match) = Regex::new(r"\((\d{4})\)")
+                .ok()
+                .and_then(|re| re.find(&filename_str))
+            {
+                let filename_string = filename_str.to_string();
+                let base_name = filename_string.replace(
+                    &format!(
+                        ".{}",
+                        Path::new(&filename_string)
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .unwrap_or("")
+                    ),
+                    "",
+                );
+                return Some(PathBuf::from(format!(
+                    "Movies/{}/{}",
+                    base_name, filename_str
+                )));
+            }
+
+            // Check for episode patterns to suggest Series/
+            if Regex::new(r"[sS]\d{1,2}[eE]\d{1,2}")
+                .ok()
+                .map(|re| re.is_match(&filename_str))
+                .unwrap_or(false)
+            {
+                // Extract show name (rough heuristic)
+                let show_name = filename_str
+                    .split(&['-', '.', '_'])
+                    .next()
+                    .unwrap_or("Unknown Show")
+                    .trim();
+                return Some(PathBuf::from(format!(
+                    "Series/{}/Season 01/{}",
+                    show_name, filename_str
+                )));
+            }
+
+            // Default to Movies/ for other files
+            let filename_string = filename_str.to_string();
+            let base_name = Path::new(&filename_string)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("Unknown Movie");
+            return Some(PathBuf::from(format!(
+                "Movies/{}/{}",
+                base_name, filename_str
+            )));
+        }
+        None
+    }
+
+    /// Suggest fix for show naming issues
+    fn suggest_show_naming_fix(&self, path_str: &str) -> Option<PathBuf> {
+        let path = Path::new(path_str);
+        let filename = path.file_name()?.to_string_lossy();
+        let extension = path.extension()?.to_str()?;
+
+        // Parse the current path components
+        let path_components: Vec<&str> = path_str.split('/').collect();
+        if path_components.len() < 3 {
+            return None;
+        }
+
+        let root_type = path_components[0]; // "Anime", "Series", etc.
+        let show_dir = path_components[1]; // Show directory name
+        let _season_dir = path_components[2]; // Season directory
+
+        // Extract show name from directory (clean up any metadata)
+        let show_name = self.extract_clean_show_name(show_dir);
+
+        // Parse filename to extract episode information
+        if let Some(episode_info) = self.parse_episode_filename(&filename) {
+            let season_num = episode_info.season;
+            let episode_num = episode_info.episode;
+
+            // Generate proper episode title if missing
+            let episode_title = if episode_info.title.is_empty() {
+                format!("Episode {}", episode_num)
+            } else {
+                episode_info.title
+            };
+
+            // Format episode number - use appropriate width for the episode count
+            let episode_formatted = if episode_num >= 100 {
+                format!("{:03}", episode_num) // 3 digits for episodes >= 100
+            } else {
+                format!("{:02}", episode_num) // 2 digits for episodes < 100
+            };
+
+            // Determine the correct format based on root type and patterns
+            let suggested_filename = if root_type == "Anime" {
+                // Use the first anime pattern: "Show - s01e01 - Episode Title"
+                format!(
+                    "{} - s{:02}e{} - {}.{}",
+                    show_name, season_num, episode_formatted, episode_title, extension
+                )
+            } else {
+                // Use the first series pattern: "Show - s01e01 - Episode Title"
+                format!(
+                    "{} - s{:02}e{} - {}.{}",
+                    show_name, season_num, episode_formatted, episode_title, extension
+                )
+            };
+
+            // Reconstruct the full path
+            let season_dir_clean = format!("Season {:02}", season_num);
+            return Some(PathBuf::from(format!(
+                "{}/{}/{}/{}",
+                root_type, show_name, season_dir_clean, suggested_filename
+            )));
+        }
+
+        None
+    }
+
+    /// Suggest fix for movie naming issues  
+    fn suggest_movie_naming_fix(&self, path_str: &str) -> Option<PathBuf> {
+        let path = Path::new(path_str);
+        let filename = path.file_name()?.to_string_lossy();
+        let extension = path.extension()?.to_str()?;
+
+        // Parse the current path components
+        let path_components: Vec<&str> = path_str.split('/').collect();
+        if path_components.len() < 3 {
+            return None;
+        }
+
+        let _movie_dir = path_components[1]; // Movie directory name
+
+        // Extract year if present
+        if let Some(year) = self.extract_year(&filename) {
+            let clean_title = self.extract_clean_movie_title(&filename, year);
+            let suggested_filename = format!("{} ({}).{}", clean_title, year, extension);
+            let suggested_dir = format!("{} ({})", clean_title, year);
+
+            return Some(PathBuf::from(format!(
+                "Movies/{}/{}",
+                suggested_dir, suggested_filename
+            )));
+        }
+
+        None
+    }
+
+    /// Extract clean show name from directory name (remove metadata, year, etc.)
+    fn extract_clean_show_name(&self, show_dir: &str) -> String {
+        // Remove common metadata patterns
+        let mut clean = show_dir.to_string();
+
+        // Remove TVDB IDs like {tvdb-123456}
+        if let Ok(re) = Regex::new(r"\s*\{tvdb-\d+\}") {
+            clean = re.replace_all(&clean, "").to_string();
+        }
+
+        // Remove year in parentheses
+        if let Ok(re) = Regex::new(r"\s*\(\d{4}\)") {
+            clean = re.replace_all(&clean, "").to_string();
+        }
+
+        clean = clean.trim().to_string();
+
+        if clean.is_empty() {
+            show_dir.to_string()
+        } else {
+            clean
+        }
+    }
+
+    /// Parse episode information from filename
+    fn parse_episode_filename(&self, filename: &str) -> Option<EpisodeInfo> {
+        // Try different episode patterns
+        let patterns = vec![
+            // Pattern: "Show - S11E397 - [720p][ybis]"
+            r"^(.+?)\s*-\s*[sS](\d{1,2})[eE](\d{1,4})\s*-\s*(.*)$",
+            // Pattern: "Show S11E397 [720p][ybis]"
+            r"^(.+?)\s+[sS](\d{1,2})[eE](\d{1,4})\s*(.*)$",
+            // Pattern: "Show - S11E397 [720p][ybis]"
+            r"^(.+?)\s*-\s*[sS](\d{1,2})[eE](\d{1,4})\s*(.*)$",
+        ];
+
+        for pattern in patterns {
+            if let Ok(re) = Regex::new(pattern) {
+                if let Some(captures) = re.captures(filename) {
+                    let season: u32 = captures.get(2)?.as_str().parse().ok()?;
+                    let episode: u32 = captures.get(3)?.as_str().parse().ok()?;
+                    let title_part = captures.get(4).map(|m| m.as_str()).unwrap_or("");
+
+                    // Clean up the title part (remove quality tags, file extension)
+                    let clean_title = self.clean_episode_title(title_part);
+
+                    return Some(EpisodeInfo {
+                        season,
+                        episode,
+                        title: clean_title,
+                    });
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Clean up episode title (remove quality tags, brackets, etc.)
+    fn clean_episode_title(&self, title: &str) -> String {
+        let mut clean = title.to_string();
+
+        // Remove file extension
+        if let Some(dot_pos) = clean.rfind('.') {
+            clean = clean[..dot_pos].to_string();
+        }
+
+        // Remove common quality/source tags in brackets/parentheses
+        let tag_patterns = vec![
+            r"\[[\w\d\s]+\]", // [720p], [ybis], [BluRay], etc.
+            r"\([\w\d\s]+\)", // (720p), (ybis), etc.
+            r"\.[\w\d]+\.",   // .x264., .HDTV., etc.
+        ];
+
+        for pattern in tag_patterns {
+            if let Ok(re) = Regex::new(pattern) {
+                clean = re.replace_all(&clean, "").to_string();
+            }
+        }
+
+        // Clean up extra whitespace and dashes
+        clean = clean.trim().trim_matches('-').trim().to_string();
+
+        // If we have no clean title after removal, return empty (will generate generic title)
+        if clean.is_empty() || clean.len() < 3 {
+            String::new()
+        } else {
+            clean
+        }
+    }
+
+    /// Extract year from filename
+    fn extract_year(&self, filename: &str) -> Option<u32> {
+        if let Ok(re) = Regex::new(r"\((\d{4})\)") {
+            re.captures(filename)
+                .and_then(|caps| caps.get(1))
+                .and_then(|m| m.as_str().parse().ok())
+        } else {
+            None
+        }
+    }
+
+    /// Extract clean movie title
+    fn extract_clean_movie_title(&self, filename: &str, year: u32) -> String {
+        // Remove year and extension, clean up the rest
+        let without_ext = filename.replace(
+            &format!(
+                ".{}",
+                Path::new(filename)
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .unwrap_or("")
+            ),
+            "",
+        );
+        let without_year = without_ext.replace(&format!("({})", year), "");
+
+        without_year.trim().to_string()
     }
 
     /// Print the validation report to stdout
@@ -1097,5 +1327,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(existing_content, "existing");
+    }
+
+    #[tokio::test]
+    async fn test_validate_fix_anime_high_episode_numbers() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        // Create One Piece-style files with high episode numbers and quality tags
+        fs::create_dir_all(
+            media_root.join("Anime/One Piece/Season 11 - Seabaody Archipelago (382-407)"),
+        )
+        .unwrap();
+        fs::write(
+            media_root.join("Anime/One Piece/Season 11 - Seabaody Archipelago (382-407)/One Piece - S11E397 - [720p][ybis].mkv"),
+            "test content",
+        )
+        .unwrap();
+        fs::write(
+            media_root.join("Anime/One Piece/Season 11 - Seabaody Archipelago (382-407)/One Piece - S11E398 - [720p][ybis].mkv"),
+            "test content",
+        )
+        .unwrap();
+
+        // Test fix mode
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf(), true);
+        let result = validate_cmd.execute().await;
+
+        assert!(result.is_ok());
+        let report = result.unwrap();
+        assert_eq!(report.scanned_files, 2);
+        assert_eq!(report.issues.len(), 0); // All files should be fixed
+        assert_eq!(report.fixed_files.len(), 2); // Two files should be fixed
+
+        // Verify files were moved to correct locations with proper names
+        assert!(media_root
+            .join("Anime/One Piece/Season 11/One Piece - s11e397 - Episode 397.mkv")
+            .exists());
+        assert!(media_root
+            .join("Anime/One Piece/Season 11/One Piece - s11e398 - Episode 398.mkv")
+            .exists());
+
+        // Original files should be gone
+        assert!(!media_root.join("Anime/One Piece/Season 11 - Seabaody Archipelago (382-407)/One Piece - S11E397 - [720p][ybis].mkv").exists());
+        assert!(!media_root.join("Anime/One Piece/Season 11 - Seabaody Archipelago (382-407)/One Piece - S11E398 - [720p][ybis].mkv").exists());
+
+        // Verify the fixed files now validate correctly
+        let validate_cmd_check = ValidateCommand::new(media_root.to_path_buf(), false);
+        let result_check = validate_cmd_check.execute().await;
+        assert!(result_check.is_ok());
+        let report_check = result_check.unwrap();
+        assert_eq!(report_check.issues.len(), 0); // No issues should remain
     }
 }
