@@ -71,9 +71,18 @@ pub enum IssueType {
 pub struct ValidationReport {
     pub scanned_files: usize,
     pub issues: Vec<ValidationIssue>,
+    pub fixed_files: Vec<FixedFile>,
     pub patterns_used: NamingPatterns,
     pub scan_path: PathBuf,
     pub validation_time: Duration,
+}
+
+/// Record of a file that was fixed
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FixedFile {
+    pub original_path: PathBuf,
+    pub new_path: PathBuf,
+    pub issue_type: IssueType,
 }
 
 /// Command to validate Plex naming scheme conformity
@@ -81,6 +90,7 @@ pub struct ValidateCommand {
     media_root: PathBuf,
     patterns: NamingPatterns,
     compiled_patterns: Vec<CompiledPattern>,
+    fix_mode: bool,
 }
 
 /// Internal structure for compiled regex patterns
@@ -152,7 +162,7 @@ impl Default for NamingPatterns {
 
 impl ValidateCommand {
     /// Create a new validate command
-    pub fn new(media_root: PathBuf) -> Self {
+    pub fn new(media_root: PathBuf, fix_mode: bool) -> Self {
         let patterns = NamingPatterns::default();
         let compiled_patterns = Self::compile_patterns(&patterns);
 
@@ -160,6 +170,7 @@ impl ValidateCommand {
             media_root,
             patterns,
             compiled_patterns,
+            fix_mode,
         }
     }
 
@@ -309,21 +320,29 @@ impl ValidateCommand {
         let media_root = Arc::new(&self.media_root);
         let pb = Arc::new(validate_pb);
 
-        // Process files in parallel using rayon
-        let issues: Vec<ValidationIssue> = media_files
-            .par_iter()
-            .filter_map(|path| {
-                let relative_path = match path.strip_prefix(media_root.as_ref()) {
-                    Ok(rel_path) => rel_path,
-                    Err(_) => return None,
-                };
+        // Process files - either just validate or validate and fix
+        let (issues, fixed_files) = if self.fix_mode {
+            self.validate_and_fix_files(&media_files, &pb).await?
+        } else {
+            let issues: Vec<ValidationIssue> = media_files
+                .par_iter()
+                .filter_map(|path| {
+                    let relative_path = match path.strip_prefix(media_root.as_ref()) {
+                        Ok(rel_path) => rel_path,
+                        Err(_) => return None,
+                    };
 
-                let result =
-                    self.validate_file_path_parallel(&self.compiled_patterns, relative_path, path);
-                pb.inc(1);
-                result
-            })
-            .collect();
+                    let result = self.validate_file_path_parallel(
+                        &self.compiled_patterns,
+                        relative_path,
+                        path,
+                    );
+                    pb.inc(1);
+                    result
+                })
+                .collect();
+            (issues, Vec::new())
+        };
 
         pb.finish_and_clear();
 
@@ -332,6 +351,7 @@ impl ValidateCommand {
         let report = ValidationReport {
             scanned_files: media_files.len(),
             issues,
+            fixed_files,
             patterns_used: self.patterns.clone(),
             scan_path: self.media_root.clone(),
             validation_time,
@@ -345,6 +365,85 @@ impl ValidateCommand {
         );
 
         Ok(report)
+    }
+
+    /// Validate files and optionally fix them
+    async fn validate_and_fix_files(
+        &self,
+        media_files: &[PathBuf],
+        pb: &Arc<ProgressBar>,
+    ) -> Result<(Vec<ValidationIssue>, Vec<FixedFile>)> {
+        let mut issues = Vec::new();
+        let mut fixed_files = Vec::new();
+
+        for path in media_files {
+            let relative_path = match path.strip_prefix(&self.media_root) {
+                Ok(rel_path) => rel_path,
+                Err(_) => {
+                    pb.inc(1);
+                    continue;
+                }
+            };
+
+            if let Some(issue) =
+                self.validate_file_path_parallel(&self.compiled_patterns, relative_path, path)
+            {
+                // Try to fix the issue if a suggestion is available
+                if let Some(suggested_path) = &issue.suggested_path {
+                    let full_suggested_path = self.media_root.join(suggested_path);
+
+                    // Try to rename the file
+                    match self.fix_file(path, &full_suggested_path).await {
+                        Ok(()) => {
+                            info!(
+                                "✅ Fixed: {} -> {}",
+                                path.display(),
+                                full_suggested_path.display()
+                            );
+                            fixed_files.push(FixedFile {
+                                original_path: path.clone(),
+                                new_path: full_suggested_path,
+                                issue_type: issue.issue_type,
+                            });
+                        }
+                        Err(e) => {
+                            warn!("❌ Failed to fix {}: {}", path.display(), e);
+                            issues.push(issue);
+                        }
+                    }
+                } else {
+                    // No suggestion available, keep as issue
+                    issues.push(issue);
+                }
+            }
+
+            pb.inc(1);
+        }
+
+        Ok((issues, fixed_files))
+    }
+
+    /// Fix a single file by renaming it to the suggested path
+    async fn fix_file(&self, original_path: &Path, new_path: &Path) -> Result<()> {
+        // Create destination directory if it doesn't exist
+        if let Some(parent) = new_path.parent() {
+            if !parent.exists() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+        }
+
+        // Check if destination already exists
+        if new_path.exists() {
+            return Err(anyhow!(
+                "Destination path already exists: {}",
+                new_path.display()
+            ));
+        }
+
+        // Rename the file
+        tokio::fs::rename(original_path, new_path).await?;
+
+        Ok(())
     }
 
     /// Validate a single file path against patterns (sequential version for testing)
@@ -417,52 +516,116 @@ impl ValidateCommand {
 
     /// Suggest a corrected path for a file
     fn suggest_path(&self, path_str: &str, issue_type: &IssueType) -> Option<PathBuf> {
-        // This is a simplified suggestion system
-        // In a full implementation, this would be more sophisticated
-        if let IssueType::DirectoryStructure = issue_type {
-            // If it's not in Movies/ or TV Shows/, suggest moving to Movies/
-            if let Some(filename) = Path::new(path_str).file_name() {
-                let filename_str = filename.to_string_lossy();
-                // Try to extract year from filename
-                if let Some(_year_match) = Regex::new(r"\((\d{4})\)")
-                    .ok()
-                    .and_then(|re| re.find(&filename_str))
-                {
+        match issue_type {
+            IssueType::DirectoryStructure => {
+                // If it's not in Movies/Series/Anime, suggest moving to Movies/ as default
+                if let Some(filename) = Path::new(path_str).file_name() {
+                    let filename_str = filename.to_string_lossy();
+
+                    // Try to extract year from filename for movie detection
+                    if let Some(_year_match) = Regex::new(r"\((\d{4})\)")
+                        .ok()
+                        .and_then(|re| re.find(&filename_str))
+                    {
+                        let filename_string = filename_str.to_string();
+                        let base_name = filename_string.replace(
+                            &format!(
+                                ".{}",
+                                Path::new(&filename_string)
+                                    .extension()
+                                    .and_then(|ext| ext.to_str())
+                                    .unwrap_or("")
+                            ),
+                            "",
+                        );
+                        return Some(PathBuf::from(format!(
+                            "Movies/{}/{}",
+                            base_name, filename_str
+                        )));
+                    }
+
+                    // Check for episode patterns to suggest Series/
+                    if Regex::new(r"[sS]\d{1,2}[eE]\d{1,2}")
+                        .ok()
+                        .map(|re| re.is_match(&filename_str))
+                        .unwrap_or(false)
+                    {
+                        // Extract show name (rough heuristic)
+                        let show_name = filename_str
+                            .split(&['-', '.', '_'])
+                            .next()
+                            .unwrap_or("Unknown Show")
+                            .trim();
+                        return Some(PathBuf::from(format!(
+                            "Series/{}/Season 01/{}",
+                            show_name, filename_str
+                        )));
+                    }
+
+                    // Default to Movies/ for other files
                     let filename_string = filename_str.to_string();
-                    let base_name = filename_string.replace(
-                        &format!(
-                            ".{}",
-                            Path::new(&filename_string)
-                                .extension()
-                                .and_then(|ext| ext.to_str())
-                                .unwrap_or("")
-                        ),
-                        "",
-                    );
+                    let base_name = Path::new(&filename_string)
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .unwrap_or("Unknown Movie");
                     return Some(PathBuf::from(format!(
                         "Movies/{}/{}",
                         base_name, filename_str
                     )));
                 }
+                None
             }
+            IssueType::ShowNaming | IssueType::MovieNaming => {
+                // For naming issues within correct directories, suggest proper format
+                // This is simplified - a full implementation would be more sophisticated
+                None
+            }
+            _ => None,
         }
-        None
     }
 
     /// Print the validation report to stdout
     pub fn print_report(&self, report: &ValidationReport) {
-        println!("\n📊 Plex Naming Scheme Validation Report");
+        let report_title = if self.fix_mode {
+            "📊 Plex Naming Scheme Fix Report"
+        } else {
+            "📊 Plex Naming Scheme Validation Report"
+        };
+
+        println!("\n{}", report_title);
         println!("═══════════════════════════════════════");
         println!("📂 Scanned directory: {}", report.scan_path.display());
         println!("📁 Files scanned: {}", report.scanned_files);
-        println!("⚠️  Issues found: {}", report.issues.len());
+
+        if self.fix_mode {
+            println!("✅ Files fixed: {}", report.fixed_files.len());
+            println!("⚠️  Issues remaining: {}", report.issues.len());
+        } else {
+            println!("⚠️  Issues found: {}", report.issues.len());
+        }
+
         println!(
-            "⏱️  Validation time: {:.2}s",
+            "⏱️  Processing time: {:.2}s",
             report.validation_time.as_secs_f64()
         );
 
+        // Report fixed files if in fix mode
+        if self.fix_mode && !report.fixed_files.is_empty() {
+            println!("\n✅ Fixed Files:");
+            println!("───────────────");
+
+            for fixed in &report.fixed_files {
+                println!("\n🔧 {}", fixed.original_path.display());
+                println!("   → {}", fixed.new_path.display());
+            }
+        }
+
         if report.issues.is_empty() {
-            println!("\n✅ All files conform to Plex naming conventions!");
+            if self.fix_mode && report.fixed_files.is_empty() {
+                println!("\n✅ All files already conform to Plex naming conventions!");
+            } else if !self.fix_mode {
+                println!("\n✅ All files conform to Plex naming conventions!");
+            }
             return;
         }
 
@@ -537,7 +700,7 @@ mod tests {
     #[tokio::test]
     async fn test_validate_empty_directory() {
         let temp_dir = TempDir::new().unwrap();
-        let validate_cmd = ValidateCommand::new(temp_dir.path().to_path_buf());
+        let validate_cmd = ValidateCommand::new(temp_dir.path().to_path_buf(), false);
 
         let result = validate_cmd.execute().await;
         assert!(result.is_ok());
@@ -558,7 +721,7 @@ mod tests {
         fs::create_dir_all(&tv_path).unwrap();
         fs::write(tv_path.join("Breaking Bad - s01e01 - Pilot.mkv"), "").unwrap();
 
-        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf(), false);
         let result = validate_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -581,7 +744,7 @@ mod tests {
         )
         .unwrap();
 
-        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf(), false);
         let result = validate_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -600,7 +763,7 @@ mod tests {
         fs::create_dir_all(&movie_path).unwrap();
         fs::write(movie_path.join("The Dark Knight (2008).mkv"), "").unwrap();
 
-        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf(), false);
         let result = validate_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -621,7 +784,7 @@ mod tests {
         fs::create_dir_all(media_root.join("Series/Show")).unwrap();
         fs::write(media_root.join("Series/Show/episode.mkv"), "").unwrap();
 
-        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf(), false);
         let result = validate_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -632,7 +795,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_nonexistent_directory() {
-        let validate_cmd = ValidateCommand::new(PathBuf::from("/nonexistent/path"));
+        let validate_cmd = ValidateCommand::new(PathBuf::from("/nonexistent/path"), false);
 
         let result = validate_cmd.execute().await;
         assert!(result.is_err());
@@ -665,7 +828,7 @@ mod tests {
         )
         .unwrap();
 
-        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf(), false);
         let result = validate_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -699,7 +862,7 @@ mod tests {
         )
         .unwrap();
 
-        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf(), false);
         let result = validate_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -725,7 +888,7 @@ mod tests {
         )
         .unwrap();
 
-        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf(), false);
         let result = validate_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -765,7 +928,7 @@ mod tests {
         )
         .unwrap();
 
-        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf(), false);
         let result = validate_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -804,7 +967,7 @@ mod tests {
         )
         .unwrap();
 
-        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf(), false);
         let result = validate_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -844,7 +1007,7 @@ mod tests {
         )
         .unwrap();
 
-        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf(), false);
         let result = validate_cmd.execute().await;
         assert!(result.is_ok());
         let report = result.unwrap();
@@ -852,5 +1015,87 @@ mod tests {
         // Should only scan 1 file (the movie), not the 200+ files in ignored directories
         assert_eq!(report.scanned_files, 1);
         assert_eq!(report.issues.len(), 0); // The movie is correctly named
+    }
+
+    #[tokio::test]
+    async fn test_validate_fix_mode() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        // Create incorrectly placed files
+        fs::create_dir_all(media_root.join("WrongDir")).unwrap();
+        fs::write(
+            media_root.join("WrongDir/Test Movie (2021).mkv"),
+            "test content",
+        )
+        .unwrap();
+        fs::write(
+            media_root.join("WrongDir/Test Series s01e01.mkv"),
+            "test content",
+        )
+        .unwrap();
+
+        // Test fix mode
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf(), true);
+        let result = validate_cmd.execute().await;
+
+        assert!(result.is_ok());
+        let report = result.unwrap();
+        assert_eq!(report.scanned_files, 2);
+        assert_eq!(report.issues.len(), 0); // All files should be fixed
+        assert_eq!(report.fixed_files.len(), 2); // Two files should be fixed
+
+        // Verify files were moved to correct locations
+        assert!(media_root
+            .join("Movies/Test Movie (2021)/Test Movie (2021).mkv")
+            .exists());
+        assert!(media_root
+            .join("Series/Test Series s01e01/Season 01/Test Series s01e01.mkv")
+            .exists());
+
+        // Original files should be gone
+        assert!(!media_root.join("WrongDir/Test Movie (2021).mkv").exists());
+        assert!(!media_root.join("WrongDir/Test Series s01e01.mkv").exists());
+    }
+
+    #[tokio::test]
+    async fn test_validate_fix_mode_existing_destination() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        // Create incorrectly placed file
+        fs::create_dir_all(media_root.join("WrongDir")).unwrap();
+        fs::write(
+            media_root.join("WrongDir/Test Movie (2021).mkv"),
+            "test content",
+        )
+        .unwrap();
+
+        // Create the destination that already exists
+        fs::create_dir_all(media_root.join("Movies/Test Movie (2021)")).unwrap();
+        fs::write(
+            media_root.join("Movies/Test Movie (2021)/Test Movie (2021).mkv"),
+            "existing",
+        )
+        .unwrap();
+
+        // Test fix mode with existing destination
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf(), true);
+        let result = validate_cmd.execute().await;
+
+        assert!(result.is_ok());
+        let report = result.unwrap();
+        assert_eq!(report.scanned_files, 2); // Should find both files
+        assert_eq!(report.fixed_files.len(), 0); // No files should be fixed due to conflict
+        assert_eq!(report.issues.len(), 1); // One file should remain as an issue
+
+        // Original file should still exist since fix failed
+        assert!(media_root.join("WrongDir/Test Movie (2021).mkv").exists());
+        // Existing file should remain unchanged
+        let existing_content = std::fs::read_to_string(
+            media_root.join("Movies/Test Movie (2021)/Test Movie (2021).mkv"),
+        )
+        .unwrap();
+        assert_eq!(existing_content, "existing");
     }
 }

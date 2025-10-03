@@ -475,6 +475,76 @@ fn test_add_command_individual_files() {
     );
 }
 
+/// Test validate command without --fix flag
+#[test]
+#[serial]
+fn test_validate_command() {
+    build_plexify();
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+
+    // Create incorrectly named files
+    fs::create_dir_all(temp_path.join("WrongDir")).unwrap();
+    fs::write(temp_path.join("WrongDir/test_movie.mkv"), "").unwrap();
+
+    // Test validate command (dry run)
+    let validate_output = Command::new("./target/debug/plexify")
+        .args(["validate", temp_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute validate command");
+
+    assert!(validate_output.status.success(), "Validate command failed");
+
+    let validate_stdout = String::from_utf8_lossy(&validate_output.stdout);
+    assert!(validate_stdout.contains("Issues found: 1"));
+    assert!(validate_stdout.contains("Suggested:"));
+
+    // File should still be in original location (not moved)
+    assert!(temp_path.join("WrongDir/test_movie.mkv").exists());
+}
+
+/// Test validate command with --fix flag
+#[test]
+#[serial]
+fn test_validate_command_with_fix() {
+    build_plexify();
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+
+    // Create incorrectly named files
+    fs::create_dir_all(temp_path.join("WrongDir")).unwrap();
+    fs::write(temp_path.join("WrongDir/Test Movie (2021).mkv"), "test").unwrap();
+    fs::write(temp_path.join("WrongDir/Test Series s01e01.mkv"), "test").unwrap();
+
+    // Test validate command with --fix
+    let validate_fix_output = Command::new("./target/debug/plexify")
+        .args(["validate", "--fix", temp_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute validate --fix command");
+
+    assert!(
+        validate_fix_output.status.success(),
+        "Validate --fix command failed"
+    );
+
+    let validate_stdout = String::from_utf8_lossy(&validate_fix_output.stdout);
+    assert!(validate_stdout.contains("Files fixed: 2"));
+    assert!(validate_stdout.contains("Issues remaining: 0"));
+    assert!(validate_stdout.contains("Fixed Files:"));
+
+    // Files should be moved to correct locations
+    assert!(temp_path
+        .join("Movies/Test Movie (2021)/Test Movie (2021).mkv")
+        .exists());
+    assert!(temp_path
+        .join("Series/Test Series s01e01/Season 01/Test Series s01e01.mkv")
+        .exists());
+
+    // Original files should be gone
+    assert!(!temp_path.join("WrongDir/Test Movie (2021).mkv").exists());
+    assert!(!temp_path.join("WrongDir/Test Series s01e01.mkv").exists());
+}
+
 /// Test hierarchical directory scanning functionality
 #[test]
 #[serial]
