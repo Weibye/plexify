@@ -629,15 +629,35 @@ impl ValidateCommand {
                 .map(|re| re.is_match(&filename_str))
                 .unwrap_or(false)
             {
-                // Extract show name (rough heuristic)
-                let show_name = filename_str
-                    .split(&['-', '.', '_'])
-                    .next()
-                    .unwrap_or("Unknown Show")
-                    .trim();
+                // Extract show name by removing everything from the episode pattern onwards
+                let show_name = if let Ok(re) = Regex::new(r"^(.+?)\s+[sS]\d{1,2}[eE]\d{1,4}.*$") {
+                    re.captures(&filename_str)
+                        .and_then(|caps| caps.get(1))
+                        .map(|m| m.as_str().trim().to_string())
+                        .unwrap_or_else(|| {
+                            // Fallback: split on common delimiters and take the first meaningful part
+                            filename_str
+                                .split(&['-', '.', '_'])
+                                .next()
+                                .unwrap_or("Unknown Show")
+                                .trim()
+                                .to_string()
+                        })
+                } else {
+                    // Fallback to simple extraction
+                    filename_str
+                        .split(&['-', '.', '_'])
+                        .next()
+                        .unwrap_or("Unknown Show")
+                        .trim()
+                        .to_string()
+                };
+                
+                let final_show_name = if show_name.is_empty() { "Unknown Show" } else { &show_name };
+                
                 return Some(PathBuf::from(format!(
                     "Series/{}/Season 01/{}",
-                    show_name, filename_str
+                    final_show_name, filename_str
                 )));
             }
 
@@ -697,6 +717,7 @@ impl ValidateCommand {
             };
 
             // Determine the correct format based on root type and patterns (using uppercase)
+            // Use the show name from the directory structure, not from the filename parsing
             let suggested_filename = if episode_title.is_empty() {
                 // No episode title available - use format without title part
                 if root_type == "Anime" {
@@ -1440,7 +1461,7 @@ mod tests {
             .join("Movies/Test Movie (2021)/Test Movie (2021).mkv")
             .exists());
         assert!(media_root
-            .join("Series/Test Series s01e01/Season 01/Test Series s01e01.mkv")
+            .join("Series/Test Series/Season 01/Test Series s01e01.mkv")
             .exists());
 
         // Original files should be gone
