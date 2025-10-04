@@ -712,30 +712,16 @@ impl ValidateCommand {
             // Determine the correct format based on root type and patterns (using uppercase)
             let suggested_filename = if episode_title.is_empty() {
                 // No episode title available - use format without title part
-                if root_type == "Anime" {
-                    format!(
-                        "{} - S{:02}E{}{}.{}",
-                        show_name, season_num, episode_formatted, metadata_suffix, extension
-                    )
-                } else {
-                    format!(
-                        "{} - S{:02}E{}{}.{}",
-                        show_name, season_num, episode_formatted, metadata_suffix, extension
-                    )
-                }
+                format!(
+                    "{} - S{:02}E{}{}.{}",
+                    show_name, season_num, episode_formatted, metadata_suffix, extension
+                )
             } else {
                 // Episode title available - use full format
-                if root_type == "Anime" {
-                    format!(
-                        "{} - S{:02}E{} - {}{}.{}",
-                        show_name, season_num, episode_formatted, episode_title, metadata_suffix, extension
-                    )
-                } else {
-                    format!(
-                        "{} - S{:02}E{} - {}{}.{}",
-                        show_name, season_num, episode_formatted, episode_title, metadata_suffix, extension
-                    )
-                }
+                format!(
+                    "{} - S{:02}E{} - {}{}.{}",
+                    show_name, season_num, episode_formatted, episode_title, metadata_suffix, extension
+                )
             };
 
             // Determine if this should go into Specials folder
@@ -746,10 +732,21 @@ impl ValidateCommand {
                 format!("Season {:02}", season_num)
             };
             
-            return Some(PathBuf::from(format!(
-                "{}/{}/{}/{}",
-                root_type, show_name, season_dir_clean, suggested_filename
-            )));
+            // Smart path construction: avoid nested root types for corrupted structures
+            // Check if this is a corrupted nested structure (detected by has_broken_show_directory)
+            if self.has_broken_show_directory(path_str) {
+                // This is a broken nested structure - don't prepend root_type to avoid double nesting
+                return Some(PathBuf::from(format!(
+                    "{}/{}/{}",
+                    show_name, season_dir_clean, suggested_filename
+                )));
+            } else {
+                // Normal structure that needs fixing - include the root_type
+                return Some(PathBuf::from(format!(
+                    "{}/{}/{}/{}",
+                    root_type, show_name, season_dir_clean, suggested_filename
+                )));
+            }
         }
 
         None
@@ -796,14 +793,22 @@ impl ValidateCommand {
             return false;
         }
 
-        let show_dir = path_components[1]; // Show directory name
-
-        // Check if show directory name ends with episode pattern (indicates broken structure)
-        if let Ok(re) = Regex::new(r"\s+S\d{2}E\d{2,3}$") {
-            re.is_match(show_dir)
+        // Check all directory components for episode patterns (not just the immediate show dir)
+        // This handles both direct broken structures and nested ones
+        let episode_pattern = if let Ok(re) = Regex::new(r"\s+S\d{2}E\d{2,3}$") {
+            re
         } else {
-            false
+            return false;
+        };
+
+        // Check each directory component (excluding the filename)
+        for i in 1..path_components.len()-1 {
+            if episode_pattern.is_match(path_components[i]) {
+                return true;
+            }
         }
+
+        false
     }
 
     /// Extract clean show name from directory name (remove metadata, year, etc.)
