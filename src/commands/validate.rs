@@ -135,6 +135,21 @@ impl Default for NamingPatterns {
                     content_type: ContentType::Series,
                     compiled_regex: None,
                 },
+                // Anime patterns without episode titles
+                NamingPattern {
+                    description: "Anime format without episode title".to_string(),
+                    pattern: r"^Anime/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/[^/]+ - S\d{2}E\d{2}(?:\s*\[[^\]]+\])*\.\w+$".to_string(),
+                    example: "Anime/Attack on Titan/Season 01/Attack on Titan - S01E01 [720p].mkv".to_string(),
+                    content_type: ContentType::Series,
+                    compiled_regex: None,
+                },
+                NamingPattern {
+                    description: "Extended Anime format without episode title (high episode numbers)".to_string(),
+                    pattern: r"^Anime/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/[^/]+ - S\d{2}E\d{3}(?:\s*\[[^\]]+\])*\.\w+$".to_string(),
+                    example: "Anime/One Piece/Season 11/One Piece - S11E397 [720p][ybis].mkv".to_string(),
+                    content_type: ContentType::Series,
+                    compiled_regex: None,
+                },
 
                 // Series patterns (shows)  
                 NamingPattern {
@@ -155,6 +170,44 @@ impl Default for NamingPatterns {
                     description: "Simple Series format".to_string(),
                     pattern: r"^Series/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/S\d{2}E\d{2} - [^/]+(?:\s*\[[^\]]+\])*\.\w+$".to_string(),
                     example: "Series/Breaking Bad/Season 01/S01E01 - Pilot [720p].mkv".to_string(),
+                    content_type: ContentType::Series,
+                    compiled_regex: None,
+                },
+                // Series patterns without episode titles
+                NamingPattern {
+                    description: "Series format without episode title".to_string(),
+                    pattern: r"^Series/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/[^/]+ - S\d{2}E\d{2}(?:\s*\[[^\]]+\])*\.\w+$".to_string(),
+                    example: "Series/The Expanse/Season 01/The Expanse - S01E01 [720p].mkv".to_string(),
+                    content_type: ContentType::Series,
+                    compiled_regex: None,
+                },
+                NamingPattern {
+                    description: "Alternative Series format without episode title".to_string(),
+                    pattern: r"^Series/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/[^/]+ S\d{2}E\d{2}(?:\s*\[[^\]]+\])*\.\w+$".to_string(),
+                    example: "Series/The Expanse/Season 01/The Expanse S01E01 [720p].mkv".to_string(),
+                    content_type: ContentType::Series,
+                    compiled_regex: None,
+                },
+                // Specials folder patterns
+                NamingPattern {
+                    description: "Series Specials format".to_string(),
+                    pattern: r"^Series/[^/]+(?:\s*\{tvdb-\d+\})?/Specials/[^/]+ - S\d{2}E\d{2} - [^/]+(?:\s*\[[^\]]+\])*\.\w+$".to_string(),
+                    example: "Series/The Great British Bake Off/Specials/The Great British Bake Off - S01E07 - Get Baking - Mary Berry [360p].mkv".to_string(),
+                    content_type: ContentType::Series,
+                    compiled_regex: None,
+                },
+                NamingPattern {
+                    description: "Series Specials format without episode title".to_string(),
+                    pattern: r"^Series/[^/]+(?:\s*\{tvdb-\d+\})?/Specials/[^/]+ - S\d{2}E\d{2}(?:\s*\[[^\]]+\])*\.\w+$".to_string(),
+                    example: "Series/The Great British Bake Off/Specials/The Great British Bake Off - S01E07 [360p].mkv".to_string(),
+                    content_type: ContentType::Series,
+                    compiled_regex: None,
+                },
+                // Anime Specials patterns
+                NamingPattern {
+                    description: "Anime Specials format".to_string(),
+                    pattern: r"^Anime/[^/]+(?:\s*\{tvdb-\d+\})?/Specials/[^/]+ - S\d{2}E\d{2} - [^/]+(?:\s*\[[^\]]+\])*\.\w+$".to_string(),
+                    example: "Anime/Attack on Titan/Specials/Attack on Titan - S01E01 - Behind the Scenes [720p].mkv".to_string(),
                     content_type: ContentType::Series,
                     compiled_regex: None,
                 },
@@ -626,12 +679,8 @@ impl ValidateCommand {
             let season_num = episode_info.season;
             let episode_num = episode_info.episode;
 
-            // Generate proper episode title if missing
-            let episode_title = if episode_info.title.is_empty() {
-                format!("Episode {}", episode_num)
-            } else {
-                episode_info.title
-            };
+            // Use existing episode title if available, otherwise leave empty (don't generate generic "Episode X")
+            let episode_title = episode_info.title;
 
             // Format episode number - use appropriate width for the episode count
             let episode_formatted = if episode_num >= 100 {
@@ -648,22 +697,42 @@ impl ValidateCommand {
             };
 
             // Determine the correct format based on root type and patterns (using uppercase)
-            let suggested_filename = if root_type == "Anime" {
-                // Use the first anime pattern: "Show - S01E01 - Episode Title [metadata]"
-                format!(
-                    "{} - S{:02}E{} - {}{}.{}",
-                    show_name, season_num, episode_formatted, episode_title, metadata_suffix, extension
-                )
+            let suggested_filename = if episode_title.is_empty() {
+                // No episode title available - use format without title part
+                if root_type == "Anime" {
+                    format!(
+                        "{} - S{:02}E{}{}.{}",
+                        show_name, season_num, episode_formatted, metadata_suffix, extension
+                    )
+                } else {
+                    format!(
+                        "{} - S{:02}E{}{}.{}",
+                        show_name, season_num, episode_formatted, metadata_suffix, extension
+                    )
+                }
             } else {
-                // Use the first series pattern: "Show - S01E01 - Episode Title [metadata]"
-                format!(
-                    "{} - S{:02}E{} - {}{}.{}",
-                    show_name, season_num, episode_formatted, episode_title, metadata_suffix, extension
-                )
+                // Episode title available - use full format
+                if root_type == "Anime" {
+                    format!(
+                        "{} - S{:02}E{} - {}{}.{}",
+                        show_name, season_num, episode_formatted, episode_title, metadata_suffix, extension
+                    )
+                } else {
+                    format!(
+                        "{} - S{:02}E{} - {}{}.{}",
+                        show_name, season_num, episode_formatted, episode_title, metadata_suffix, extension
+                    )
+                }
             };
 
-            // Reconstruct the full path
-            let season_dir_clean = format!("Season {:02}", season_num);
+            // Determine if this should go into Specials folder
+            let is_special_content = self.is_special_content(path_str, &episode_title);
+            let season_dir_clean = if is_special_content {
+                "Specials".to_string()
+            } else {
+                format!("Season {:02}", season_num)
+            };
+            
             return Some(PathBuf::from(format!(
                 "{}/{}/{}/{}",
                 root_type, show_name, season_dir_clean, suggested_filename
@@ -800,8 +869,8 @@ impl ValidateCommand {
                     }
                 }
             }
-            // Remove quality-like parentheses from the title
-            if let Ok(quality_re) = Regex::new(r"\((?:\d+p|x264|HDTV|BluRay|WebRip)\)") {
+            // Remove all quality-like parentheses from the title (more comprehensive)
+            if let Ok(quality_re) = Regex::new(r"\((?:\d+p\d*|x264|HDTV|BluRay|WebRip|1080p60)\)") {
                 clean = quality_re.replace_all(&clean, "").to_string();
             }
         }
@@ -840,7 +909,40 @@ impl ValidateCommand {
             clean
         };
 
-        (final_title, metadata)
+        // Deduplicate metadata while preserving order
+        let mut deduplicated_metadata = Vec::new();
+        for meta in metadata {
+            if !deduplicated_metadata.contains(&meta) {
+                deduplicated_metadata.push(meta);
+            }
+        }
+
+        (final_title, deduplicated_metadata)
+    }
+
+    /// Determine if content should go into Specials folder
+    fn is_special_content(&self, path_str: &str, episode_title: &str) -> bool {
+        let path_lower = path_str.to_lowercase();
+        let title_lower = episode_title.to_lowercase();
+        
+        // Check for "behind the scenes" in path or title
+        if path_lower.contains("behind the scenes") || title_lower.contains("behind the scenes") {
+            return true;
+        }
+        
+        // Check for other special content indicators
+        let special_keywords = [
+            "special", "bonus", "making of", "deleted scenes", "bloopers", 
+            "interviews", "commentary", "extras", "featurette"
+        ];
+        
+        for keyword in &special_keywords {
+            if path_lower.contains(keyword) || title_lower.contains(keyword) {
+                return true;
+            }
+        }
+        
+        false
     }
 
     /// Extract year from filename
@@ -1418,12 +1520,12 @@ mod tests {
         assert_eq!(report.issues.len(), 0); // All files should be fixed
         assert_eq!(report.fixed_files.len(), 2); // Two files should be fixed
 
-        // Verify files were moved to correct locations with proper names
+        // Verify files were moved to correct locations with proper names (without generic "Episode X")
         assert!(media_root
-            .join("Anime/One Piece/Season 11/One Piece - S11E397 - Episode 397 [720p][ybis].mkv")
+            .join("Anime/One Piece/Season 11/One Piece - S11E397 [720p][ybis].mkv")
             .exists());
         assert!(media_root
-            .join("Anime/One Piece/Season 11/One Piece - S11E398 - Episode 398 [720p][ybis].mkv")
+            .join("Anime/One Piece/Season 11/One Piece - S11E398 [720p][ybis].mkv")
             .exists());
 
         // Original files should be gone
