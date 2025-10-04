@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
-use crate::ignore::IgnoreFilter;
 use super::naming_rules::NamingRules;
+use crate::ignore::IgnoreFilter;
 
 /// Media file extensions that should be validated
 const MEDIA_EXTENSIONS: &[&str] = &["mkv", "mp4", "avi", "webm", "mov", "m4v"];
@@ -337,12 +337,15 @@ impl ValidateCommand {
         // If we're in fix mode, attempt to rename the files
         let mut fixed_count = 0;
         if self.fix_mode && !issues.is_empty() {
-            info!("🔧 Fix mode enabled, attempting to rename {} files...", issues.len());
-            
+            info!(
+                "🔧 Fix mode enabled, attempting to rename {} files...",
+                issues.len()
+            );
+
             for issue in &mut issues {
                 match self.rename_file(issue).await {
                     Ok(true) => fixed_count += 1,
-                    Ok(false) => {}, // No rename needed or failed silently
+                    Ok(false) => {} // No rename needed or failed silently
                     Err(e) => {
                         warn!("Failed to rename {:?}: {}", issue.file_path, e);
                     }
@@ -440,19 +443,51 @@ impl ValidateCommand {
 
     /// Suggest a corrected path for a file using naming rules
     fn suggest_path(&self, file_path: &Path, issue_type: &IssueType) -> Option<PathBuf> {
+        debug!(
+            "Suggesting path for: {:?}, issue type: {:?}",
+            file_path, issue_type
+        );
+
         // First try to apply naming rules for Series files
         if let Ok(naming_rules) = NamingRules::new() {
-            if let Some(rule_match) = naming_rules.apply_rules(file_path) {
-                // Apply the rule transformation
+            // Convert absolute path to relative path for our naming rules
+            let relative_path = if let Ok(rel_path) = file_path.strip_prefix(&self.media_root) {
+                rel_path
+            } else {
+                debug!("Could not make path relative to media root");
+                file_path
+            };
+
+            let path_str = relative_path.to_string_lossy().replace("\\", "/");
+            debug!("Trying naming rules for relative path: {}", path_str);
+
+            if let Some(rule_match) = naming_rules.apply_rules(relative_path) {
+                debug!(
+                    "Found rule match with {} captures",
+                    rule_match.captures.len()
+                );
+
+                // Apply the rule transformation - use the first matching rule
                 for rule in naming_rules.get_rules() {
-                    if rule.pattern.is_match(&file_path.to_string_lossy().replace("\\", "/")) {
-                        if let Ok(suggested_path) = (rule.transform)(&rule_match) {
-                            return Some(suggested_path);
+                    if rule.pattern.is_match(&path_str) {
+                        debug!("Applying rule: {}", rule.name);
+                        match (rule.transform)(&rule_match) {
+                            Ok(suggested_path) => {
+                                debug!("Rule transform successful: {:?}", suggested_path);
+                                return Some(suggested_path);
+                            }
+                            Err(e) => {
+                                debug!("Rule transform failed: {}", e);
+                            }
                         }
                         break;
                     }
                 }
+            } else {
+                debug!("No naming rules matched for path: {}", path_str);
             }
+        } else {
+            debug!("Failed to create naming rules");
         }
 
         // Fallback to simple suggestion for directory structure issues
@@ -494,7 +529,7 @@ impl ValidateCommand {
 
         if let Some(suggested_path) = &issue.suggested_path {
             let full_suggested_path = self.media_root.join(suggested_path);
-            
+
             // Ensure the target directory exists
             if let Some(parent) = full_suggested_path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
@@ -511,11 +546,10 @@ impl ValidateCommand {
 
             // Rename the file
             tokio::fs::rename(&issue.file_path, &full_suggested_path).await?;
-            
+
             info!(
                 "📁 Renamed: {:?} -> {:?}",
-                issue.file_path,
-                full_suggested_path
+                issue.file_path, full_suggested_path
             );
 
             issue.fixed_path = Some(full_suggested_path);
@@ -570,7 +604,7 @@ impl ValidateCommand {
             } else {
                 println!("\n❌ {}", issue.file_path.display());
                 println!("   Issue: {}", issue.description);
-                
+
                 if let Some(suggested) = &issue.suggested_path {
                     println!("   Suggested: {}", suggested.display());
                 }
@@ -910,14 +944,15 @@ mod tests {
         fs::create_dir_all(&series_path).unwrap();
         fs::write(
             series_path.join("Scrubs.S09E02.RETAIL.DVDRip.XviD-REWARD.avi"),
-            "test content"
-        ).unwrap();
+            "test content",
+        )
+        .unwrap();
 
         // First test without fix mode (dry run)
         let validate_cmd = ValidateCommand::new(media_root.to_path_buf(), false);
         let result = validate_cmd.execute().await;
         assert!(result.is_ok());
-        
+
         let report = result.unwrap();
         assert_eq!(report.scanned_files, 1);
         // The file should have an issue (wrong season format: 9 instead of 09)
@@ -934,14 +969,14 @@ mod tests {
         let validate_cmd_fix = ValidateCommand::new(media_root.to_path_buf(), true);
         let result_fix = validate_cmd_fix.execute().await;
         assert!(result_fix.is_ok());
-        
+
         let report_fix = result_fix.unwrap();
         assert_eq!(report_fix.scanned_files, 1);
-        
-        // After fix mode, check that file was actually renamed  
+
+        // After fix mode, check that file was actually renamed
         println!("Fixed files: {}", report_fix.fixed_files);
         println!("Issues after fix: {}", report_fix.issues.len());
-        
+
         // Check that we got some fixes
         if report_fix.fixed_files > 0 {
             // File should be fixed, check if it exists in new location

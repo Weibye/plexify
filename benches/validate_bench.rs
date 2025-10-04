@@ -162,7 +162,7 @@ fn bench_validate_small(c: &mut Criterion) {
     c.bench_function("validate_50_files", |b| {
         b.iter(|| {
             let temp_dir = create_test_media_library(50);
-            let validate_cmd = ValidateCommand::new(temp_dir.path().to_path_buf());
+            let validate_cmd = ValidateCommand::new(temp_dir.path().to_path_buf(), false);
             let report = rt.block_on(validate_cmd.execute()).unwrap();
             black_box(report);
         });
@@ -175,7 +175,7 @@ fn bench_validate_medium(c: &mut Criterion) {
     c.bench_function("validate_200_files", |b| {
         b.iter(|| {
             let temp_dir = create_test_media_library(200);
-            let validate_cmd = ValidateCommand::new(temp_dir.path().to_path_buf());
+            let validate_cmd = ValidateCommand::new(temp_dir.path().to_path_buf(), false);
             let report = rt.block_on(validate_cmd.execute()).unwrap();
             black_box(report);
         });
@@ -188,7 +188,7 @@ fn bench_validate_large(c: &mut Criterion) {
     c.bench_function("validate_500_files", |b| {
         b.iter(|| {
             let temp_dir = create_test_media_library(500);
-            let validate_cmd = ValidateCommand::new(temp_dir.path().to_path_buf());
+            let validate_cmd = ValidateCommand::new(temp_dir.path().to_path_buf(), false);
             let report = rt.block_on(validate_cmd.execute()).unwrap();
             black_box(report);
         });

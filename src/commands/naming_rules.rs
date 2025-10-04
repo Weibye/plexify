@@ -25,29 +25,38 @@ impl NamingRuleMatch {
     /// Extract season number from captures, ensuring it has at least 2 digits
     pub fn format_season(&self, season_index: usize) -> Result<String> {
         if season_index >= self.captures.len() {
-            return Err(anyhow::anyhow!("Season index {} out of bounds", season_index));
+            return Err(anyhow::anyhow!(
+                "Season index {} out of bounds",
+                season_index
+            ));
         }
-        
+
         let season_str = &self.captures[season_index];
-        let season_num: u32 = season_str.parse()
+        let season_num: u32 = season_str
+            .parse()
             .map_err(|_| anyhow::anyhow!("Invalid season number: {}", season_str))?;
-        
+
         Ok(format!("{:02}", season_num))
     }
 
     /// Extract episode identifier from captures, ensuring SXXEXX format is uppercase
     pub fn format_episode(&self, episode_index: usize) -> Result<String> {
         if episode_index >= self.captures.len() {
-            return Err(anyhow::anyhow!("Episode index {} out of bounds", episode_index));
+            return Err(anyhow::anyhow!(
+                "Episode index {} out of bounds",
+                episode_index
+            ));
         }
-        
+
         let episode_str = &self.captures[episode_index].to_uppercase();
-        
+
         // Ensure SXXEXX pattern
         if let Some(caps) = Regex::new(r"S(\d+)E(\d+)")?.captures(episode_str) {
-            let season: u32 = caps[1].parse()
+            let season: u32 = caps[1]
+                .parse()
                 .map_err(|_| anyhow::anyhow!("Invalid season in episode: {}", episode_str))?;
-            let episode: u32 = caps[2].parse()
+            let episode: u32 = caps[2]
+                .parse()
                 .map_err(|_| anyhow::anyhow!("Invalid episode in episode: {}", episode_str))?;
             Ok(format!("S{:02}E{:02}", season, episode))
         } else {
@@ -60,24 +69,26 @@ impl NamingRuleMatch {
         if title_index >= self.captures.len() {
             return Err(anyhow::anyhow!("Title index {} out of bounds", title_index));
         }
-        
+
         let mut title = self.captures[title_index].clone();
-        
+
         // Remove common metadata patterns and clean up
         title = title
-            .replace(".", " ")  // Replace dots with spaces
-            .replace("_", " ")  // Replace underscores with spaces
+            .replace(".", " ") // Replace dots with spaces
+            .replace("_", " ") // Replace underscores with spaces
             .trim()
             .to_string();
-            
+
         // Remove quality/release metadata (like "RETAIL.DVDRip.XviD-REWARD")
-        let clean_regex = Regex::new(r"(?i)\b(retail|dvdrip|webrip|bluray|hdtv|xvid|x264|x265|aac|ac3|dts|1080p|720p|480p|mkv|avi|mp4|webm|[\w\-]+rip|[\w\-]+\d+p?)\b")?;
+        let clean_regex = Regex::new(
+            r"(?i)\b(retail|dvdrip|webrip|bluray|hdtv|xvid|x264|x265|aac|ac3|dts|1080p|720p|480p|mkv|avi|mp4|webm|[\w\-]+rip|[\w\-]+\d+p?)\b",
+        )?;
         title = clean_regex.replace_all(&title, "").to_string();
-        
+
         // Clean up multiple spaces and trim
         let space_regex = Regex::new(r"\s+")?;
         title = space_regex.replace_all(&title, " ").trim().to_string();
-        
+
         // Capitalize words properly (basic title case)
         title = title
             .split_whitespace()
@@ -85,12 +96,14 @@ impl NamingRuleMatch {
                 let mut chars = word.chars();
                 match chars.next() {
                     None => String::new(),
-                    Some(first) => first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
+                    Some(first) => {
+                        first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+                    }
                 }
             })
             .collect::<Vec<_>>()
             .join(" ");
-            
+
         Ok(title)
     }
 
@@ -99,11 +112,11 @@ impl NamingRuleMatch {
         // Extract resolution and quality info
         let quality_regex = Regex::new(r"(?i)(\d+p\d*|1080p|720p|480p|4k|uhd|hd|sd)").unwrap();
         let mut metadata_parts = Vec::new();
-        
+
         if let Some(caps) = quality_regex.find(full_filename) {
             metadata_parts.push(caps.as_str().to_lowercase());
         }
-        
+
         // If we found metadata, format it properly
         if !metadata_parts.is_empty() {
             format!(" [{}]", metadata_parts.join(" "))
@@ -121,7 +134,7 @@ pub struct NamingRules {
 impl NamingRules {
     pub fn new() -> Result<Self> {
         let mut rules = Vec::new();
-        
+
         // Rule 1: Season directory missing leading zero (Season 6 -> Season 06)
         // Example: Series/Elementary/Season 6/Elementary - S06E08 Sand Trap.mkv
         rules.push(NamingRule {
@@ -133,9 +146,9 @@ impl NamingRules {
                 let season_num = &m.captures[1];
                 let filename = &m.captures[2];
                 let ext = &m.captures[3];
-                
+
                 let season_formatted = format!("{:02}", season_num.parse::<u32>().unwrap_or(0));
-                
+
                 Ok(PathBuf::from(format!(
                     "Series/{}/Season {}/{}.{}",
                     series_name, season_formatted, filename, ext
@@ -144,11 +157,13 @@ impl NamingRules {
         });
 
         // Rule 2: Missing dash between SXXEXX and episode title
-        // Example: Elementary - S06E08 Sand Trap.mkv -> Elementary - S06E08 - Sand Trap.mkv  
+        // Example: Elementary - S06E08 Sand Trap.mkv -> Elementary - S06E08 - Sand Trap.mkv
         rules.push(NamingRule {
             name: "missing_dash_after_episode".to_string(),
             description: "Add missing dash between SXXEXX and episode title".to_string(),
-            pattern: Regex::new(r"^Series/([^/]+)/Season (\d{2})/([^/]+) - (S\d{2}E\d{2}) ([^/]+)\.(\w+)$")?,
+            pattern: Regex::new(
+                r"^Series/([^/]+)/Season (\d{2})/([^/]+) - (S\d{2}E\d{2}) ([^/]+)\.(\w+)$",
+            )?,
             transform: |m| {
                 let series_name = &m.captures[0];
                 let season = &m.captures[1];
@@ -156,7 +171,7 @@ impl NamingRules {
                 let episode = &m.captures[3];
                 let episode_title = &m.captures[4];
                 let ext = &m.captures[5];
-                
+
                 Ok(PathBuf::from(format!(
                     "Series/{}/Season {}/{} - {} - {}.{}",
                     series_name, season, show_name, episode, episode_title, ext
@@ -169,17 +184,19 @@ impl NamingRules {
         rules.push(NamingRule {
             name: "dotted_metadata_cleanup".to_string(),
             description: "Clean up dotted filenames with metadata".to_string(),
-            pattern: Regex::new(r"^Series/([^/]+)/Season (\d{1,2})/(.*)\.(S\d{2}E\d{2})\.(.+)\.(\w+)$")?,
+            pattern: Regex::new(
+                r"^Series/([^/]+)/Season (\d{1,2})/(.*)\.(S\d{2}E\d{2})\.(.+)\.(\w+)$",
+            )?,
             transform: |m| {
                 let series_name = &m.captures[0];
-                let season_num = &m.captures[1];  
+                let season_num = &m.captures[1];
                 let show_name = &m.captures[2];
                 let episode = &m.captures[3];
                 // Skip metadata at index 4
                 let ext = &m.captures[5];
-                
+
                 let season_formatted = format!("{:02}", season_num.parse::<u32>().unwrap_or(0));
-                
+
                 // Extract just the series name and episode, ignore metadata
                 Ok(PathBuf::from(format!(
                     "Series/{}/Season {}/{} - {}.{}",
@@ -200,7 +217,7 @@ impl NamingRules {
                 let episode = &m.captures[2];
                 let quality = &m.captures[3];
                 let ext = &m.captures[4];
-                
+
                 Ok(PathBuf::from(format!(
                     "Series/{}/{} - {} [{}].{}",
                     series_path, filename_base, episode, quality, ext
@@ -221,26 +238,26 @@ impl NamingRules {
                 let episode = &m.captures[3];
                 let raw_title = &m.captures[4];
                 let ext = &m.captures[5];
-                
+
                 let season_formatted = format!("{:02}", season_num.parse::<u32>().unwrap_or(0));
-                
+
                 // Clean the episode title by replacing dots with spaces and cleaning metadata
                 let mut episode_title = raw_title
                     .replace(".", " ")
                     .replace("_", " ");
-                    
+
                 // Remove Roman numerals at the start (like XXXVI)
                 let roman_regex = Regex::new(r"^[IVXLCDM]+\s+")?;
                 episode_title = roman_regex.replace(&episode_title, "").to_string();
-                
-                // Remove common quality/release metadata 
+
+                // Remove common quality/release metadata
                 let metadata_regex = Regex::new(r"(?i)\b(retail|dvdrip|webrip|bluray|hdtv|xvid|x264|x265|aac|ac3|dts|1080p|720p|480p|[\w\-]+rip)\b")?;
                 episode_title = metadata_regex.replace_all(&episode_title, "").to_string();
-                
+
                 // Clean up multiple spaces and trim
                 let space_regex = Regex::new(r"\s+")?;
                 episode_title = space_regex.replace_all(&episode_title, " ").trim().to_string();
-                
+
                 // Title case
                 episode_title = episode_title
                     .split_whitespace()
@@ -253,7 +270,7 @@ impl NamingRules {
                     })
                     .collect::<Vec<_>>()
                     .join(" ");
-                
+
                 Ok(PathBuf::from(format!(
                     "Series/{}/Season {}/{} - {} - {}.{}",
                     series_name, season_formatted, show_name, episode, episode_title, ext
@@ -267,20 +284,21 @@ impl NamingRules {
     /// Try to apply naming rules to a file path
     pub fn apply_rules(&self, file_path: &Path) -> Option<NamingRuleMatch> {
         let path_str = file_path.to_string_lossy().replace("\\", "/");
-        
+
         for rule in &self.rules {
             if let Some(caps) = rule.pattern.captures(&path_str) {
-                let captures: Vec<String> = caps.iter()
+                let captures: Vec<String> = caps
+                    .iter()
                     .skip(1) // Skip the full match
                     .map(|m| m.map_or(String::new(), |m| m.as_str().to_string()))
                     .collect();
-                
+
                 let extension = file_path
                     .extension()
                     .and_then(|ext| ext.to_str())
                     .map(|ext| format!(".{}", ext))
                     .unwrap_or_default();
-                
+
                 return Some(NamingRuleMatch {
                     original_path: file_path.to_path_buf(),
                     captures,
@@ -288,7 +306,7 @@ impl NamingRules {
                 });
             }
         }
-        
+
         None
     }
 
@@ -302,22 +320,24 @@ impl NamingRuleMatch {
     /// Helper method for cleaning episode titles from raw strings
     fn clean_episode_title_from_str(&self, title: &str) -> Result<String> {
         let mut cleaned = title.to_string();
-        
+
         // Remove common metadata patterns and clean up
         cleaned = cleaned
-            .replace(".", " ")  // Replace dots with spaces
-            .replace("_", " ")  // Replace underscores with spaces
+            .replace(".", " ") // Replace dots with spaces
+            .replace("_", " ") // Replace underscores with spaces
             .trim()
             .to_string();
-            
+
         // Remove quality/release metadata (like "RETAIL.DVDRip.XviD-REWARD")
-        let clean_regex = Regex::new(r"(?i)\b(retail|dvdrip|webrip|bluray|hdtv|xvid|x264|x265|aac|ac3|dts|1080p|720p|480p|mkv|avi|mp4|webm|[\w\-]+rip|[\w\-]+\d+p?)\b")?;
+        let clean_regex = Regex::new(
+            r"(?i)\b(retail|dvdrip|webrip|bluray|hdtv|xvid|x264|x265|aac|ac3|dts|1080p|720p|480p|mkv|avi|mp4|webm|[\w\-]+rip|[\w\-]+\d+p?)\b",
+        )?;
         cleaned = clean_regex.replace_all(&cleaned, "").to_string();
-        
+
         // Clean up multiple spaces and trim
         let space_regex = Regex::new(r"\s+")?;
         cleaned = space_regex.replace_all(&cleaned, " ").trim().to_string();
-        
+
         // Capitalize words properly (basic title case)
         cleaned = cleaned
             .split_whitespace()
@@ -325,12 +345,14 @@ impl NamingRuleMatch {
                 let mut chars = word.chars();
                 match chars.next() {
                     None => String::new(),
-                    Some(first) => first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
+                    Some(first) => {
+                        first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+                    }
                 }
             })
             .collect::<Vec<_>>()
             .join(" ");
-            
+
         Ok(cleaned)
     }
 }
@@ -345,14 +367,14 @@ mod tests {
         assert!(!rules.get_rules().is_empty());
     }
 
-    #[test] 
+    #[test]
     fn test_format_season() {
         let rule_match = NamingRuleMatch {
             original_path: PathBuf::from("test"),
             captures: vec!["6".to_string()],
             extension: ".mkv".to_string(),
         };
-        
+
         assert_eq!(rule_match.format_season(0).unwrap(), "06");
     }
 
@@ -363,7 +385,7 @@ mod tests {
             captures: vec!["s06e08".to_string()],
             extension: ".mkv".to_string(),
         };
-        
+
         assert_eq!(rule_match.format_episode(0).unwrap(), "S06E08");
     }
 
@@ -374,7 +396,7 @@ mod tests {
             captures: vec!["sand.trap.retail.dvdrip".to_string()],
             extension: ".mkv".to_string(),
         };
-        
+
         let cleaned = rule_match.clean_episode_title(0).unwrap();
         assert_eq!(cleaned, "Sand Trap");
     }
@@ -386,10 +408,10 @@ mod tests {
             captures: vec![],
             extension: ".mkv".to_string(),
         };
-        
+
         let quality = rule_match.extract_quality_metadata("episode.1080p.h264");
         assert_eq!(quality, " [1080p]");
-        
+
         let no_quality = rule_match.extract_quality_metadata("episode.normal.title");
         assert_eq!(no_quality, "");
     }
@@ -398,7 +420,7 @@ mod tests {
     fn test_naming_rule_season_zero_padding() {
         let rules = NamingRules::new().unwrap();
         let test_path = Path::new("Series/Elementary/Season 6/Elementary - S06E08 Sand Trap.mkv");
-        
+
         if let Some(rule_match) = rules.apply_rules(test_path) {
             // Try to apply the first rule (season missing zero)
             for rule in rules.get_rules() {
@@ -416,11 +438,11 @@ mod tests {
         panic!("Rule should have matched and transformed the path");
     }
 
-    #[test] 
+    #[test]
     fn test_naming_rule_missing_dash() {
         let rules = NamingRules::new().unwrap();
         let test_path = Path::new("Series/Elementary/Season 06/Elementary - S06E08 Sand Trap.mkv");
-        
+
         if let Some(rule_match) = rules.apply_rules(test_path) {
             // Try to apply the missing dash rule
             for rule in rules.get_rules() {
@@ -441,8 +463,9 @@ mod tests {
     #[test]
     fn test_naming_rule_dotted_metadata_cleanup() {
         let rules = NamingRules::new().unwrap();
-        let test_path = Path::new("Series/Scrubs/Season 9/Scrubs.S09E02.RETAIL.DVDRip.XviD-REWARD.avi");
-        
+        let test_path =
+            Path::new("Series/Scrubs/Season 9/Scrubs.S09E02.RETAIL.DVDRip.XviD-REWARD.avi");
+
         // The apply_rules method should return the first matching rule
         if let Some(rule_match) = rules.apply_rules(test_path) {
             // Apply the first rule that matches (which should be season_missing_zero)
@@ -463,7 +486,7 @@ mod tests {
     fn test_naming_rule_parentheses_to_brackets() {
         let rules = NamingRules::new().unwrap();
         let test_path = Path::new("Series/Super Best Friends Play - FFX/Super Best Friends Play - Final Fantasy X - S01E13 (1080p60).webm");
-        
+
         if let Some(rule_match) = rules.apply_rules(test_path) {
             // Try to apply the parentheses to brackets rule
             for rule in rules.get_rules() {
@@ -485,7 +508,7 @@ mod tests {
     fn test_naming_rule_complex_dotted_title() {
         let rules = NamingRules::new().unwrap();
         let test_path = Path::new("Series/Samurai Jack (2001)/Season 3/Samurai.Jack.S03E10.XXXVI.Jack.The.Monks.and.the.Ancient.Master's.Son.avi");
-        
+
         // This should match the first rule (season_missing_zero) because the season is "3" not "03"
         if let Some(rule_match) = rules.apply_rules(test_path) {
             let first_rule = &rules.get_rules()[0]; // season_missing_zero
