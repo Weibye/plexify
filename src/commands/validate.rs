@@ -448,7 +448,7 @@ impl ValidateCommand {
             file_path, issue_type
         );
 
-        // First try to apply naming rules for Series files
+        // First try to apply atomic naming rules for Series/Anime files
         if let Ok(naming_rules) = NamingRules::new() {
             // Convert absolute path to relative path for our naming rules
             let relative_path = if let Ok(rel_path) = file_path.strip_prefix(&self.media_root) {
@@ -459,32 +459,19 @@ impl ValidateCommand {
             };
 
             let path_str = relative_path.to_string_lossy().replace("\\", "/");
-            debug!("Trying naming rules for relative path: {}", path_str);
+            debug!("Trying atomic naming rules for relative path: {}", path_str);
 
-            if let Some(rule_match) = naming_rules.apply_rules(relative_path) {
+            if let Some(suggested_path) = naming_rules.apply_rules(relative_path) {
                 debug!(
-                    "Found rule match with {} captures",
-                    rule_match.captures.len()
+                    "Atomic rules transformation successful: {:?}",
+                    suggested_path
                 );
-
-                // Apply the rule transformation - use the first matching rule
-                for rule in naming_rules.get_rules() {
-                    if rule.pattern.is_match(&path_str) {
-                        debug!("Applying rule: {}", rule.name);
-                        match (rule.transform)(&rule_match) {
-                            Ok(suggested_path) => {
-                                debug!("Rule transform successful: {:?}", suggested_path);
-                                return Some(suggested_path);
-                            }
-                            Err(e) => {
-                                debug!("Rule transform failed: {}", e);
-                            }
-                        }
-                        break;
-                    }
-                }
+                return Some(suggested_path);
             } else {
-                debug!("No naming rules matched for path: {}", path_str);
+                debug!(
+                    "No atomic naming rules could be applied for path: {}",
+                    path_str
+                );
             }
         } else {
             debug!("Failed to create naming rules");
