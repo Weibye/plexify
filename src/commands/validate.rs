@@ -11,6 +11,7 @@ use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
 use crate::ignore::IgnoreFilter;
+use super::naming_rules::NamingRules;
 
 /// Media file extensions that should be validated
 const MEDIA_EXTENSIONS: &[&str] = &["mkv", "mp4", "avi", "webm", "mov", "m4v"];
@@ -54,6 +55,7 @@ pub struct ValidationIssue {
     pub issue_type: IssueType,
     pub description: String,
     pub suggested_path: Option<PathBuf>,
+    pub fixed_path: Option<PathBuf>,
 }
 
 /// Types of naming issues
@@ -74,6 +76,7 @@ pub struct ValidationReport {
     pub patterns_used: NamingPatterns,
     pub scan_path: PathBuf,
     pub validation_time: Duration,
+    pub fixed_files: usize,
 }
 
 /// Command to validate Plex naming scheme conformity
@@ -81,6 +84,7 @@ pub struct ValidateCommand {
     media_root: PathBuf,
     patterns: NamingPatterns,
     compiled_patterns: Vec<CompiledPattern>,
+    fix_mode: bool,
 }
 
 /// Internal structure for compiled regex patterns
@@ -152,7 +156,7 @@ impl Default for NamingPatterns {
 
 impl ValidateCommand {
     /// Create a new validate command
-    pub fn new(media_root: PathBuf) -> Self {
+    pub fn new(media_root: PathBuf, fix_mode: bool) -> Self {
         let patterns = NamingPatterns::default();
         let compiled_patterns = Self::compile_patterns(&patterns);
 
@@ -160,6 +164,7 @@ impl ValidateCommand {
             media_root,
             patterns,
             compiled_patterns,
+            fix_mode,
         }
     }
 
@@ -310,7 +315,7 @@ impl ValidateCommand {
         let pb = Arc::new(validate_pb);
 
         // Process files in parallel using rayon
-        let issues: Vec<ValidationIssue> = media_files
+        let mut issues: Vec<ValidationIssue> = media_files
             .par_iter()
             .filter_map(|path| {
                 let relative_path = match path.strip_prefix(media_root.as_ref()) {
@@ -329,12 +334,29 @@ impl ValidateCommand {
 
         let validation_time = start_time.elapsed();
 
+        // If we're in fix mode, attempt to rename the files
+        let mut fixed_count = 0;
+        if self.fix_mode && !issues.is_empty() {
+            info!("🔧 Fix mode enabled, attempting to rename {} files...", issues.len());
+            
+            for issue in &mut issues {
+                match self.rename_file(issue).await {
+                    Ok(true) => fixed_count += 1,
+                    Ok(false) => {}, // No rename needed or failed silently
+                    Err(e) => {
+                        warn!("Failed to rename {:?}: {}", issue.file_path, e);
+                    }
+                }
+            }
+        }
+
         let report = ValidationReport {
             scanned_files: media_files.len(),
             issues,
             patterns_used: self.patterns.clone(),
             scan_path: self.media_root.clone(),
             validation_time,
+            fixed_files: fixed_count,
         };
 
         info!(
@@ -398,7 +420,8 @@ impl ValidateCommand {
             file_path: full_path.to_path_buf(),
             issue_type: issue_type.clone(),
             description,
-            suggested_path: self.suggest_path(&path_str, &issue_type),
+            suggested_path: self.suggest_path(full_path, &issue_type),
+            fixed_path: None,
         })
     }
 
@@ -415,13 +438,27 @@ impl ValidateCommand {
         IssueType::DirectoryStructure
     }
 
-    /// Suggest a corrected path for a file
-    fn suggest_path(&self, path_str: &str, issue_type: &IssueType) -> Option<PathBuf> {
-        // This is a simplified suggestion system
-        // In a full implementation, this would be more sophisticated
+    /// Suggest a corrected path for a file using naming rules
+    fn suggest_path(&self, file_path: &Path, issue_type: &IssueType) -> Option<PathBuf> {
+        // First try to apply naming rules for Series files
+        if let Ok(naming_rules) = NamingRules::new() {
+            if let Some(rule_match) = naming_rules.apply_rules(file_path) {
+                // Apply the rule transformation
+                for rule in naming_rules.get_rules() {
+                    if rule.pattern.is_match(&file_path.to_string_lossy().replace("\\", "/")) {
+                        if let Ok(suggested_path) = (rule.transform)(&rule_match) {
+                            return Some(suggested_path);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Fallback to simple suggestion for directory structure issues
         if let IssueType::DirectoryStructure = issue_type {
             // If it's not in Movies/ or TV Shows/, suggest moving to Movies/
-            if let Some(filename) = Path::new(path_str).file_name() {
+            if let Some(filename) = file_path.file_name() {
                 let filename_str = filename.to_string_lossy();
                 // Try to extract year from filename
                 if let Some(_year_match) = Regex::new(r"\((\d{4})\)")
@@ -432,7 +469,7 @@ impl ValidateCommand {
                     let base_name = filename_string.replace(
                         &format!(
                             ".{}",
-                            Path::new(&filename_string)
+                            file_path
                                 .extension()
                                 .and_then(|ext| ext.to_str())
                                 .unwrap_or("")
@@ -449,6 +486,45 @@ impl ValidateCommand {
         None
     }
 
+    /// Rename a file if fix mode is enabled
+    async fn rename_file(&self, issue: &mut ValidationIssue) -> Result<bool> {
+        if !self.fix_mode {
+            return Ok(false);
+        }
+
+        if let Some(suggested_path) = &issue.suggested_path {
+            let full_suggested_path = self.media_root.join(suggested_path);
+            
+            // Ensure the target directory exists
+            if let Some(parent) = full_suggested_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+
+            // Check if target file already exists
+            if full_suggested_path.exists() {
+                warn!(
+                    "Target file already exists, skipping rename: {:?}",
+                    full_suggested_path
+                );
+                return Ok(false);
+            }
+
+            // Rename the file
+            tokio::fs::rename(&issue.file_path, &full_suggested_path).await?;
+            
+            info!(
+                "📁 Renamed: {:?} -> {:?}",
+                issue.file_path,
+                full_suggested_path
+            );
+
+            issue.fixed_path = Some(full_suggested_path);
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
     /// Print the validation report to stdout
     pub fn print_report(&self, report: &ValidationReport) {
         println!("\n📊 Plex Naming Scheme Validation Report");
@@ -456,6 +532,9 @@ impl ValidateCommand {
         println!("📂 Scanned directory: {}", report.scan_path.display());
         println!("📁 Files scanned: {}", report.scanned_files);
         println!("⚠️  Issues found: {}", report.issues.len());
+        if report.fixed_files > 0 {
+            println!("🔧 Files fixed: {}", report.fixed_files);
+        }
         println!(
             "⏱️  Validation time: {:.2}s",
             report.validation_time.as_secs_f64()
@@ -482,11 +561,19 @@ impl ValidateCommand {
 
             *issue_counts.entry(issue_type_str.to_string()).or_insert(0) += 1;
 
-            println!("\n❌ {}", issue.file_path.display());
-            println!("   Issue: {}", issue.description);
-
-            if let Some(suggested) = &issue.suggested_path {
-                println!("   Suggested: {}", suggested.display());
+            if issue.fixed_path.is_some() {
+                println!("\n✅ {}", issue.file_path.display());
+                println!("   Issue: {}", issue.description);
+                if let Some(fixed) = &issue.fixed_path {
+                    println!("   Fixed: {}", fixed.display());
+                }
+            } else {
+                println!("\n❌ {}", issue.file_path.display());
+                println!("   Issue: {}", issue.description);
+                
+                if let Some(suggested) = &issue.suggested_path {
+                    println!("   Suggested: {}", suggested.display());
+                }
             }
         }
 
@@ -537,7 +624,7 @@ mod tests {
     #[tokio::test]
     async fn test_validate_empty_directory() {
         let temp_dir = TempDir::new().unwrap();
-        let validate_cmd = ValidateCommand::new(temp_dir.path().to_path_buf());
+        let validate_cmd = ValidateCommand::new(temp_dir.path().to_path_buf(), false);
 
         let result = validate_cmd.execute().await;
         assert!(result.is_ok());
@@ -558,7 +645,7 @@ mod tests {
         fs::create_dir_all(&tv_path).unwrap();
         fs::write(tv_path.join("Breaking Bad - s01e01 - Pilot.mkv"), "").unwrap();
 
-        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf(), false);
         let result = validate_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -581,7 +668,7 @@ mod tests {
         )
         .unwrap();
 
-        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf(), false);
         let result = validate_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -600,7 +687,7 @@ mod tests {
         fs::create_dir_all(&movie_path).unwrap();
         fs::write(movie_path.join("The Dark Knight (2008).mkv"), "").unwrap();
 
-        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf(), false);
         let result = validate_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -621,7 +708,7 @@ mod tests {
         fs::create_dir_all(media_root.join("Series/Show")).unwrap();
         fs::write(media_root.join("Series/Show/episode.mkv"), "").unwrap();
 
-        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf(), false);
         let result = validate_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -632,7 +719,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_nonexistent_directory() {
-        let validate_cmd = ValidateCommand::new(PathBuf::from("/nonexistent/path"));
+        let validate_cmd = ValidateCommand::new(PathBuf::from("/nonexistent/path"), false);
 
         let result = validate_cmd.execute().await;
         assert!(result.is_err());
@@ -665,7 +752,7 @@ mod tests {
         )
         .unwrap();
 
-        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf(), false);
         let result = validate_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -699,7 +786,7 @@ mod tests {
         )
         .unwrap();
 
-        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf(), false);
         let result = validate_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -725,7 +812,7 @@ mod tests {
         )
         .unwrap();
 
-        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf(), false);
         let result = validate_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -765,7 +852,7 @@ mod tests {
         )
         .unwrap();
 
-        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf(), false);
         let result = validate_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -804,13 +891,52 @@ mod tests {
         )
         .unwrap();
 
-        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf(), false);
         let result = validate_cmd.execute().await;
 
         assert!(result.is_ok());
         let report = result.unwrap();
         assert_eq!(report.scanned_files, 1);
         assert_eq!(report.issues.len(), 0, "Anime with TVDB id should be valid");
+    }
+
+    #[tokio::test]
+    async fn test_validate_with_fix_mode() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        // Create a series file that needs the dash fix
+        let series_path = media_root.join("Series/Elementary/Season 6");
+        fs::create_dir_all(&series_path).unwrap();
+        fs::write(
+            series_path.join("Elementary - S06E08 Sand Trap.mkv"),
+            "test content"
+        ).unwrap();
+
+        // First test without fix mode (dry run)
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf(), false);
+        let result = validate_cmd.execute().await;
+        assert!(result.is_ok());
+        
+        let report = result.unwrap();
+        assert_eq!(report.scanned_files, 1);
+        // The file should have an issue (wrong season format: 6 instead of 06)
+        assert_eq!(report.issues.len(), 1);
+        assert_eq!(report.fixed_files, 0);
+
+        // Now test with fix mode
+        let validate_cmd_fix = ValidateCommand::new(media_root.to_path_buf(), true);
+        let result_fix = validate_cmd_fix.execute().await;
+        assert!(result_fix.is_ok());
+        
+        let report_fix = result_fix.unwrap();
+        assert_eq!(report_fix.scanned_files, 1);
+        // We might still have the issue reported but it should be fixed
+        assert_eq!(report_fix.issues.len(), 1);
+        // Check if there's a suggestion
+        if let Some(issue) = report_fix.issues.first() {
+            assert!(issue.suggested_path.is_some());
+        }
     }
 
     #[tokio::test]
@@ -844,7 +970,7 @@ mod tests {
         )
         .unwrap();
 
-        let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
+        let validate_cmd = ValidateCommand::new(media_root.to_path_buf(), false);
         let result = validate_cmd.execute().await;
         assert!(result.is_ok());
         let report = result.unwrap();

@@ -112,6 +112,9 @@ enum Commands {
     Validate {
         /// Path to the media directory to validate
         path: PathBuf,
+        /// Actually fix/rename files instead of just validating
+        #[arg(long)]
+        fix: bool,
     },
 }
 
@@ -176,9 +179,13 @@ async fn main() -> Result<()> {
             );
             CleanCommand::new(path, work_root).execute().await
         }
-        Commands::Validate { path } => {
-            info!("Starting validate command for path: {:?}", path);
-            let validate_cmd = ValidateCommand::new(path);
+        Commands::Validate { path, fix } => {
+            if fix {
+                info!("Starting validate command with --fix for path: {:?}", path);
+            } else {
+                info!("Starting validate command for path: {:?}", path);
+            }
+            let validate_cmd = ValidateCommand::new(path, fix);
             match validate_cmd.execute().await {
                 Ok(report) => {
                     validate_cmd.print_report(&report);
