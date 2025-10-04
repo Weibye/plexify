@@ -307,7 +307,21 @@ impl NamingRules {
             },
         });
 
-        // ATOMIC RULE 9: Uppercase SXXEXX patterns
+        // ATOMIC RULE 9: Fix duplicated directory structure for Series
+        // Example: Series/Veronica Mars/Series/Veronica Mars/Season 01/file -> Series/Veronica Mars/Season 01/file
+        rules.push(NamingRule {
+            name: "fix_duplicated_series_structure".to_string(),
+            description: "Remove duplicated Series/Show structure".to_string(),
+            pattern: Regex::new(r"^Series/([^/]+)/Series/[^/]+/(Season .+)$")?,
+            transform: |m| {
+                let show_name = &m.captures[0];
+                let season_and_file = &m.captures[1];
+
+                Ok(PathBuf::from(format!("Series/{}/{}", show_name, season_and_file)))
+            },
+        });
+
+        // ATOMIC RULE 10: Uppercase SXXEXX patterns
         rules.push(NamingRule {
             name: "uppercase_episode_codes".to_string(),
             description: "Ensure SXXEXX patterns are uppercase".to_string(),
@@ -594,6 +608,21 @@ mod tests {
             assert_eq!(
                 result.to_string_lossy(),
                 "Series/From/Season 03/From - S03E04 [720p].mkv"
+            );
+        } else {
+            panic!("Atomic rules should have transformed the path");
+        }
+    }
+
+    #[test]
+    fn test_atomic_rule_fix_duplicated_structure() {
+        let rules = NamingRules::new().unwrap();
+        let test_path = Path::new("Series/Veronica Mars/Series/Veronica Mars/Season 01/Veronica Mars - S01E11.mp4");
+
+        if let Some(result) = rules.apply_rules(test_path) {
+            assert_eq!(
+                result.to_string_lossy(),
+                "Series/Veronica Mars/Season 01/Veronica Mars - S01E11.mp4"
             );
         } else {
             panic!("Atomic rules should have transformed the path");

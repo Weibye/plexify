@@ -417,6 +417,11 @@ impl ValidateCommand {
         // First determine the expected content type based on directory
         let issue_type = self.determine_issue_type(&path_str);
         
+        debug!(
+            "Path '{}' determined as issue type: {:?}",
+            path_str, issue_type
+        );
+        
         // If it's not in a recognized directory structure, use DirectoryStructure
         // Otherwise, treat as naming issue for that content type
         let actual_issue_type = if issue_type == IssueType::DirectoryStructure {
@@ -598,18 +603,23 @@ impl ValidateCommand {
 
             *issue_counts.entry(issue_type_str.to_string()).or_insert(0) += 1;
 
+            // Normalize paths to use forward slashes for consistent display
+            let normalized_file_path = issue.file_path.to_string_lossy().replace("\\", "/");
+            
             if issue.fixed_path.is_some() {
-                println!("\n✅ {}", issue.file_path.display());
+                println!("\n✅ {}", normalized_file_path);
                 println!("   Issue: {}", issue.description);
                 if let Some(fixed) = &issue.fixed_path {
-                    println!("   Fixed: {}", fixed.display());
+                    let normalized_fixed_path = fixed.to_string_lossy().replace("\\", "/");
+                    println!("   Fixed: {}", normalized_fixed_path);
                 }
             } else {
-                println!("\n❌ {}", issue.file_path.display());
+                println!("\n❌ {}", normalized_file_path);
                 println!("   Issue: {}", issue.description);
 
                 if let Some(suggested) = &issue.suggested_path {
-                    println!("   Suggested: {}", suggested.display());
+                    let normalized_suggested_path = suggested.to_string_lossy().replace("\\", "/");
+                    println!("   Suggested: {}", normalized_suggested_path);
                 }
             }
         }
