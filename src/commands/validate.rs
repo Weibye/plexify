@@ -539,6 +539,19 @@ impl ValidateCommand {
         // Try all compiled patterns (much faster than recompiling regex each time)
         for pattern in compiled_patterns.iter() {
             if pattern.regex.is_match(&path_str) {
+                // Pattern matched, but do additional validation for broken show directory names
+                if self.has_broken_show_directory(&path_str) {
+                    // Even though it matched a pattern, the show directory name is broken
+                    let issue_type = self.determine_issue_type(&path_str);
+                    let description = "Show directory name contains episode pattern (corrupted structure)".to_string();
+                    let suggested_path = self.suggest_path(&path_str, &issue_type);
+                    return Some(ValidationIssue {
+                        file_path: full_path.to_path_buf(),
+                        issue_type,
+                        description,
+                        suggested_path,
+                    });
+                }
                 return None; // Valid
             }
         }
@@ -629,35 +642,15 @@ impl ValidateCommand {
                 .map(|re| re.is_match(&filename_str))
                 .unwrap_or(false)
             {
-                // Extract show name by removing everything from the episode pattern onwards
-                let show_name = if let Ok(re) = Regex::new(r"^(.+?)\s+[sS]\d{1,2}[eE]\d{1,4}.*$") {
-                    re.captures(&filename_str)
-                        .and_then(|caps| caps.get(1))
-                        .map(|m| m.as_str().trim().to_string())
-                        .unwrap_or_else(|| {
-                            // Fallback: split on common delimiters and take the first meaningful part
-                            filename_str
-                                .split(&['-', '.', '_'])
-                                .next()
-                                .unwrap_or("Unknown Show")
-                                .trim()
-                                .to_string()
-                        })
-                } else {
-                    // Fallback to simple extraction
-                    filename_str
-                        .split(&['-', '.', '_'])
-                        .next()
-                        .unwrap_or("Unknown Show")
-                        .trim()
-                        .to_string()
-                };
-                
-                let final_show_name = if show_name.is_empty() { "Unknown Show" } else { &show_name };
-                
+                // Extract show name (rough heuristic)
+                let show_name = filename_str
+                    .split(&['-', '.', '_'])
+                    .next()
+                    .unwrap_or("Unknown Show")
+                    .trim();
                 return Some(PathBuf::from(format!(
                     "Series/{}/Season 01/{}",
-                    final_show_name, filename_str
+                    show_name, filename_str
                 )));
             }
 
@@ -717,7 +710,6 @@ impl ValidateCommand {
             };
 
             // Determine the correct format based on root type and patterns (using uppercase)
-            // Use the show name from the directory structure, not from the filename parsing
             let suggested_filename = if episode_title.is_empty() {
                 // No episode title available - use format without title part
                 if root_type == "Anime" {
@@ -792,6 +784,28 @@ impl ValidateCommand {
         None
     }
 
+    /// Check if a path has a broken show directory name (contains episode patterns)
+    fn has_broken_show_directory(&self, path_str: &str) -> bool {
+        let path_components: Vec<&str> = path_str.split('/').collect();
+        if path_components.len() < 3 {
+            return false;
+        }
+
+        let root_type = path_components[0]; // "Anime", "Series", etc.
+        if root_type != "Series" && root_type != "Anime" {
+            return false;
+        }
+
+        let show_dir = path_components[1]; // Show directory name
+
+        // Check if show directory name ends with episode pattern (indicates broken structure)
+        if let Ok(re) = Regex::new(r"\s+S\d{2}E\d{2,3}$") {
+            re.is_match(show_dir)
+        } else {
+            false
+        }
+    }
+
     /// Extract clean show name from directory name (remove metadata, year, etc.)
     fn extract_clean_show_name(&self, show_dir: &str) -> String {
         // Remove common metadata patterns
@@ -804,6 +818,11 @@ impl ValidateCommand {
 
         // Remove year in parentheses
         if let Ok(re) = Regex::new(r"\s*\(\d{4}\)") {
+            clean = re.replace_all(&clean, "").to_string();
+        }
+
+        // Remove episode patterns like "S01E01" from show directory names (fixes broken nested directories)
+        if let Ok(re) = Regex::new(r"\s+S\d{2}E\d{2,3}.*$") {
             clean = re.replace_all(&clean, "").to_string();
         }
 
@@ -1461,7 +1480,7 @@ mod tests {
             .join("Movies/Test Movie (2021)/Test Movie (2021).mkv")
             .exists());
         assert!(media_root
-            .join("Series/Test Series/Season 01/Test Series s01e01.mkv")
+            .join("Series/Test Series s01e01/Season 01/Test Series s01e01.mkv")
             .exists());
 
         // Original files should be gone
