@@ -59,7 +59,7 @@ pub struct ValidationIssue {
 }
 
 /// Types of naming issues
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum IssueType {
     ShowNaming,
     MovieNaming,
@@ -122,7 +122,7 @@ impl Default for NamingPatterns {
                 },
                 NamingPattern {
                     description: "Alternative Series format".to_string(),
-                    pattern: r"^Series/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/[^/]+ S\d{2}E\d{2} [^/]+\.\w+$".to_string(),
+                    pattern: r"^Series/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/[^/]+ S\d{2}E\d{2} [^/\[]+\.\w+$".to_string(),
                     example: "Series/Breaking Bad (2008) {tvdb-296861}/Season 01/Breaking Bad S01E01 Pilot.mkv".to_string(),
                     content_type: ContentType::Series,
                     compiled_regex: None,
@@ -131,6 +131,22 @@ impl Default for NamingPatterns {
                     description: "Simple Series format".to_string(),
                     pattern: r"^Series/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/S\d{2}E\d{2} - [^/]+\.\w+$".to_string(),
                     example: "Series/Breaking Bad/Season 01/S01E01 - Pilot.mkv".to_string(),
+                    content_type: ContentType::Series,
+                    compiled_regex: None,
+                },
+                // Series with quality metadata (no episode title)
+                NamingPattern {
+                    description: "Series with quality metadata".to_string(),
+                    pattern: r"^Series/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/[^/]+ - S\d{2}E\d{2} \[[^\]]+\]\.\w+$".to_string(),
+                    example: "Series/From/Season 03/From - S03E04 [720p].mkv".to_string(),
+                    content_type: ContentType::Series,
+                    compiled_regex: None,
+                },
+                // Series with episode title AND quality metadata  
+                NamingPattern {
+                    description: "Series with episode title and quality metadata".to_string(),
+                    pattern: r"^Series/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/[^/]+ - S\d{2}E\d{2} - [^/\[]+\[[^\]]+\]\.\w+$".to_string(),
+                    example: "Series/Critical Role (2015) {tvdb-296861}/Season 01 - Vox Machina/Critical Role - S01E01 - Arrival at Kraghammer [1080p30].mp4".to_string(),
                     content_type: ContentType::Series,
                     compiled_regex: None,
                 },
@@ -398,10 +414,18 @@ impl ValidateCommand {
         }
 
         // If we reach here, the file doesn't match any pattern
-        // Determine the expected content type based on directory
+        // First determine the expected content type based on directory
         let issue_type = self.determine_issue_type(&path_str);
+        
+        // If it's not in a recognized directory structure, use DirectoryStructure
+        // Otherwise, treat as naming issue for that content type
+        let actual_issue_type = if issue_type == IssueType::DirectoryStructure {
+            IssueType::DirectoryStructure
+        } else {
+            issue_type // ShowNaming or MovieNaming
+        };
 
-        let description = match issue_type {
+        let description = match actual_issue_type {
             IssueType::ShowNaming => "Show file doesn't match expected naming pattern".to_string(),
             IssueType::MovieNaming => {
                 "Movie file doesn't match expected naming pattern".to_string()
@@ -421,9 +445,9 @@ impl ValidateCommand {
 
         Some(ValidationIssue {
             file_path: full_path.to_path_buf(),
-            issue_type: issue_type.clone(),
+            issue_type: actual_issue_type.clone(),
             description,
-            suggested_path: self.suggest_path(full_path, &issue_type),
+            suggested_path: self.suggest_path(relative_path, &actual_issue_type),
             fixed_path: None,
         })
     }
@@ -450,18 +474,10 @@ impl ValidateCommand {
 
         // First try to apply atomic naming rules for Series/Anime files
         if let Ok(naming_rules) = NamingRules::new() {
-            // Convert absolute path to relative path for our naming rules
-            let relative_path = if let Ok(rel_path) = file_path.strip_prefix(&self.media_root) {
-                rel_path
-            } else {
-                debug!("Could not make path relative to media root");
-                file_path
-            };
+            let path_str = file_path.to_string_lossy().replace("\\", "/");
+            debug!("Trying atomic naming rules for path: {}", path_str);
 
-            let path_str = relative_path.to_string_lossy().replace("\\", "/");
-            debug!("Trying atomic naming rules for relative path: {}", path_str);
-
-            if let Some(suggested_path) = naming_rules.apply_rules(relative_path) {
+            if let Some(suggested_path) = naming_rules.apply_rules(file_path) {
                 debug!(
                     "Atomic rules transformation successful: {:?}",
                     suggested_path

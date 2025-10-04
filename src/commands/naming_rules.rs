@@ -289,7 +289,25 @@ impl NamingRules {
             },
         });
 
-        // ATOMIC RULE 8: Uppercase SXXEXX patterns
+        // ATOMIC RULE 8: Remove extra dash before quality metadata when no episode title
+        // Example: Show - S01E01 - [720p].mkv -> Show - S01E01 [720p].mkv  
+        rules.push(NamingRule {
+            name: "remove_dash_before_quality".to_string(),
+            description: "Remove extra dash before quality metadata when no episode title".to_string(),
+            pattern: Regex::new(r"^(.+ - S\d{2}E\d{2}) - (\[[^\]]+\])\.(\w+)$")?,
+            transform: |m| {
+                let path_base = &m.captures[0];
+                let quality = &m.captures[1];
+                let ext = &m.captures[2];
+
+                Ok(PathBuf::from(format!(
+                    "{} {}.{}",
+                    path_base, quality, ext
+                )))
+            },
+        });
+
+        // ATOMIC RULE 9: Uppercase SXXEXX patterns
         rules.push(NamingRule {
             name: "uppercase_episode_codes".to_string(),
             description: "Ensure SXXEXX patterns are uppercase".to_string(),
@@ -562,6 +580,21 @@ mod tests {
             // Should have fixed season padding at minimum
             assert!(result_str.contains("Season 03"));
             // May have additional transformations applied
+        } else {
+            panic!("Atomic rules should have transformed the path");
+        }
+    }
+
+    #[test]
+    fn test_atomic_rule_remove_dash_before_quality() {
+        let rules = NamingRules::new().unwrap();
+        let test_path = Path::new("Series/From/Season 03/From - S03E04 - [720p].mkv");
+
+        if let Some(result) = rules.apply_rules(test_path) {
+            assert_eq!(
+                result.to_string_lossy(),
+                "Series/From/Season 03/From - S03E04 [720p].mkv"
+            );
         } else {
             panic!("Atomic rules should have transformed the path");
         }
