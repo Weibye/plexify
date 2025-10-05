@@ -415,7 +415,7 @@ impl ValidateCommand {
 
         // If we reach here, the file doesn't match any pattern
         // First determine the expected content type based on directory
-        let issue_type = self.determine_issue_type(&path_str);
+        let issue_type = self.determine_issue_type(&path_str, full_path);
         
         debug!(
             "Path '{}' determined as issue type: {:?}",
@@ -458,7 +458,8 @@ impl ValidateCommand {
     }
 
     /// Determine issue type based on directory structure
-    fn determine_issue_type(&self, path_str: &str) -> IssueType {
+    fn determine_issue_type(&self, path_str: &str, full_path: &Path) -> IssueType {
+        // First check if the relative path starts with a root directory
         for (dir_name, content_type) in DIRECTORY_MAPPING {
             if path_str.starts_with(&format!("{}/", dir_name)) {
                 return match content_type {
@@ -467,7 +468,61 @@ impl ValidateCommand {
                 };
             }
         }
+
+        // If not, check the full path to see if we're inside one of these directories
+        let full_path_str = full_path.to_string_lossy().replace("\\", "/");
+        for (dir_name, content_type) in DIRECTORY_MAPPING {
+            if full_path_str.contains(&format!("/{}/", dir_name)) || 
+               full_path_str.starts_with(&format!("{}/", dir_name)) {
+                return match content_type {
+                    ContentType::Series => IssueType::ShowNaming,
+                    ContentType::Movie => IssueType::MovieNaming,
+                };
+            }
+        }
+
         IssueType::DirectoryStructure
+    }
+
+    /// Construct a full path structure for atomic rules when validating subdirectories
+    fn construct_full_path_for_rules(&self, relative_path: &Path, media_root: &Path) -> Option<PathBuf> {
+        let full_path = media_root.join(relative_path);
+        let full_path_str = full_path.to_string_lossy().replace("\\", "/");
+        
+        // Check if we can determine the proper structure from the full path
+        for (dir_name, _content_type) in DIRECTORY_MAPPING {
+            if let Some(series_pos) = full_path_str.find(&format!("/{}/", dir_name)) {
+                // Extract the part starting from the root directory
+                let start_pos = series_pos + 1; // Skip the leading /
+                if let Some(rest) = full_path_str.get(start_pos..) {
+                    return Some(PathBuf::from(rest));
+                }
+            } else if full_path_str.starts_with(&format!("{}/", dir_name)) {
+                // Already starts with the root directory
+                return Some(PathBuf::from(&*full_path_str));
+            }
+        }
+        
+        // If we can't determine the structure, try to reconstruct it from components
+        let components: Vec<_> = full_path.components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect();
+            
+        // Look for Series/Anime/Movies in the path components
+        for (i, component) in components.iter().enumerate() {
+            for (dir_name, _content_type) in DIRECTORY_MAPPING {
+                if component == dir_name {
+                    // Reconstruct path starting from this root
+                    let mut reconstructed = PathBuf::new();
+                    for comp in &components[i..] {
+                        reconstructed.push(comp.as_ref());
+                    }
+                    return Some(reconstructed);
+                }
+            }
+        }
+        
+        None
     }
 
     /// Suggest a corrected path for a file using naming rules
@@ -479,14 +534,39 @@ impl ValidateCommand {
 
         // First try to apply atomic naming rules for Series/Anime files
         if let Ok(naming_rules) = NamingRules::new() {
-            let path_str = file_path.to_string_lossy().replace("\\", "/");
+            // Try to construct a full path structure if we're dealing with a partial path
+            let working_path = self.construct_full_path_for_rules(file_path, &self.media_root)?;
+            
+            let path_str = working_path.to_string_lossy().replace("\\", "/");
             debug!("Trying atomic naming rules for path: {}", path_str);
 
-            if let Some(suggested_path) = naming_rules.apply_rules(file_path) {
+            if let Some(suggested_path) = naming_rules.apply_rules(&working_path) {
                 debug!(
                     "Atomic rules transformation successful: {:?}",
                     suggested_path
                 );
+                // When validating a subdirectory, we need to provide a relative suggestion
+                // that makes sense from the current validation root
+                let current_dir_components: Vec<_> = self.media_root.components().collect();
+                let suggestion_components: Vec<_> = suggested_path.components().collect();
+                
+                // Find where the paths diverge and extract the meaningful part
+                for (dir_name, _content_type) in DIRECTORY_MAPPING {
+                    let suggested_str = suggested_path.to_string_lossy();
+                    if suggested_str.contains(&format!("/{}/", dir_name)) || suggested_str.starts_with(&format!("{}/", dir_name)) {
+                        // For subdirectory validation, show just the changed part
+                        if let Some(season_pos) = suggested_str.find("/Season ") {
+                            if let Some(rest) = suggested_str.get(season_pos + 1..) {
+                                return Some(PathBuf::from(rest));
+                            }
+                        }
+                        // Fall back to the filename if we can't extract season info
+                        if let Some(filename) = suggested_path.file_name() {
+                            return Some(PathBuf::from(filename));
+                        }
+                    }
+                }
+                
                 return Some(suggested_path);
             } else {
                 debug!(
