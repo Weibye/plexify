@@ -545,28 +545,8 @@ impl ValidateCommand {
                     "Atomic rules transformation successful: {:?}",
                     suggested_path
                 );
-                // When validating a subdirectory, we need to provide a relative suggestion
-                // that makes sense from the current validation root
-                let current_dir_components: Vec<_> = self.media_root.components().collect();
-                let suggestion_components: Vec<_> = suggested_path.components().collect();
                 
-                // Find where the paths diverge and extract the meaningful part
-                for (dir_name, _content_type) in DIRECTORY_MAPPING {
-                    let suggested_str = suggested_path.to_string_lossy();
-                    if suggested_str.contains(&format!("/{}/", dir_name)) || suggested_str.starts_with(&format!("{}/", dir_name)) {
-                        // For subdirectory validation, show just the changed part
-                        if let Some(season_pos) = suggested_str.find("/Season ") {
-                            if let Some(rest) = suggested_str.get(season_pos + 1..) {
-                                return Some(PathBuf::from(rest));
-                            }
-                        }
-                        // Fall back to the filename if we can't extract season info
-                        if let Some(filename) = suggested_path.file_name() {
-                            return Some(PathBuf::from(filename));
-                        }
-                    }
-                }
-                
+                // Always return the full suggested path for consistent display
                 return Some(suggested_path);
             } else {
                 debug!(
@@ -616,35 +596,82 @@ impl ValidateCommand {
         }
 
         if let Some(suggested_path) = &issue.suggested_path {
-            let full_suggested_path = self.media_root.join(suggested_path);
+            // For suggested paths that are already absolute or contain root structures,
+            // we need to determine the proper target path
+            let full_suggested_path = if suggested_path.is_absolute() {
+                // If it's absolute, use it directly
+                suggested_path.clone()
+            } else {
+                let suggested_str = suggested_path.to_string_lossy();
+                // Check if the suggested path contains a root directory structure
+                let mut found_root = false;
+                for (dir_name, _content_type) in DIRECTORY_MAPPING {
+                    if suggested_str.starts_with(&format!("{}/", dir_name)) {
+                        found_root = true;
+                        break;
+                    }
+                }
+                
+                if found_root {
+                    // The suggested path already contains the full structure starting from root
+                    // We need to find the common ancestor directory that contains the root
+                    let current_path_str = issue.file_path.to_string_lossy();
+                    
+                    // Find the root directory in the current file's path
+                    for (dir_name, _content_type) in DIRECTORY_MAPPING {
+                        if let Some(pos) = current_path_str.find(&format!("{}{}", dir_name, std::path::MAIN_SEPARATOR)) {
+                            // Extract the base path up to (but not including) the root directory
+                            let base_path = &current_path_str[..pos];
+                            let full_target = PathBuf::from(format!("{}{}", base_path, suggested_str));
+                            return self.perform_rename(issue, &full_target).await;
+                        }
+                        // Also check for forward slash (normalized paths)
+                        if let Some(pos) = current_path_str.find(&format!("{}/", dir_name)) {
+                            let base_path = &current_path_str[..pos];
+                            let full_target = PathBuf::from(format!("{}{}", base_path, suggested_str));
+                            return self.perform_rename(issue, &full_target).await;
+                        }
+                    }
+                    // Fallback: join with media root
+                    self.media_root.join(suggested_path)
+                } else {
+                    // Regular relative path, join with media root
+                    self.media_root.join(suggested_path)
+                }
+            };
 
-            // Ensure the target directory exists
-            if let Some(parent) = full_suggested_path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
+            self.perform_rename(issue, &full_suggested_path).await
+        } else {
+            Ok(false)
+        }
+    }
 
-            // Check if target file already exists
-            if full_suggested_path.exists() {
-                warn!(
-                    "Target file already exists, skipping rename: {:?}",
-                    full_suggested_path
-                );
-                return Ok(false);
-            }
-
-            // Rename the file
-            tokio::fs::rename(&issue.file_path, &full_suggested_path).await?;
-
-            info!(
-                "📁 Renamed: {:?} -> {:?}",
-                issue.file_path, full_suggested_path
-            );
-
-            issue.fixed_path = Some(full_suggested_path);
-            return Ok(true);
+    /// Perform the actual file rename operation
+    async fn perform_rename(&self, issue: &mut ValidationIssue, target_path: &Path) -> Result<bool> {
+        // Ensure the target directory exists
+        if let Some(parent) = target_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
         }
 
-        Ok(false)
+        // Check if target file already exists
+        if target_path.exists() {
+            warn!(
+                "Target file already exists, skipping rename: {:?}",
+                target_path
+            );
+            return Ok(false);
+        }
+
+        // Rename the file
+        tokio::fs::rename(&issue.file_path, target_path).await?;
+
+        info!(
+            "📁 Renamed: {:?} -> {:?}",
+            issue.file_path, target_path
+        );
+
+        issue.fixed_path = Some(target_path.to_path_buf());
+        Ok(true)
     }
 
     /// Print the validation report to stdout
