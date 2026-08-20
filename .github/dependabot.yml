@@ -39,8 +39,8 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
+      # `day` applies to weekly schedules only; a monthly run happens on the 1st.
       interval: "monthly"
-      day: "monday"
       time: "09:00"
     # Group all GitHub Actions updates together
     groups:
