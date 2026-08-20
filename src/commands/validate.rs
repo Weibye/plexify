@@ -43,8 +43,6 @@ pub struct NamingPattern {
     pub pattern: String,
     pub example: String,
     pub content_type: ContentType,
-    #[serde(skip)]
-    pub compiled_regex: Option<Regex>,
 }
 
 /// Validation issue found in a media file
@@ -99,14 +97,12 @@ impl Default for NamingPatterns {
                     pattern: r"^Anime/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/[^/]+ - s\d{2}e\d{2} - [^/]+\.\w+$".to_string(),
                     example: "Anime/Attack on Titan/Season 01/Attack on Titan - s01e01 - To You, in 2000 Years.mkv".to_string(),
                     content_type: ContentType::Series,
-                    compiled_regex: None,
                 },
                 NamingPattern {
                     description: "Alternative Anime format".to_string(),
                     pattern: r"^Anime/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/[^/]+ S\d{2}E\d{2} [^/]+\.\w+$".to_string(),
                     example: "Anime/Attack on Titan/Season 01/Attack on Titan S01E01 To You, in 2000 Years.mkv".to_string(),
                     content_type: ContentType::Series,
-                    compiled_regex: None,
                 },
                 // Series patterns (shows)  
                 NamingPattern {
@@ -114,21 +110,18 @@ impl Default for NamingPatterns {
                     pattern: r"^Series/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/[^/]+ - s\d{2}e\d{2} - [^/]+\.\w+$".to_string(),
                     example: "Series/Breaking Bad/Season 01/Breaking Bad - s01e01 - Pilot.mkv".to_string(),
                     content_type: ContentType::Series,
-                    compiled_regex: None,
                 },
                 NamingPattern {
                     description: "Alternative Series format".to_string(),
                     pattern: r"^Series/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/[^/]+ S\d{2}E\d{2} [^/]+\.\w+$".to_string(),
                     example: "Series/Breaking Bad (2008) {tvdb-296861}/Season 01/Breaking Bad S01E01 Pilot.mkv".to_string(),
                     content_type: ContentType::Series,
-                    compiled_regex: None,
                 },
                 NamingPattern {
                     description: "Simple Series format".to_string(),
                     pattern: r"^Series/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/S\d{2}E\d{2} - [^/]+\.\w+$".to_string(),
                     example: "Series/Breaking Bad/Season 01/S01E01 - Pilot.mkv".to_string(),
                     content_type: ContentType::Series,
-                    compiled_regex: None,
                 },
                 // Movie patterns
                 NamingPattern {
@@ -136,14 +129,12 @@ impl Default for NamingPatterns {
                     pattern: r"^Movies/[^/]+ \(\d{4}\)/[^/]+ \(\d{4}\)\.\w+$".to_string(),
                     example: "Movies/The Dark Knight (2008)/The Dark Knight (2008).mkv".to_string(),
                     content_type: ContentType::Movie,
-                    compiled_regex: None,
                 },
                 NamingPattern {
                     description: "Collection Movie format".to_string(),
                     pattern: r"^Movies/[^/]+ Collection/[^/]+ \(\d{4}\)\.\w+$".to_string(),
                     example: "Movies/Marvel Cinematic Universe Collection/Iron Man (2008).mkv".to_string(),
                     content_type: ContentType::Movie,
-                    compiled_regex: None,
                 },
             ],
         }
@@ -318,8 +309,7 @@ impl ValidateCommand {
                     Err(_) => return None,
                 };
 
-                let result =
-                    self.validate_file_path_parallel(&self.compiled_patterns, relative_path, path);
+                let result = self.validate_file_path(&self.compiled_patterns, relative_path, path);
                 pb.inc(1);
                 result
             })
@@ -347,17 +337,8 @@ impl ValidateCommand {
         Ok(report)
     }
 
-    /// Validate a single file path against patterns (sequential version for testing)
+    /// Validate a single file path against the precompiled patterns
     fn validate_file_path(
-        &self,
-        relative_path: &Path,
-        full_path: &Path,
-    ) -> Option<ValidationIssue> {
-        self.validate_file_path_parallel(&self.compiled_patterns, relative_path, full_path)
-    }
-
-    /// Validate a single file path against patterns (parallel version)
-    fn validate_file_path_parallel(
         &self,
         compiled_patterns: &[CompiledPattern],
         relative_path: &Path,
