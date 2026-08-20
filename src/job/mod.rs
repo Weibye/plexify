@@ -54,20 +54,15 @@ pub enum MediaFileType {
     Mkv,
 }
 
-/// Episode metadata extracted from file paths for prioritization
+/// Episode metadata extracted from file paths for prioritization.
+///
+/// Only episodes have metadata. Movies and anything else that does not parse as
+/// an episode yield `None`, which is what separates the two during prioritization.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EpisodeMetadata {
     pub series_name: String,
     pub season_number: u32,
     pub episode_number: u32,
-    pub content_type: ContentType,
-}
-
-/// Content type for media files
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ContentType {
-    Movie,
-    Series,
 }
 
 impl Job {
@@ -250,7 +245,6 @@ impl Job {
             series_name,
             season_number,
             episode_number,
-            content_type: ContentType::Series,
         })
     }
 }
@@ -691,7 +685,6 @@ mod tests {
         assert_eq!(metadata.series_name, "Breaking Bad");
         assert_eq!(metadata.season_number, 1);
         assert_eq!(metadata.episode_number, 3);
-        assert_eq!(metadata.content_type, ContentType::Series);
     }
 
     #[test]
@@ -715,7 +708,6 @@ mod tests {
         assert_eq!(metadata.series_name, "Breaking Bad (2008)");
         assert_eq!(metadata.season_number, 1);
         assert_eq!(metadata.episode_number, 1);
-        assert_eq!(metadata.content_type, ContentType::Series);
     }
 
     #[test]
@@ -739,7 +731,6 @@ mod tests {
         assert_eq!(metadata.series_name, "Attack on Titan");
         assert_eq!(metadata.season_number, 1);
         assert_eq!(metadata.episode_number, 5);
-        assert_eq!(metadata.content_type, ContentType::Series);
     }
 
     #[test]
@@ -761,7 +752,6 @@ mod tests {
         assert_eq!(metadata.series_name, "Critical Role (2015)");
         assert_eq!(metadata.season_number, 1);
         assert_eq!(metadata.episode_number, 12);
-        assert_eq!(metadata.content_type, ContentType::Series);
     }
 
     #[test]

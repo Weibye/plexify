@@ -57,14 +57,12 @@ fn bench_directory_skip_old_approach(c: &mut Criterion) {
 
             // Old approach: visit all files but ignore them individually
             let mut count = 0;
-            for entry in WalkDir::new(&root).follow_links(false).into_iter() {
-                if let Ok(entry) = entry {
-                    let path = entry.path();
-                    if !path.is_dir() {
-                        // Only check files, not directories
-                        if !filter.should_ignore(path) {
-                            count += 1;
-                        }
+            for entry in WalkDir::new(root).follow_links(false).into_iter().flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    // Only check files, not directories
+                    if !filter.should_ignore(path) {
+                        count += 1;
                     }
                 }
             }
@@ -82,7 +80,7 @@ fn bench_directory_skip_new_approach(c: &mut Criterion) {
 
             // New approach: skip entire directories before traversing
             let mut count = 0;
-            for entry in WalkDir::new(&root)
+            for entry in WalkDir::new(root)
                 .follow_links(false)
                 .into_iter()
                 .filter_entry(|e| {
@@ -95,14 +93,13 @@ fn bench_directory_skip_new_approach(c: &mut Criterion) {
                     }
                     true
                 })
+                .flatten()
             {
-                if let Ok(entry) = entry {
-                    let path = entry.path();
-                    if !path.is_dir() {
-                        // Only count files
-                        if !filter.should_ignore(path) {
-                            count += 1;
-                        }
+                let path = entry.path();
+                if !path.is_dir() {
+                    // Only count files
+                    if !filter.should_ignore(path) {
+                        count += 1;
                     }
                 }
             }

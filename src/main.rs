@@ -34,15 +34,7 @@ use std::path::PathBuf;
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-mod commands;
-mod config;
-mod ffmpeg;
-mod ignore;
-mod job;
-mod queue;
-mod worker;
-
-use commands::{
+use plexify::commands::{
     add::AddCommand, clean::CleanCommand, scan::ScanCommand, validate::ValidateCommand,
     work::WorkCommand,
 };
