@@ -147,6 +147,20 @@ impl WorkCommand {
             let job_name = claimed_job.job_name().to_string();
             let work_folder = &queue.in_progress_dir;
 
+            // The output can have appeared since the job was queued - another
+            // worker got there first, or the queue outlived an earlier run.
+            // Handing this to FFmpeg would re-encode a file that is already
+            // done, and if the source has since been disabled it would fail on
+            // every retry instead.
+            if job.output_exists(media_root) {
+                info!(
+                    "⏭️ Output already exists, nothing to do: {:?}",
+                    job.full_output_path(media_root)
+                );
+                claimed_job.complete().await?;
+                return Ok(true);
+            }
+
             // Create a progress bar for job processing
             let job_pb = ProgressBar::new_spinner();
             job_pb.set_style(
@@ -235,5 +249,51 @@ mod tests {
 
         let result = work_cmd.execute().await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_job_whose_output_already_exists_is_completed_without_transcoding() {
+        use crate::job::{Job, MediaFileType, PostProcessingSettings, QualitySettings};
+
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        std::fs::write(media_root.join("show.mkv"), "").unwrap();
+        std::fs::write(media_root.join("show.mp4"), "").unwrap();
+
+        let queue = JobQueue::new(media_root.to_path_buf(), media_root.to_path_buf());
+        queue.init().await.unwrap();
+
+        let job = Job::new(
+            PathBuf::from("show.mkv"),
+            MediaFileType::Mkv,
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            media_root,
+        );
+        queue.enqueue_job(&job).await.unwrap();
+
+        let work_cmd = WorkCommand::new(
+            media_root.to_path_buf(),
+            media_root.to_path_buf(),
+            false,
+            JobPriority::None,
+        );
+        let processor = FFmpegProcessor::new(Config::default(), false);
+
+        let processed = work_cmd.process_next_job(&queue, &processor).await.unwrap();
+
+        assert!(processed, "the job should have been claimed");
+        assert!(
+            media_root
+                .join("_completed")
+                .join(job.job_filename())
+                .exists(),
+            "the job should be recorded as completed rather than retried"
+        );
+        assert!(
+            media_root.join("show.mkv").exists(),
+            "the source must not be disabled by a job that did no work"
+        );
     }
 }

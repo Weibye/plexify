@@ -51,6 +51,12 @@ a JSON file, and the queue is three directories that jobs move between:
 {work_root}/_queue/{uuid}.job  →  _in_progress/  →  _completed/
 ```
 
+**A job is named after the file it transcodes.** The `{uuid}` is a v5 UUID derived from the
+resolved input path (`Job::id_for_input`), not a random one, and that is what makes the queue
+addressable: the same file always maps to the same job filename, so re-scanning a library is
+idempotent and both primitives below have something stable to collide on. Never make the id
+random again.
+
 Any number of `work` processes on any number of machines can point at the same work root.
 Mutual exclusion comes from two filesystem primitives, both in `src/queue/mod.rs`:
 

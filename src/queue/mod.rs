@@ -191,11 +191,16 @@ impl JobQueue {
         }
     }
 
-    /// Check if a job already exists in the queue
+    /// Check whether this file already has a job waiting or being worked on.
+    ///
+    /// `_completed` is deliberately not consulted. A finished job means the file
+    /// was transcoded, and the source is gone from the scan once it has been
+    /// disabled; if the output was later deleted, the file should be queued again
+    /// rather than remembered as done forever.
     pub async fn job_exists(&self, job: &Job) -> Result<bool> {
         let job_filename = job.job_filename();
-        let job_path = self.queue_dir.join(job_filename);
-        Ok(job_path.exists())
+        Ok(self.queue_dir.join(&job_filename).exists()
+            || self.in_progress_dir.join(&job_filename).exists())
     }
 
     /// Clean up all queue directories
@@ -472,5 +477,37 @@ mod tests {
         // Clean up
         claimed1.complete().await.unwrap();
         claimed2.complete().await.unwrap();
+    }
+
+    #[test]
+    async fn test_job_exists_covers_in_progress_jobs() {
+        let temp_dir = TempDir::new().unwrap();
+        let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        queue.init().await.unwrap();
+
+        let job = Job::new(
+            PathBuf::from("show.mkv"),
+            MediaFileType::Mkv,
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            temp_dir.path(),
+        );
+
+        assert!(!queue.job_exists(&job).await.unwrap());
+
+        queue.enqueue_job(&job).await.unwrap();
+        assert!(queue.job_exists(&job).await.unwrap());
+
+        // A worker claims it: the file leaves _queue, but re-scanning the library
+        // must not queue the same file a second time behind the worker's back.
+        let claimed = queue.claim_job(None).await.unwrap().unwrap();
+        assert!(
+            queue.job_exists(&job).await.unwrap(),
+            "a job being worked on still exists"
+        );
+
+        // Once finished, the job is no longer outstanding.
+        claimed.complete().await.unwrap();
+        assert!(!queue.job_exists(&job).await.unwrap());
     }
 }
