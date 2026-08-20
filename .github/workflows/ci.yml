@@ -97,7 +97,14 @@ jobs:
   security_audit:
     name: Security Audit
     runs-on: ubuntu-latest
-    
+
+    # rustsec/audit-check publishes its findings as a check run. Without these
+    # it still fails the job correctly, but the advisories are only visible in
+    # the raw log rather than as annotations.
+    permissions:
+      checks: write
+      contents: read
+
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
