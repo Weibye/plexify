@@ -5,7 +5,6 @@ pub mod ignore;
 pub mod job;
 pub mod paths;
 pub mod queue;
-pub mod worker;
 
 use clap::ValueEnum;
 

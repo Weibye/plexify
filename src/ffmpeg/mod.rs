@@ -4,7 +4,6 @@ use std::process::Stdio;
 use tokio::process::Command;
 use tracing::{debug, error, info};
 
-use crate::config::Config;
 use crate::job::{Job, MediaFileType, QualitySettings};
 
 /// Builder for constructing FFmpeg commands with a fluent API
@@ -121,17 +120,12 @@ impl FFmpegCommandBuilder {
 
 /// FFmpeg wrapper for media transcoding
 pub struct FFmpegProcessor {
-    #[allow(dead_code)]
-    config: Config,
     background_mode: bool,
 }
 
 impl FFmpegProcessor {
-    pub fn new(config: Config, background_mode: bool) -> Self {
-        Self {
-            config,
-            background_mode,
-        }
+    pub fn new(background_mode: bool) -> Self {
+        Self { background_mode }
     }
 
     pub async fn process_job(
@@ -300,15 +294,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_ffmpeg_processor_creation() {
-        let config = Config::default();
-        let processor = FFmpegProcessor::new(config, false);
+        let processor = FFmpegProcessor::new(false);
         assert!(!processor.background_mode);
     }
 
     #[tokio::test]
     async fn test_background_mode() {
-        let config = Config::default();
-        let processor = FFmpegProcessor::new(config, true);
+        let processor = FFmpegProcessor::new(true);
         assert!(processor.background_mode);
     }
 
@@ -550,8 +542,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = Config::default();
-        let processor = FFmpegProcessor::new(config, false);
+        let processor = FFmpegProcessor::new(false);
 
         // Move the file - since job now has absolute paths, pass None for media_root
         processor

@@ -377,6 +377,12 @@ export FFMPEG_AUDIO_BITRATE="128k"  # Audio bitrate (default: 128k)
 export SLEEP_INTERVAL="60"          # Sleep between job checks in seconds (default: 60)
 ```
 
+The `FFMPEG_*` variables are read when a job is created, by `scan` and `add`, and the
+resolved settings are stored in the job file. Setting them in a worker's environment has
+no effect on jobs that already exist — a job always encodes with the settings it was
+queued with. `SLEEP_INTERVAL` is the exception: it belongs to the worker loop and is read
+by `work`.
+
 ### Combining Presets and Environment Variables
 Environment variables override preset values:
 ```bash
