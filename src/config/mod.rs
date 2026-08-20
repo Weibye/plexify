@@ -1,12 +1,13 @@
 use std::env;
 
-/// Configuration for FFmpeg and application behavior
+/// Settings for the worker loop itself.
+///
+/// Encoding settings are not here: a job carries the `QualitySettings` it was
+/// created with, so what a worker finds in its own environment must not change
+/// how an existing job is encoded.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct Config {
-    pub ffmpeg_preset: String,
-    pub ffmpeg_crf: String,
-    pub ffmpeg_audio_bitrate: String,
+    /// Seconds to wait before checking an empty queue again.
     pub sleep_interval: u64,
 }
 
@@ -14,10 +15,6 @@ impl Config {
     /// Load configuration from environment variables with defaults
     pub fn from_env() -> Self {
         Self {
-            ffmpeg_preset: env::var("FFMPEG_PRESET").unwrap_or_else(|_| "veryfast".to_string()),
-            ffmpeg_crf: env::var("FFMPEG_CRF").unwrap_or_else(|_| "23".to_string()),
-            ffmpeg_audio_bitrate: env::var("FFMPEG_AUDIO_BITRATE")
-                .unwrap_or_else(|_| "128k".to_string()),
             sleep_interval: env::var("SLEEP_INTERVAL")
                 .unwrap_or_else(|_| "60".to_string())
                 .parse()
@@ -28,11 +25,6 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self {
-            ffmpeg_preset: "veryfast".to_string(),
-            ffmpeg_crf: "23".to_string(),
-            ffmpeg_audio_bitrate: "128k".to_string(),
-            sleep_interval: 60,
-        }
+        Self { sleep_interval: 60 }
     }
 }

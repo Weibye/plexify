@@ -58,7 +58,7 @@ impl WorkCommand {
         let queue = JobQueue::new(self.media_root.clone(), self.work_root.clone());
         queue.init().await?;
 
-        let processor = FFmpegProcessor::new(config.clone(), self.background_mode);
+        let processor = FFmpegProcessor::new(self.background_mode);
 
         // Set up signal handling for graceful shutdown
         tokio::pin! {
