@@ -2,3 +2,7 @@
 _queue/
 _in_progress/
 _completed/
+
+# Claude Code: worktrees and personal overrides are local-only
+.claude/worktrees/
+.claude/settings.local.json
