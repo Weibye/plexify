@@ -11,6 +11,7 @@ use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
 use crate::ignore::IgnoreFilter;
+use crate::paths::to_forward_slashes;
 
 /// Media file extensions that should be validated
 const MEDIA_EXTENSIONS: &[&str] = &["mkv", "mp4", "avi", "webm", "mov", "m4v"];
@@ -344,7 +345,7 @@ impl ValidateCommand {
         relative_path: &Path,
         full_path: &Path,
     ) -> Option<ValidationIssue> {
-        let path_str = relative_path.to_string_lossy().replace("\\", "/");
+        let path_str = to_forward_slashes(relative_path);
 
         // Try all compiled patterns (much faster than recompiling regex each time)
         for pattern in compiled_patterns.iter() {
@@ -432,23 +433,40 @@ impl ValidateCommand {
 
     /// Print the validation report to stdout
     pub fn print_report(&self, report: &ValidationReport) {
-        println!("\n📊 Plex Naming Scheme Validation Report");
-        println!("═══════════════════════════════════════");
-        println!("📂 Scanned directory: {}", report.scan_path.display());
-        println!("📁 Files scanned: {}", report.scanned_files);
-        println!("⚠️  Issues found: {}", report.issues.len());
-        println!(
+        print!("{}", self.render_report(report));
+    }
+
+    /// Render the validation report.
+    ///
+    /// Every path is rendered with `/` separators so that reported paths read the
+    /// same way as the patterns listed at the end of the report, which are
+    /// forward-slash by definition.
+    pub fn render_report(&self, report: &ValidationReport) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+
+        let _ = writeln!(out, "\n📊 Plex Naming Scheme Validation Report");
+        let _ = writeln!(out, "═══════════════════════════════════════");
+        let _ = writeln!(
+            out,
+            "📂 Scanned directory: {}",
+            to_forward_slashes(&report.scan_path)
+        );
+        let _ = writeln!(out, "📁 Files scanned: {}", report.scanned_files);
+        let _ = writeln!(out, "⚠️  Issues found: {}", report.issues.len());
+        let _ = writeln!(
+            out,
             "⏱️  Validation time: {:.2}s",
             report.validation_time.as_secs_f64()
         );
 
         if report.issues.is_empty() {
-            println!("\n✅ All files conform to Plex naming conventions!");
-            return;
+            let _ = writeln!(out, "\n✅ All files conform to Plex naming conventions!");
+            return out;
         }
 
-        println!("\n🔍 Issues Found:");
-        println!("─────────────────");
+        let _ = writeln!(out, "\n🔍 Issues Found:");
+        let _ = writeln!(out, "─────────────────");
 
         let mut issue_counts: HashMap<String, usize> = HashMap::new();
 
@@ -463,22 +481,22 @@ impl ValidateCommand {
 
             *issue_counts.entry(issue_type_str.to_string()).or_insert(0) += 1;
 
-            println!("\n❌ {}", issue.file_path.display());
-            println!("   Issue: {}", issue.description);
+            let _ = writeln!(out, "\n❌ {}", to_forward_slashes(&issue.file_path));
+            let _ = writeln!(out, "   Issue: {}", issue.description);
 
             if let Some(suggested) = &issue.suggested_path {
-                println!("   Suggested: {}", suggested.display());
+                let _ = writeln!(out, "   Suggested: {}", to_forward_slashes(suggested));
             }
         }
 
-        println!("\n📈 Issue Summary:");
-        println!("─────────────────");
+        let _ = writeln!(out, "\n📈 Issue Summary:");
+        let _ = writeln!(out, "─────────────────");
         for (issue_type, count) in issue_counts {
-            println!("• {}: {} files", issue_type, count);
+            let _ = writeln!(out, "• {}: {} files", issue_type, count);
         }
 
-        println!("\n💡 Supported Patterns:");
-        println!("─────────────────────");
+        let _ = writeln!(out, "\n💡 Supported Patterns:");
+        let _ = writeln!(out, "─────────────────────");
 
         let show_patterns: Vec<_> = report
             .patterns_used
@@ -494,18 +512,20 @@ impl ValidateCommand {
             .collect();
 
         if !show_patterns.is_empty() {
-            println!("📺 Shows:");
+            let _ = writeln!(out, "📺 Shows:");
             for pattern in show_patterns {
-                println!("   • {}", pattern.example);
+                let _ = writeln!(out, "   • {}", pattern.example);
             }
         }
 
         if !movie_patterns.is_empty() {
-            println!("\n🎬 Movies:");
+            let _ = writeln!(out, "\n🎬 Movies:");
             for pattern in movie_patterns {
-                println!("   • {}", pattern.example);
+                let _ = writeln!(out, "   • {}", pattern.example);
             }
         }
+
+        out
     }
 }
 
@@ -833,5 +853,36 @@ mod tests {
         // Should only scan 1 file (the movie), not the 200+ files in ignored directories
         assert_eq!(report.scanned_files, 1);
         assert_eq!(report.issues.len(), 0); // The movie is correctly named
+    }
+
+    #[test]
+    fn render_report_uses_one_separator_style_for_every_path() {
+        let root = PathBuf::from("C:/media").join("library");
+        let command = ValidateCommand::new(root.clone());
+
+        let report = ValidationReport {
+            scanned_files: 1,
+            issues: vec![ValidationIssue {
+                file_path: root
+                    .join("Series")
+                    .join("Elementary")
+                    .join("Season 6")
+                    .join("Elementary - S06E08 Sand Trap.mkv"),
+                issue_type: IssueType::ShowNaming,
+                description: "Show file doesn't match expected naming pattern".to_string(),
+                suggested_path: Some(PathBuf::from("Series").join("Elementary")),
+            }],
+            patterns_used: NamingPatterns::default(),
+            scan_path: root,
+            validation_time: Duration::from_secs(0),
+        };
+
+        let rendered = command.render_report(&report);
+
+        assert!(
+            !rendered.contains('\\'),
+            "report should render every path with forward slashes: {rendered}"
+        );
+        assert!(rendered.contains("C:/media/library/Series/Elementary/Season 6/"));
     }
 }
