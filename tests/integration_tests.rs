@@ -903,3 +903,45 @@ fn test_work_priority_defaults() {
         "Help should show 'episode' as an option"
     );
 }
+
+#[test]
+fn test_rescanning_a_library_does_not_duplicate_jobs() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+
+    fs::write(temp_path.join("video1.mkv"), "").unwrap();
+    fs::write(temp_path.join("video2.mkv"), "").unwrap();
+
+    let count_jobs = || {
+        std::fs::read_dir(temp_path.join("_queue"))
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                (path.extension()? == "job").then_some(path)
+            })
+            .count()
+    };
+
+    let scan = || {
+        let output = Command::new(PLEXIFY_BIN)
+            .args([
+                "scan",
+                temp_path.to_str().unwrap(),
+                "--work-dir",
+                temp_path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("Failed to execute scan command");
+        assert!(output.status.success(), "Scan command failed");
+    };
+
+    scan();
+    assert_eq!(count_jobs(), 2, "first scan should queue both files");
+
+    scan();
+    assert_eq!(
+        count_jobs(),
+        2,
+        "second scan should recognise both jobs as already queued"
+    );
+}

@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+use crate::paths::to_forward_slashes;
+
 /// Represents a media file that needs to be transcoded
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Job {
@@ -66,6 +68,30 @@ pub struct EpisodeMetadata {
 }
 
 impl Job {
+    /// Namespace for the v5 UUIDs that identify jobs by the file they transcode.
+    ///
+    /// A fixed random namespace, generated once for this project. It must never
+    /// change: the ids derived from it are the filenames workers see in the queue.
+    const ID_NAMESPACE: Uuid = Uuid::from_bytes([
+        0x0d, 0x1c, 0x9d, 0x2f, 0x6b, 0x24, 0x4a, 0x5f, 0x9b, 0x3c, 0x7e, 0x51, 0x28, 0xa4, 0x6f,
+        0x13,
+    ]);
+
+    /// Identify a job by the file it transcodes.
+    ///
+    /// The id is derived from the resolved input path rather than generated at
+    /// random, which is what makes a job file findable again: two scans of the
+    /// same library produce the same id for the same file, so the queue can tell
+    /// that the job is already there. Separators are normalised first so that
+    /// `C:/media` and `C:\\media` do not describe two different jobs.
+    pub fn id_for_input(absolute_input_path: &Path) -> String {
+        Uuid::new_v5(
+            &Self::ID_NAMESPACE,
+            to_forward_slashes(absolute_input_path).as_bytes(),
+        )
+        .to_string()
+    }
+
     /// Create a new job for a media file with configuration, converting relative paths to absolute
     pub fn new(
         input_path: PathBuf,
@@ -92,7 +118,7 @@ impl Job {
         };
 
         Self {
-            id: Uuid::new_v4().to_string(),
+            id: Self::id_for_input(&absolute_input_path),
             input_path: absolute_input_path,
             output_path,
             subtitle_path,
@@ -189,17 +215,6 @@ impl Job {
                 }
             }
         })
-    }
-
-    /// Create a job filename based on the source file (for compatibility)
-    #[allow(dead_code)]
-    pub fn job_filename_from_source(&self) -> String {
-        let stem = self
-            .input_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("unknown");
-        format!("{stem}.job")
     }
 
     /// Extract episode metadata from the job's input path for prioritization
@@ -790,5 +805,47 @@ mod tests {
 
         let metadata = job.extract_episode_metadata();
         assert!(metadata.is_none());
+    }
+
+    #[test]
+    fn job_id_is_derived_from_the_input_path() {
+        let media_root = Path::new("/media");
+        let job = |name: &str| {
+            Job::new(
+                PathBuf::from(name),
+                MediaFileType::Mkv,
+                QualitySettings::default(),
+                PostProcessingSettings::default(),
+                media_root,
+            )
+        };
+
+        assert_eq!(
+            job("show.mkv").id,
+            job("show.mkv").id,
+            "the same file must always produce the same job id"
+        );
+        assert_ne!(job("show.mkv").id, job("other.mkv").id);
+    }
+
+    #[test]
+    fn job_id_ignores_separator_style() {
+        let forward = Job::id_for_input(Path::new("C:/media/Series/show.mkv"));
+        let native = Job::id_for_input(&Path::new("C:/media").join("Series").join("show.mkv"));
+
+        assert_eq!(forward, native);
+    }
+
+    #[test]
+    fn job_filename_is_the_id() {
+        let job = Job::new(
+            PathBuf::from("show.mkv"),
+            MediaFileType::Mkv,
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            Path::new("/media"),
+        );
+
+        assert_eq!(job.job_filename(), format!("{}.job", job.id));
     }
 }
