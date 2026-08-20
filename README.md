@@ -98,6 +98,40 @@ plexify clean /path/to/media
 plexify validate /path/to/media
 ```
 
+### The work directory
+
+`scan`, `add`, `work`, and `clean` all take `--work-dir` (short form `-w`), which sets where
+the job queue lives. **It defaults to the current working directory, not the media
+directory.**
+
+```bash
+# Queue is created under /srv/plexify-queue
+plexify scan /path/to/media --work-dir /srv/plexify-queue
+plexify work /path/to/media --work-dir /srv/plexify-queue
+```
+
+Every command that touches the queue must be given the same work directory, otherwise it
+will look at an empty one. Because the default is the current working directory, running
+`plexify scan /media` from two different shells creates two unrelated queues, and a worker
+started from a third directory finds no jobs at all. Pass `--work-dir` explicitly whenever
+more than one command or machine is involved.
+
+`clean` removes the queue directories from the work directory, so it needs the same
+`--work-dir` as the `scan` that created them.
+
+For distributed processing, point every machine's `--work-dir` at the same shared location:
+
+```bash
+# Machine A
+plexify scan /mnt/media --work-dir /mnt/shared/plexify-queue
+
+# Machine B, reading the same queue
+plexify work /mnt/media --work-dir /mnt/shared/plexify-queue --background
+```
+
+Job files record absolute media paths, so each machine must be able to reach the media at
+the same path.
+
 ### Hierarchical Directory Support
 
 Plexify automatically scans through your entire media directory hierarchy, finding media files in any subdirectory structure:
@@ -240,26 +274,29 @@ FFMPEG_CRF=20 plexify scan --preset quality /path/to/media
 1. **Scan**: Create jobs for all .webm and .mkv files with your preferred quality preset
 ```bash
 # Scan with balanced preset (recommended)
-plexify scan --preset balanced /home/user/Videos
+plexify scan --preset balanced /home/user/Videos --work-dir /home/user/plexify-queue
 
 # Or scan with custom settings via environment variables
-FFMPEG_PRESET=medium plexify scan /home/user/Videos
+FFMPEG_PRESET=medium plexify scan /home/user/Videos --work-dir /home/user/plexify-queue
 ```
 
 2. **Work**: Start processing the queue (you can run multiple workers)
 ```bash
 # Terminal 1 - High priority worker
-plexify work /home/user/Videos
+plexify work /home/user/Videos --work-dir /home/user/plexify-queue
 
 # Terminal 2 - Background worker
-plexify work /home/user/Videos --background
+plexify work /home/user/Videos --work-dir /home/user/plexify-queue --background
 ```
+
+Each terminal has its own current working directory, so passing `--work-dir` explicitly is
+what makes both workers share one queue.
 
 3. **Monitor**: Check logs for progress (logs output to stdout)
 
 4. **Clean**: Remove temporary files when done
 ```bash
-plexify clean /home/user/Videos
+plexify clean /home/user/Videos --work-dir /home/user/plexify-queue
 ```
 
 5. **Validate**: Check Plex naming scheme conformity (optional)
@@ -364,17 +401,24 @@ FFMPEG_CRF="18" plexify scan --preset balanced /path/to/media
 
 ## Directory Structure
 
-Plexify creates temporary directories in your media root:
+Plexify keeps its job queue in the **work directory**, which is separate from your media
+directory. See [The work directory](#the-work-directory) for how to choose it.
 
 ```
-/path/to/media/
+/path/to/work/           # --work-dir, defaults to the current working directory
+├── _queue/              # Pending jobs
+├── _in_progress/        # Currently processing
+└── _completed/          # Finished jobs
+
+/path/to/media/          # Untouched except for the transcoded output
 ├── video1.webm
 ├── video1.vtt
-├── video2.mkv
-├── _queue/           # Pending jobs
-├── _in_progress/     # Currently processing
-└── _completed/       # Finished jobs
+└── video2.mkv
 ```
+
+Keeping the queue outside the media tree means your media server never sees Plexify's
+bookkeeping files, and lets several machines share one queue over a network mount while
+each reads media from its own path.
 
 ## FFmpeg Processing Details
 

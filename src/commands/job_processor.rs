@@ -155,18 +155,34 @@ impl<'a> JobProcessor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::fs;
     use tempfile::TempDir;
 
+    /// Clear the encoding environment variables so a test observes documented
+    /// defaults rather than whatever the developer's shell happens to export.
+    /// Only safe inside `#[serial(env)]` tests.
+    fn clear_encoding_env() {
+        std::env::remove_var("FFMPEG_PRESET");
+        std::env::remove_var("FFMPEG_CRF");
+        std::env::remove_var("FFMPEG_AUDIO_BITRATE");
+    }
+
     #[tokio::test]
+    #[serial(env)]
     async fn test_job_processor_config_from_preset() {
+        clear_encoding_env();
+
         let config = JobProcessorConfig::from_preset(Some("quality")).unwrap();
         // Just verify it doesn't panic and creates a config
         assert_eq!(config.quality_settings.ffmpeg_preset, "slow");
     }
 
     #[tokio::test]
+    #[serial(env)]
     async fn test_job_processor_config_from_env() {
+        clear_encoding_env();
+
         let config = JobProcessorConfig::from_preset(None).unwrap();
         // Just verify it doesn't panic and creates a config with defaults
         assert_eq!(config.quality_settings.ffmpeg_preset, "veryfast");

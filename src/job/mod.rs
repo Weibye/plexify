@@ -373,11 +373,17 @@ impl Default for PostProcessingSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::path::PathBuf;
-    use std::sync::Mutex;
 
-    // Mutex to serialize environment variable tests to prevent race conditions
-    static ENV_TEST_MUTEX: Mutex<()> = Mutex::new(());
+    /// Clear the encoding environment variables so a test observes documented
+    /// defaults rather than whatever the developer's shell happens to export.
+    /// Only safe inside `#[serial(env)]` tests.
+    fn clear_encoding_env() {
+        std::env::remove_var("FFMPEG_PRESET");
+        std::env::remove_var("FFMPEG_CRF");
+        std::env::remove_var("FFMPEG_AUDIO_BITRATE");
+    }
 
     #[test]
     fn test_webm_job_creation() {
@@ -419,9 +425,9 @@ mod tests {
     }
 
     #[test]
+    #[serial(env)]
     fn test_quality_settings_from_env() {
-        // Use a mutex to prevent environment variable tests from running concurrently
-        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        clear_encoding_env();
 
         std::env::set_var("FFMPEG_PRESET", "fast");
         std::env::set_var("FFMPEG_CRF", "20");
@@ -432,10 +438,7 @@ mod tests {
         assert_eq!(quality.ffmpeg_crf, "20");
         assert_eq!(quality.ffmpeg_audio_bitrate, "192k");
 
-        // Clean up
-        std::env::remove_var("FFMPEG_PRESET");
-        std::env::remove_var("FFMPEG_CRF");
-        std::env::remove_var("FFMPEG_AUDIO_BITRATE");
+        clear_encoding_env();
     }
 
     #[test]
@@ -553,7 +556,10 @@ mod tests {
     }
 
     #[test]
+    #[serial(env)]
     fn test_quality_settings_from_preset() {
+        clear_encoding_env();
+
         let settings = QualitySettings::from_preset(QualityPreset::Quality);
         assert_eq!(settings.ffmpeg_preset, "slow");
         assert_eq!(settings.ffmpeg_crf, "18");
@@ -561,7 +567,10 @@ mod tests {
     }
 
     #[test]
+    #[serial(env)]
     fn test_quality_settings_from_preset_name() {
+        clear_encoding_env();
+
         let settings = QualitySettings::from_preset_name("balanced").unwrap();
         assert_eq!(settings.ffmpeg_preset, "medium");
         assert_eq!(settings.ffmpeg_crf, "20");
@@ -572,9 +581,9 @@ mod tests {
     }
 
     #[test]
+    #[serial(env)]
     fn test_preset_with_env_override() {
-        // Use a mutex to prevent environment variable tests from running concurrently
-        let _guard = ENV_TEST_MUTEX.lock().unwrap();
+        clear_encoding_env();
 
         // Set environment variables
         std::env::set_var("FFMPEG_PRESET", "custom");
@@ -585,9 +594,7 @@ mod tests {
         assert_eq!(settings.ffmpeg_crf, "25"); // Overridden by env
         assert_eq!(settings.ffmpeg_audio_bitrate, "256k"); // From preset
 
-        // Clean up
-        std::env::remove_var("FFMPEG_PRESET");
-        std::env::remove_var("FFMPEG_CRF");
+        clear_encoding_env();
     }
 
     #[test]

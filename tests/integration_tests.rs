@@ -1,32 +1,22 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::sync::Once;
 use tempfile::TempDir;
 
 use serial_test::serial;
 
-static INIT: Once = Once::new();
-
-/// Build the binary once for all tests
-fn build_plexify() {
-    INIT.call_once(|| {
-        let build_output = Command::new("cargo")
-            .args(["build", "--bin", "plexify"])
-            .output()
-            .expect("Failed to build plexify");
-        assert!(
-            build_output.status.success(),
-            "Failed to build plexify binary"
-        );
-    });
-}
+/// Path to the binary under test.
+///
+/// Cargo builds the binary before running integration tests and supplies its path
+/// at compile time. Tests must not run `cargo build` themselves: the outer
+/// `cargo test` already holds the build lock, so a nested build fails and every
+/// later test fails behind it.
+const PLEXIFY_BIN: &str = env!("CARGO_BIN_EXE_plexify");
 
 /// Test the complete scan -> clean workflow
 #[test]
 #[serial]
 fn test_scan_and_clean_workflow() {
-    build_plexify();
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path();
 
@@ -37,7 +27,7 @@ fn test_scan_and_clean_workflow() {
     fs::write(temp_path.join("video3.webm"), "").unwrap(); // No .vtt file
 
     // Test scan command (use temp_path as both media dir and queue dir)
-    let scan_output = Command::new("./target/debug/plexify")
+    let scan_output = Command::new(PLEXIFY_BIN)
         .args([
             "scan",
             temp_path.to_str().unwrap(),
@@ -89,7 +79,7 @@ fn test_scan_and_clean_workflow() {
     );
 
     // Test clean command
-    let clean_output = Command::new("./target/debug/plexify")
+    let clean_output = Command::new(PLEXIFY_BIN)
         .args([
             "clean",
             temp_path.to_str().unwrap(),
@@ -111,8 +101,7 @@ fn test_scan_and_clean_workflow() {
 #[test]
 #[serial]
 fn test_help_commands() {
-    build_plexify();
-    let help_output = Command::new("./target/debug/plexify")
+    let help_output = Command::new(PLEXIFY_BIN)
         .arg("--help")
         .output()
         .expect("Failed to execute help command");
@@ -142,9 +131,8 @@ fn test_help_commands() {
 #[test]
 #[serial]
 fn test_invalid_paths() {
-    build_plexify();
     // Test scan with non-existent directory
-    let scan_output = Command::new("./target/debug/plexify")
+    let scan_output = Command::new(PLEXIFY_BIN)
         .args(["scan", "/non/existent/path"])
         .output()
         .expect("Failed to execute scan command");
@@ -155,7 +143,7 @@ fn test_invalid_paths() {
     );
 
     // Test work with non-existent directory
-    let work_output = Command::new("./target/debug/plexify")
+    let work_output = Command::new(PLEXIFY_BIN)
         .args(["work", "/non/existent/path"])
         .output()
         .expect("Failed to execute work command");
@@ -166,7 +154,7 @@ fn test_invalid_paths() {
     );
 
     // Test clean with non-existent directory
-    let clean_output = Command::new("./target/debug/plexify")
+    let clean_output = Command::new(PLEXIFY_BIN)
         .args(["clean", "/non/existent/path"])
         .output()
         .expect("Failed to execute clean command");
@@ -181,8 +169,6 @@ fn test_invalid_paths() {
 #[test]
 #[serial]
 fn test_job_files_contain_complete_details() {
-    build_plexify();
-
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path();
 
@@ -206,7 +192,7 @@ fn test_job_files_contain_complete_details() {
     std::env::set_var("FFMPEG_AUDIO_BITRATE", "192k");
 
     // Run scan command (use temp_path as both media dir and queue dir)
-    let scan_output = Command::new("./target/debug/plexify")
+    let scan_output = Command::new(PLEXIFY_BIN)
         .args([
             "scan",
             temp_path.to_str().unwrap(),
@@ -307,8 +293,6 @@ fn test_job_files_contain_complete_details() {
 #[test]
 #[serial]
 fn test_work_folder_workflow() {
-    build_plexify();
-
     let temp_dir = TempDir::new().unwrap();
     let media_path = temp_dir.path().join("media");
     let work_path = temp_dir.path().join("work");
@@ -323,7 +307,7 @@ fn test_work_folder_workflow() {
     std::env::set_var("FFMPEG_PRESET", "ultrafast");
 
     // First, scan to create jobs
-    let scan_output = Command::new("./target/debug/plexify")
+    let scan_output = Command::new(PLEXIFY_BIN)
         .args([
             "scan",
             media_path.to_str().unwrap(),
@@ -375,7 +359,6 @@ fn test_work_folder_workflow() {
 #[test]
 #[serial]
 fn test_add_command_individual_files() {
-    build_plexify();
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path();
 
@@ -389,7 +372,7 @@ fn test_add_command_individual_files() {
     fs::write(&vtt_file, "test vtt content").unwrap();
 
     // Test add command with MKV (no subtitles needed)
-    let add_mkv_output = Command::new("./target/debug/plexify")
+    let add_mkv_output = Command::new(PLEXIFY_BIN)
         .args([
             "add",
             mkv_file.to_str().unwrap(),
@@ -407,7 +390,7 @@ fn test_add_command_individual_files() {
     );
 
     // Test add command with WebM (with subtitles)
-    let add_webm_output = Command::new("./target/debug/plexify")
+    let add_webm_output = Command::new(PLEXIFY_BIN)
         .args([
             "add",
             webm_file.to_str().unwrap(),
@@ -440,7 +423,7 @@ fn test_add_command_individual_files() {
     let webm_no_sub = temp_path.join("nosub.webm");
     fs::write(&webm_no_sub, "webm without sub").unwrap();
 
-    let add_nosub_output = Command::new("./target/debug/plexify")
+    let add_nosub_output = Command::new(PLEXIFY_BIN)
         .args([
             "add",
             webm_no_sub.to_str().unwrap(),
@@ -459,7 +442,7 @@ fn test_add_command_individual_files() {
     let mp4_file = temp_path.join("video.mp4");
     fs::write(&mp4_file, "mp4 content").unwrap();
 
-    let add_mp4_output = Command::new("./target/debug/plexify")
+    let add_mp4_output = Command::new(PLEXIFY_BIN)
         .args([
             "add",
             mp4_file.to_str().unwrap(),
@@ -479,7 +462,6 @@ fn test_add_command_individual_files() {
 #[test]
 #[serial]
 fn test_hierarchical_directory_scanning() {
-    build_plexify();
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path();
 
@@ -500,7 +482,7 @@ fn test_hierarchical_directory_scanning() {
     fs::write(temp_path.join("TV Shows/Show2/episode.mkv"), "").unwrap();
 
     // Run scan command
-    let scan_output = Command::new("./target/debug/plexify")
+    let scan_output = Command::new(PLEXIFY_BIN)
         .args([
             "scan",
             temp_path.to_str().unwrap(),
@@ -553,7 +535,7 @@ fn test_hierarchical_directory_scanning() {
     assert_eq!(job_count, 5);
 
     // Clean up
-    let clean_output = Command::new("./target/debug/plexify")
+    let clean_output = Command::new(PLEXIFY_BIN)
         .args([
             "clean",
             temp_path.to_str().unwrap(),
@@ -597,17 +579,13 @@ fn test_absolute_paths_in_jobs() {
     )
     .unwrap();
 
-    // Get absolute path to binary before changing directory
-    let binary_path = std::env::current_dir()
-        .unwrap()
-        .join("target/debug/plexify");
-
-    // Change to a different directory before scanning
+    // Change to a different directory before scanning. PLEXIFY_BIN is absolute,
+    // so it stays valid across the change.
     let original_dir = std::env::current_dir().unwrap();
     std::env::set_current_dir(&scan_from_path).unwrap();
 
     // Run scan command from the different directory
-    let scan_output = Command::new(&binary_path)
+    let scan_output = Command::new(PLEXIFY_BIN)
         .args([
             "scan",
             media_path.to_str().unwrap(),
@@ -694,7 +672,6 @@ fn test_absolute_paths_in_jobs() {
 #[test]
 #[serial]
 fn test_plexifyignore_integration() {
-    build_plexify();
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path();
 
@@ -714,7 +691,7 @@ fn test_plexifyignore_integration() {
     fs::write(temp_path.join("movie.mkv"), "").unwrap();
 
     // Test scan command with debug logging to see ignore messages
-    let scan_output = Command::new("./target/debug/plexify")
+    let scan_output = Command::new(PLEXIFY_BIN)
         .env("RUST_LOG", "info")
         .args([
             "scan",
@@ -761,7 +738,7 @@ fn test_plexifyignore_integration() {
     assert_eq!(job_files.len(), 2, "Expected 2 job files to be created");
 
     // Test validate command with debug logging
-    let validate_output = Command::new("./target/debug/plexify")
+    let validate_output = Command::new(PLEXIFY_BIN)
         .env("RUST_LOG", "info")
         .args(["validate", temp_path.to_str().unwrap()])
         .output()
@@ -789,7 +766,6 @@ fn test_plexifyignore_integration() {
 #[test]
 #[serial]
 fn test_episode_prioritization_integration() {
-    build_plexify();
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path();
 
@@ -831,7 +807,7 @@ fn test_episode_prioritization_integration() {
     .unwrap();
 
     // First, scan to create jobs
-    let scan_output = Command::new("./target/debug/plexify")
+    let scan_output = Command::new(PLEXIFY_BIN)
         .args([
             "scan",
             temp_path.to_str().unwrap(),
@@ -856,7 +832,7 @@ fn test_episode_prioritization_integration() {
     assert_eq!(job_count, 5, "Should have created 5 job files");
 
     // Test help command mentions the priority option
-    let help_output = Command::new("./target/debug/plexify")
+    let help_output = Command::new(PLEXIFY_BIN)
         .args(["work", "--help"])
         .output()
         .expect("Failed to run help command");
@@ -885,7 +861,6 @@ fn test_episode_prioritization_integration() {
 #[test]
 #[serial]
 fn test_work_priority_defaults() {
-    build_plexify();
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path();
 
@@ -893,7 +868,7 @@ fn test_work_priority_defaults() {
     fs::write(temp_path.join("movie.mkv"), "dummy content").unwrap();
 
     // Scan to create a job
-    let scan_output = Command::new("./target/debug/plexify")
+    let scan_output = Command::new(PLEXIFY_BIN)
         .args([
             "scan",
             temp_path.to_str().unwrap(),
@@ -906,7 +881,7 @@ fn test_work_priority_defaults() {
     assert!(scan_output.status.success(), "Scan command failed");
 
     // Test help to ensure priority parameter is documented
-    let help_output = Command::new("./target/debug/plexify")
+    let help_output = Command::new(PLEXIFY_BIN)
         .args(["work", "--help"])
         .output()
         .expect("Failed to run help command");
