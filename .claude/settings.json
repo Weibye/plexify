@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Read",
+      "Bash(cargo build*)",
+      "Bash(cargo check*)",
+      "Bash(cargo test*)",
+      "Bash(cargo fmt*)",
+      "Bash(cargo clippy*)",
+      "Bash(cargo bench*)",
+      "Bash(cargo tree*)",
+      "Bash(cargo run*)",
+      "Bash(cargo --version)",
+      "Bash(rustc --version)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git show*)",
+      "Bash(git branch*)",
+      "Bash(git ls-files*)",
+      "Bash(git remote -v)",
+      "Bash(gh issue list*)",
+      "Bash(gh issue view*)",
+      "Bash(gh pr list*)",
+      "Bash(gh pr view*)",
+      "Bash(gh pr diff*)",
+      "Bash(gh pr checks*)",
+      "Bash(gh run list*)",
+      "Bash(gh run view*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "shell": "bash",
+            "command": "grep -Eq '\"file_path\":\"[^\"]*\\.rs\"' && cargo fmt --all; true",
+            "statusMessage": "cargo fmt",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}
