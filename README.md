@@ -335,13 +335,19 @@ Movies/Film Name (Year)/Film Name (Year).ext
   does not carry them: `Scrubs - S09E02.avi`.
 
 A series directory may carry a year and a TVDB id — `Breaking Bad (2008) {tvdb-81189}` — and
-both are preserved as they are. Directories are never renamed apart from the season
-component.
+both are preserved as they are. The series directory is never renamed.
 
-A season directory is always `Season NN` or `Specials`. An arc name appended to it —
-`Season 01 - Vox Machina` — is reported for removal: Plex's scanner reads a season
-directory as the word "Season" and a number, and text after that stops it parsing the
-season, which can collapse several seasons into one.
+The season directory is the one part of the path that is *decided* rather than kept. It
+comes from the episode marker in the filename, so:
+
+- A file with no season directory is moved into `Season NN`, created if it does not exist.
+- A file in the wrong season directory moves to the one its marker names.
+- Season zero is `Specials`.
+- An arc name appended to a season directory — `Season 01 - Vox Machina` — is removed. Plex's
+  scanner reads a season directory as the word "Season" and a number, and text after that
+  stops it parsing the season, which can collapse several seasons into one.
+
+A directory nested below the season directory, such as `Season 01/Extras`, stays where it is.
 
 ### Example output
 

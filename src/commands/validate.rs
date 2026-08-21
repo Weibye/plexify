@@ -891,4 +891,45 @@ mod tests {
 
         assert_eq!(paths, sorted, "a report is read top to bottom");
     }
+
+    #[tokio::test]
+    async fn an_episode_with_no_season_directory_is_given_one() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        let series = media_root.join("Series/Loose Show");
+        fs::create_dir_all(&series).unwrap();
+        fs::write(series.join("Loose Show - S02E03 - Wandering.mkv"), "").unwrap();
+
+        let report = ValidateCommand::new(media_root.to_path_buf())
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            only_destination(&report),
+            "Series/Loose Show/Season 02/Loose Show - S02E03 - Wandering.mkv"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_episode_in_the_wrong_season_directory_is_moved_across() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        let season = media_root.join("Series/Misfiled/Season 01");
+        fs::create_dir_all(&season).unwrap();
+        fs::write(season.join("Misfiled - S04E02 - Wrong Home.mkv"), "").unwrap();
+
+        let report = ValidateCommand::new(media_root.to_path_buf())
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            only_destination(&report),
+            "Series/Misfiled/Season 04/Misfiled - S04E02 - Wrong Home.mkv",
+            "the marker in the filename decides, not the directory it sat in"
+        );
+    }
 }

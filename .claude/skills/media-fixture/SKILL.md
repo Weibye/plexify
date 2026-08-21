@@ -41,6 +41,8 @@ Malformed content, one directory per defect, drawn from the cases in issue #51:
 | `Series/Scrubs/Season 9/` | Scene-release naming, dots for spaces, release-group cruft |
 | `Series/Samurai Jack (2001)/Season 3/` | Dotted name plus unpadded season, apostrophe in episode title |
 | `Series/Super Best Friends Play - FFX/` | Quality metadata in parentheses rather than brackets |
+| `Series/Loose Show/` | No season directory at all; the file must be moved into `Season 02` |
+| `Series/Misfiled/Season 01/` | Filed under the wrong season; the `S04E02` marker decides where it goes |
 | `Series/Veronica Mars/Series/Veronica Mars S02E04/Season 01/` | Duplicated tree root — must be reported, never auto-fixed |
 | `Downloads/` | Covered by `.plexifyignore`; must be skipped entirely |
 

@@ -43,6 +43,12 @@ touch_file "Series/Samurai Jack (2001)/Season 3/Samurai.Jack.S03E10.XXXVI.Jack.T
 touch_file "Series/Super Best Friends Play - FFX/Super Best Friends Play - Final Fantasy X - S01E13 (1080p60).webm"
 touch_file "Series/Super Best Friends Play - FFX/Super Best Friends Play - Final Fantasy X - S01E13 (1080p60).vtt"
 
+# --- No season directory at all: must be moved into one -----------------------
+touch_file "Series/Loose Show/Loose Show - S02E03 - Wandering.mkv"
+
+# --- Filed under the wrong season: the marker decides, not the directory ------
+touch_file "Series/Misfiled/Season 01/Misfiled - S04E02 - Wrong Home.mkv"
+
 # --- Duplicated tree root: report, never auto-fix -----------------------------
 touch_file "Series/Veronica Mars/Series/Veronica Mars S02E04/Season 01/Veronica Mars S02E04.mp4"
 

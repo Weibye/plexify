@@ -42,6 +42,8 @@ Movies/The Dark Knight (2008)/The Dark Knight (2008).mkv
 
 Rules that hold across every entry:
 
+- Every episode is in the season directory its marker names, created if it does not exist.
+  Season zero is `Specials`.
 - Season directories are zero-padded to two digits — `Season 6` is wrong, `Season 06` is
   right — and carry nothing else. An arc name appended to one (`Season 01 - Vox Machina`)
   is reported for removal: Plex's scanner reads the word "Season" and a number, and text
@@ -71,9 +73,15 @@ Constraints that are easy to get wrong:
 - **Whatever `render` emits must parse back to the same fields.** Otherwise a fix moves a
   file, and the next run moves it again. `what_is_rendered_parses_back_to_the_same_fields`
   and `every_proposed_destination_is_itself_canonical` guard this; keep both passing.
-- **Rules apply per path component.** A component with no rule is preserved. The series
-  directory is not renamed and a file with no season directory is not moved into one — both
-  deliberately conservative, because this runs against a library nobody can reconstruct.
+- **Rules apply per path component.** A component with no rule is preserved, and the series
+  directory has no rule — it is never renamed, because this runs against a library nobody
+  can reconstruct.
+- **The season directory is derived, not preserved.** It comes from the marker in the
+  filename, so a loose file is moved into `Season NN` and a misfiled one moves across.
+  `Episode::season_directory` is evidence of where the file was found; rendering from it
+  instead of from `episode.season` would quietly undo this. A directory nested *below* the
+  season directory — `Season 01/Extras` — is preserved where it is, which is why the parser
+  looks for the season anywhere in the chain rather than only at the end.
 - The series name comes from the **file**, not its directory; the directory is consulted only
   when the filename carries no name at all. A directory may be an abbreviation of the series,
   or simply wrong, and rewriting files to match it would spread that.
@@ -94,11 +102,15 @@ built by the `media-fixture` skill contains all of them.
 | `Series/Charmed/Season 06/Charmed - S06E17 - Hyde School Reunion.avi` | unchanged — already canonical |
 | `Series/Scrubs/Season 9/Scrubs.S09E02.RETAIL.DVDRip.XviD-REWARD.avi` | `Series/Scrubs/Season 09/Scrubs - S09E02.avi` |
 | `Series/Samurai Jack (2001)/Season 3/Samurai.Jack.S03E10.XXXVI.Jack.The.Monks.and.the.Ancient.Master's.Son.avi` | `Series/Samurai Jack (2001)/Season 03/Samurai Jack - S03E10 - Jack The Monks and the Ancient Master's Son.avi` |
-| `Series/Super Best Friends Play - FFX/... - S01E13 (1080p60).webm` | `... - S01E13 [1080p60].webm` |
+| `Series/Super Best Friends Play - FFX/... - S01E13 (1080p60).webm` | `Series/Super Best Friends Play - FFX/Season 01/... - S01E13 [1080p60].webm` |
 | `Series/Veronica Mars/Series/Veronica Mars S02E04/Season 01/...` | invalid, reported, not rewritten |
 
 Note the third case: unrecoverable scene-release cruft is discarded rather than guessed at.
 Only quality metadata worth keeping (resolution, frame rate) survives.
+
+The fifth case is written differently here than in #51. That issue expected the file to stay
+loose in the series directory, because nothing created season directories at the time; #86
+supersedes it, and the file now moves into `Season 01`.
 
 ## Renaming safely
 
