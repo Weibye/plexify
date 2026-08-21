@@ -42,8 +42,11 @@ Movies/The Dark Knight (2008)/The Dark Knight (2008).mkv
 
 Rules that hold across every entry:
 
-- Season directories are zero-padded to at least two digits — `Season 6` is wrong,
-  `Season 06` is right.
+- Season directories are zero-padded to two digits — `Season 6` is wrong, `Season 06` is
+  right — and carry nothing else. An arc name appended to one (`Season 01 - Vox Machina`)
+  is reported for removal: Plex's scanner reads the word "Season" and a number, and text
+  after that stops it parsing the season, which can collapse several seasons into one. The
+  arc name belongs to the season in metadata. `Specials` keeps its own name.
 - `SxxExx` markers are uppercase.
 - A dash with surrounding spaces separates series name, episode marker, and episode title.
 - Quality metadata goes in square brackets and comes after the title, with no dash before
