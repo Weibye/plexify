@@ -6,10 +6,28 @@ use tracing::{debug, error, info};
 
 use crate::job::{Job, MediaFileType, QualitySettings};
 
-/// Builder for constructing FFmpeg commands with a fluent API
+/// Builder for constructing FFmpeg commands with a fluent API.
+///
+/// FFmpeg's command line is positional: an option applies to the next file that
+/// follows it, and the output file must come last. Options after the output are
+/// silently discarded, which is a quiet way to lose a stream mapping.
+///
+/// So the builder does not append to one list. It keeps each kind of argument in
+/// its own bucket and assembles them in FFmpeg's order at `build` time:
+///
+/// ```text
+/// {global} {input options} -i {input}... {output options} {output}
+/// ```
+///
+/// Callers can then chain in whatever order reads best without changing what
+/// FFmpeg receives.
 #[derive(Debug, Default)]
 pub struct FFmpegCommandBuilder {
-    args: Vec<String>,
+    global: Vec<String>,
+    input_options: Vec<String>,
+    inputs: Vec<String>,
+    output_options: Vec<String>,
+    output: Option<String>,
 }
 
 impl FFmpegCommandBuilder {
@@ -18,28 +36,28 @@ impl FFmpegCommandBuilder {
         Self::default()
     }
 
-    /// Add common FFmpeg flags for media processing
-    /// These flags ensure proper PTS generation and timestamp handling
+    /// Add common FFmpeg flags for media processing.
+    ///
+    /// `+genpts` is a demuxer flag and belongs to the input; `avoid_negative_ts`
+    /// is a muxer option and belongs to the output.
     pub fn with_common_flags(mut self) -> Self {
-        self.args.extend_from_slice(&[
-            "-fflags".to_string(),
-            "+genpts".to_string(),
-            "-avoid_negative_ts".to_string(),
-            "make_zero".to_string(),
-        ]);
+        self.input_options
+            .extend_from_slice(&["-fflags".to_string(), "+genpts".to_string()]);
+        self.output_options
+            .extend_from_slice(&["-avoid_negative_ts".to_string(), "make_zero".to_string()]);
         self
     }
 
     /// Add subtitle duration fixing flag
     pub fn with_subtitle_duration_fix(mut self) -> Self {
-        self.args.push("-fix_sub_duration".to_string());
+        self.input_options.push("-fix_sub_duration".to_string());
         self
     }
 
     /// Add a single input file
     pub fn with_input<P: AsRef<Path>>(mut self, input_path: P) -> Self {
-        self.args.push("-i".to_string());
-        self.args
+        self.inputs.push("-i".to_string());
+        self.inputs
             .push(input_path.as_ref().to_string_lossy().to_string());
         self
     }
@@ -47,9 +65,7 @@ impl FFmpegCommandBuilder {
     /// Add multiple input files
     pub fn with_inputs<P: AsRef<Path>>(mut self, input_paths: &[P]) -> Self {
         for input_path in input_paths {
-            self.args.push("-i".to_string());
-            self.args
-                .push(input_path.as_ref().to_string_lossy().to_string());
+            self = self.with_input(input_path);
         }
         self
     }
@@ -57,15 +73,15 @@ impl FFmpegCommandBuilder {
     /// Add stream mapping arguments
     pub fn with_stream_mapping(mut self, mappings: &[&str]) -> Self {
         for mapping in mappings {
-            self.args.push("-map".to_string());
-            self.args.push(mapping.to_string());
+            self.output_options.push("-map".to_string());
+            self.output_options.push(mapping.to_string());
         }
         self
     }
 
     /// Add video encoding settings using H.264 with configurable preset and CRF
     pub fn with_video_encoding(mut self, quality_settings: &QualitySettings) -> Self {
-        self.args.extend_from_slice(&[
+        self.output_options.extend_from_slice(&[
             "-c:v".to_string(),
             "libx264".to_string(),
             "-preset".to_string(),
@@ -78,7 +94,7 @@ impl FFmpegCommandBuilder {
 
     /// Add audio encoding settings using AAC with configurable bitrate
     pub fn with_audio_encoding(mut self, quality_settings: &QualitySettings) -> Self {
-        self.args.extend_from_slice(&[
+        self.output_options.extend_from_slice(&[
             "-c:a".to_string(),
             "aac".to_string(),
             "-b:a".to_string(),
@@ -89,32 +105,36 @@ impl FFmpegCommandBuilder {
 
     /// Add subtitle encoding settings using mov_text format for MP4 containers
     pub fn with_subtitle_encoding(mut self) -> Self {
-        self.args
+        self.output_options
             .extend_from_slice(&["-c:s".to_string(), "mov_text".to_string()]);
         self
     }
 
     /// Enable output file overwriting
     pub fn with_overwrite(mut self) -> Self {
-        self.args.push("-y".to_string());
+        self.global.push("-y".to_string());
         self
     }
 
     /// Add the output file path
     pub fn with_output<P: AsRef<Path>>(mut self, output_path: P) -> Self {
-        self.args
-            .push(output_path.as_ref().to_string_lossy().to_string());
+        self.output = Some(output_path.as_ref().to_string_lossy().to_string());
         self
     }
 
     /// Build the final command arguments as a vector of strings
     pub fn build(self) -> Vec<String> {
-        self.args
+        let mut args = self.global;
+        args.extend(self.input_options);
+        args.extend(self.inputs);
+        args.extend(self.output_options);
+        args.extend(self.output);
+        args
     }
 
     /// Build the command arguments and apply them to a tokio Command
     pub fn build_command(self, base_command: &mut Command) {
-        base_command.args(&self.args);
+        base_command.args(self.build());
     }
 }
 
@@ -170,17 +190,23 @@ impl FFmpegProcessor {
                         return Err(anyhow!("Required subtitle file not found: {vtt_path:?}"));
                     }
 
+                    // The subtitle is the whole reason the second input is here,
+                    // so it is not optional.
                     ffmpeg_builder
                         .with_inputs(&[&input_path, &vtt_path])
-                        .with_stream_mapping(&["0:v:0", "0:a:0", "1:s:0"])
+                        .with_stream_mapping(&["0:v", "0:a", "1:s"])
                 } else {
                     return Err(anyhow!("WebM job missing subtitle path"));
                 }
             }
+            // Every stream, not the first of each: a second audio track is
+            // usually a commentary or another language, and dropping it while
+            // renaming the source to `.disabled` loses it for good. Subtitles
+            // are optional so a file without any still transcodes.
             MediaFileType::Mkv => ffmpeg_builder
                 .with_subtitle_duration_fix()
                 .with_input(&input_path)
-                .with_stream_mapping(&["0:v:0", "0:a:0", "0:s:0"]),
+                .with_stream_mapping(&["0:v", "0:a", "0:s?"]),
         };
 
         // Create the base command (with optional nice for background mode)
@@ -314,11 +340,11 @@ mod tests {
         assert_eq!(
             args,
             vec![
+                "-y",
                 "-fflags",
                 "+genpts",
                 "-avoid_negative_ts",
-                "make_zero",
-                "-y"
+                "make_zero"
             ]
         );
     }
@@ -343,14 +369,15 @@ mod tests {
             .build();
 
         let expected = vec![
+            "-y",
             "-fflags",
             "+genpts",
-            "-avoid_negative_ts",
-            "make_zero",
             "-i",
             "/path/to/video.webm",
             "-i",
             "/path/to/video.vtt",
+            "-avoid_negative_ts",
+            "make_zero",
             "-map",
             "0:v:0",
             "-map",
@@ -369,7 +396,6 @@ mod tests {
             "192k",
             "-c:s",
             "mov_text",
-            "-y",
             "/path/to/output.mp4",
         ];
 
@@ -397,13 +423,14 @@ mod tests {
             .build();
 
         let expected = vec![
+            "-y",
             "-fflags",
             "+genpts",
-            "-avoid_negative_ts",
-            "make_zero",
             "-fix_sub_duration",
             "-i",
             "/path/to/video.mkv",
+            "-avoid_negative_ts",
+            "make_zero",
             "-map",
             "0:v:0",
             "-map",
@@ -422,13 +449,238 @@ mod tests {
             "128k",
             "-c:s",
             "mov_text",
-            "-y",
             "/path/to/output.mp4",
         ];
 
         assert_eq!(args, expected);
     }
 
+    /// The bug this design exists to prevent.
+    ///
+    /// `process_job` used to call `with_output` before the input and the stream
+    /// mappings, and FFmpeg applies options to the file that follows them - so
+    /// every `-map` landed after the output and was silently discarded. The unit
+    /// tests above did not catch it because they happened to call the builder in
+    /// a different order than the code did.
+    #[test]
+    fn the_output_comes_last_whatever_order_the_caller_used() {
+        let quality = QualitySettings::default();
+
+        let args = FFmpegCommandBuilder::new()
+            .with_common_flags()
+            .with_video_encoding(&quality)
+            .with_subtitle_encoding()
+            .with_overwrite()
+            .with_output("/path/to/output.mp4")
+            .with_subtitle_duration_fix()
+            .with_input("/path/to/video.mkv")
+            .with_stream_mapping(&["0:v", "0:a", "0:s?"])
+            .build();
+
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("/path/to/output.mp4"),
+            "the output path must be the final argument: {args:?}"
+        );
+
+        let position = |needle: &str| args.iter().position(|arg| arg == needle).unwrap();
+        assert!(
+            position("-i") < position("-map"),
+            "inputs must precede the mappings that refer to them: {args:?}"
+        );
+        assert!(
+            position("-fix_sub_duration") < position("-i"),
+            "an input option must precede the input it applies to: {args:?}"
+        );
+        assert_eq!(
+            args.iter().filter(|arg| *arg == "-map").count(),
+            3,
+            "every mapping survives: {args:?}"
+        );
+    }
+
+    #[test]
+    fn maps_every_stream_rather_than_the_first_of_each() {
+        let args = FFmpegCommandBuilder::new()
+            .with_input("/in.mkv")
+            .with_stream_mapping(&["0:v", "0:a", "0:s?"])
+            .with_output("/out.mp4")
+            .build();
+
+        let mappings: Vec<&String> = args
+            .iter()
+            .skip_while(|arg| *arg != "-map")
+            .filter(|arg| !arg.starts_with('-'))
+            .collect();
+
+        assert_eq!(
+            mappings,
+            vec!["0:v", "0:a", "0:s?", "/out.mp4"],
+            "audio and subtitles are mapped as groups, and subtitles optionally"
+        );
+    }
+
+    /// Whether a real FFmpeg is available to exercise the transcoding path.
+    ///
+    /// The tests below are the only ones that prove what FFmpeg does with the
+    /// arguments we build, so a developer without FFmpeg installed skips them
+    /// rather than failing - but **CI must actually run them**. A skipped test
+    /// and a passing one are indistinguishable in the log, so if these quietly
+    /// stopped running nobody would find out until a library lost a track.
+    fn ffmpeg_present() -> bool {
+        let available = std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+
+        if !available {
+            assert!(
+                std::env::var("CI").is_err(),
+                "FFmpeg must be installed in CI: these tests are the only check that every stream survives a transcode, and skipping them silently would leave that unverified"
+            );
+            eprintln!("skipping: ffmpeg is not on PATH");
+        }
+
+        available
+    }
+
+    /// Codec type and language of every stream in a file, via ffprobe.
+    fn streams_of(path: &Path) -> Vec<String> {
+        let output = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type:stream_tags=language",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(path)
+            .output()
+            .expect("ffprobe should run");
+
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|line| line.trim().trim_end_matches(',').to_string())
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    fn transcode(input: &Path) -> PathBuf {
+        let job = Job::new(
+            input.to_path_buf(),
+            MediaFileType::Mkv,
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            input.parent().expect("input has a parent"),
+        );
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime
+            .block_on(FFmpegProcessor::new(false).process_job(&job, None, None))
+            .expect("transcode should succeed");
+
+        job.output_path
+    }
+
+    #[test]
+    fn keeps_every_audio_track_and_its_language() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("multi.mkv");
+
+        let built = std::process::Command::new("ffmpeg")
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=1:size=160x120:rate=5",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=880:duration=1",
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
+                "-map",
+                "2:a",
+                "-c:v",
+                "libx264",
+                "-c:a",
+                "aac",
+                "-metadata:s:a:0",
+                "language=eng",
+                "-metadata:s:a:1",
+                "language=fra",
+                "-y",
+            ])
+            .arg(&input)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("ffmpeg should run");
+        assert!(built.success(), "could not build the test input");
+
+        let output = transcode(&input);
+
+        assert_eq!(
+            streams_of(&output),
+            vec!["video,und", "audio,eng", "audio,fra"],
+            "a second audio track is usually another language, and the source is              disabled straight afterwards - losing it here loses it for good"
+        );
+    }
+
+    #[test]
+    fn transcodes_a_file_that_has_no_subtitles() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("plain.mkv");
+
+        let built = std::process::Command::new("ffmpeg")
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=1:size=160x120:rate=5",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=duration=1",
+                "-c:v",
+                "libx264",
+                "-c:a",
+                "aac",
+                "-y",
+            ])
+            .arg(&input)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("ffmpeg should run");
+        assert!(built.success(), "could not build the test input");
+
+        let output = transcode(&input);
+
+        assert_eq!(
+            streams_of(&output),
+            vec!["video,und", "audio,und"],
+            "the subtitle mapping is optional, so a file without one still converts"
+        );
+    }
     #[test]
     fn test_ffmpeg_command_builder_build_command() {
         let quality = QualitySettings::default();
