@@ -106,7 +106,19 @@ Consequences to preserve when changing it:
 Paths are matched **relative to the media root, with `/` separators**. On Windows they must
 go through `crate::paths::to_forward_slashes` first, or every component comparison is wrong.
 
-`validate` is read-only: it reports a destination for each file and modifies nothing.
+`validate` reports a destination for each file and changes nothing. `validate --fix` carries
+those renames out, and `src/fix.rs` is the only code in the project that moves a file in the
+library. Its rules exist because it runs against a library nobody can reconstruct:
+
+- Every proposal is rechecked against the disk immediately before it is applied; the report
+  was computed earlier and the library may have moved on.
+- A destination is never overwritten, and two sources are never allowed to claim one
+  destination. Both are refused and reported rather than resolved by guessing.
+- A media file and the files named after it - subtitles, `.nfo` - move as a group or not at
+  all, so a rename cannot silently break the `.vtt` pairing `work` depends on.
+- The plan is written to disk before the first rename, then rewritten with the outcome, so
+  an interrupted run leaves a record of what it intended and how far it got.
+- Directories the run empties are reported, never removed.
 
 ### Cross-cutting
 

@@ -24,8 +24,11 @@
 //! # Clean up temporary files
 //! plexify clean /path/to/media
 //!
-//! # Validate Plex naming scheme conformity
+//! # Report what in the library is not in canonical form
 //! plexify validate /path/to/media
+//!
+//! # Carry out the renames it proposes
+//! plexify validate /path/to/media --fix
 //! ```
 
 use anyhow::Result;
@@ -100,10 +103,13 @@ enum Commands {
         #[arg(long, short = 'w')]
         work_dir: Option<PathBuf>,
     },
-    /// Validate Plex naming scheme conformity
+    /// Report what in the library is not in canonical form
     Validate {
         /// Path to the media directory to validate
         path: PathBuf,
+        /// Carry out the renames instead of only reporting them
+        #[arg(long)]
+        fix: bool,
     },
 }
 
@@ -168,13 +174,38 @@ async fn main() -> Result<()> {
             );
             CleanCommand::new(path, work_root).execute().await
         }
-        Commands::Validate { path } => {
-            info!("Starting validate command for path: {:?}", path);
-            let validate_cmd = ValidateCommand::new(path);
+        Commands::Validate { path, fix } => {
+            info!(
+                "Starting validate command for path: {:?}, fix: {}",
+                path, fix
+            );
+            let validate_cmd = if fix {
+                ValidateCommand::new(path).fixing()
+            } else {
+                ValidateCommand::new(path)
+            };
+
             match validate_cmd.execute().await {
                 Ok(report) => {
                     validate_cmd.print_report(&report);
-                    Ok(())
+
+                    // Everything above is a dry run. Only the flag turns the
+                    // proposals into moves, and the report the user just read is
+                    // exactly what is about to be attempted.
+                    if fix {
+                        let plan = plexify::fix::plan(&report);
+                        let plan_file = plexify::fix::default_plan_file(plan.created_unix_seconds);
+
+                        match plexify::fix::apply(&plan, &plan_file) {
+                            Ok(outcome) => {
+                                validate_cmd.print_fix_outcome(&outcome);
+                                Ok(())
+                            }
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        Ok(())
+                    }
                 }
                 Err(e) => Err(e),
             }

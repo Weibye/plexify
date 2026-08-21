@@ -94,8 +94,11 @@ plexify work /path/to/media --priority episode
 # Clean up temporary files
 plexify clean /path/to/media
 
-# Validate Plex naming scheme conformity
+# Report what in the library is not in canonical form
 plexify validate /path/to/media
+
+# Carry out the renames it proposes
+plexify validate /path/to/media --fix
 ```
 
 ### The work directory
@@ -299,9 +302,10 @@ what makes both workers share one queue.
 plexify clean /home/user/Videos --work-dir /home/user/plexify-queue
 ```
 
-5. **Validate**: Check Plex naming scheme conformity (optional)
+5. **Validate**: See what is not in canonical form, then fix it
 ```bash
 plexify validate /home/user/Videos
+plexify validate /home/user/Videos --fix
 ```
 
 ## Library Naming Validation
@@ -369,6 +373,43 @@ A file is reported one of two ways. A **proposed rename** is a destination the t
 from the file's own name and can act on. **Needing a decision** means the name could not be
 decomposed — a duplicated library root, a missing episode marker, a film with no year — and
 nothing is proposed, because the right answer is not recoverable from the path.
+
+### Carrying the renames out
+
+```bash
+plexify validate /path/to/media --fix
+```
+
+The report prints first and `--fix` then applies exactly what it listed. Only proposed
+renames are acted on; anything needing a decision is left alone.
+
+What it will not do:
+
+- **Overwrite anything.** If a destination is already occupied, that rename is refused and
+  reported.
+- **Merge two files into one name.** If two files canonicalise to the same destination —
+  two season directories differing only by an arc name, say — both are refused.
+- **Separate a file from its subtitles.** A `.vtt`, `.srt` or `.nfo` named after a media
+  file moves with it. If any part of the group is blocked, none of it moves.
+- **Delete anything.** Directories left empty by a run are listed at the end, not removed.
+
+Every run writes a plan file — `plexify-fix-<timestamp>.json` in the current directory —
+before the first rename, and rewrites it afterwards with what actually happened. It records
+every move as a `from`/`to` pair, so an interrupted run leaves a record of how far it got.
+
+```
+🔧 Fix
+──────
+✅ Renamed: 8
+📄 Plan: plexify-fix-1787309398.json
+
+📁 Left empty by this run, and not removed:
+───────────────────────────────────────────
+   Series/Elementary/Season 6
+```
+
+Running `validate` again after a fix proposes nothing: the destinations it produces are
+themselves canonical.
 
 ## Configuration
 
