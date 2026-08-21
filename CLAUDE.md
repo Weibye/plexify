@@ -86,15 +86,27 @@ next to the source. Preserve the write-then-move ordering.
 
 ### 2. Library validation (`validate`)
 
-`NamingPatterns::default()` in `src/commands/validate.rs` is a declarative table of regexes,
-each with a description, an example, and a `ContentType`. Adding a supported naming layout
-means adding a table entry, not writing new matching code.
+`src/naming/` owns what a correct path looks like, and `validate` is a caller. The module
+**parses** a library-relative path into fields and **renders** those fields back into one
+canonical form; a path is correct exactly when rendering its own parse reproduces it. There
+is no table of accepted shapes, and adding one would reintroduce the problem this design
+exists to avoid: a yes/no matcher can reject a path but cannot say what it should have been,
+so a destination ends up patched together from the source string.
 
-The regexes match the path **relative to the media root, with `/` separators**, anchored with
-`^`/`$` and rooted at a top-level content directory (`Series/`, `Anime/`, `Movies/`). On
-Windows, paths must be normalised to forward slashes before matching or every pattern fails.
+Consequences to preserve when changing it:
 
-`validate` is currently read-only: it reports issues and does not modify the library.
+- A destination must always come out of `render`, never out of string surgery on the input.
+- Anything `render` emits must parse back to the same fields, or a fix would move a file
+  twice. There is a test for this; keep it passing.
+- Recovery heuristics may drop what they are confident is noise and may leave a field empty,
+  but must never invent a value. Unrecoverable paths return `Unresolvable` with a reason.
+- Rules apply per path component. The series directory is not renamed, and a file with no
+  season directory is not moved into one.
+
+Paths are matched **relative to the media root, with `/` separators**. On Windows they must
+go through `crate::paths::to_forward_slashes` first, or every component comparison is wrong.
+
+`validate` is read-only: it reports a destination for each file and modifies nothing.
 
 ### Cross-cutting
 

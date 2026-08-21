@@ -1,68 +1,38 @@
 use anyhow::{anyhow, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
 use crate::ignore::IgnoreFilter;
+use crate::naming::{assess, Assessment, LibraryRoot};
 use crate::paths::to_forward_slashes;
 
 /// Media file extensions that should be validated
 const MEDIA_EXTENSIONS: &[&str] = &["mkv", "mp4", "avi", "webm", "mov", "m4v"];
 
-/// Content type for categorizing naming patterns
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum ContentType {
-    Series,
-    Movie,
-}
-
-/// Directory mapping configuration
-const DIRECTORY_MAPPING: &[(&str, ContentType)] = &[
-    ("Anime", ContentType::Series),
-    ("Series", ContentType::Series),
-    ("Movies", ContentType::Movie),
-];
-
-/// Naming scheme patterns for different content types
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NamingPatterns {
-    /// All naming patterns
-    pub patterns: Vec<NamingPattern>,
-}
-
-/// Unified naming pattern with precompiled regex
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NamingPattern {
-    pub description: String,
-    pub pattern: String,
-    pub example: String,
-    pub content_type: ContentType,
-}
-
-/// Validation issue found in a media file
+/// Something the library holds that is not in canonical form.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidationIssue {
-    pub file_path: PathBuf,
-    pub issue_type: IssueType,
-    pub description: String,
-    pub suggested_path: Option<PathBuf>,
+    /// The file as it exists, relative to the media root, with `/` separators.
+    pub path: String,
+    pub kind: IssueKind,
 }
 
-/// Types of naming issues
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum IssueType {
-    ShowNaming,
-    MovieNaming,
-    DirectoryStructure,
-    FileExtension,
-    UnknownContentType,
+/// What is wrong with a file, and what can be done about it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum IssueKind {
+    /// The canonical form of this file differs from where it is now.
+    Rename {
+        /// Where the file belongs, relative to the media root.
+        destination: String,
+    },
+    /// The path could not be decomposed, so no destination can be proposed.
+    NeedsDecision { reason: String },
 }
 
 /// Validation report containing all issues found
@@ -70,107 +40,35 @@ pub enum IssueType {
 pub struct ValidationReport {
     pub scanned_files: usize,
     pub issues: Vec<ValidationIssue>,
-    pub patterns_used: NamingPatterns,
     pub scan_path: PathBuf,
     pub validation_time: Duration,
 }
 
-/// Command to validate Plex naming scheme conformity
+impl ValidationReport {
+    /// Files whose canonical destination differs from where they are.
+    pub fn renames(&self) -> impl Iterator<Item = &ValidationIssue> {
+        self.issues
+            .iter()
+            .filter(|issue| matches!(issue.kind, IssueKind::Rename { .. }))
+    }
+
+    /// Files a person has to resolve.
+    pub fn needing_decision(&self) -> impl Iterator<Item = &ValidationIssue> {
+        self.issues
+            .iter()
+            .filter(|issue| matches!(issue.kind, IssueKind::NeedsDecision { .. }))
+    }
+}
+
+/// Command to validate library naming conformity
 pub struct ValidateCommand {
     media_root: PathBuf,
-    patterns: NamingPatterns,
-    compiled_patterns: Vec<CompiledPattern>,
-}
-
-/// Internal structure for compiled regex patterns
-#[derive(Debug, Clone)]
-struct CompiledPattern {
-    regex: Regex,
-}
-
-impl Default for NamingPatterns {
-    fn default() -> Self {
-        Self {
-            patterns: vec![
-                // Anime patterns (shows)
-                NamingPattern {
-                    description: "Standard Anime format".to_string(),
-                    pattern: r"^Anime/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/[^/]+ - s\d{2}e\d{2} - [^/]+\.\w+$".to_string(),
-                    example: "Anime/Attack on Titan/Season 01/Attack on Titan - s01e01 - To You, in 2000 Years.mkv".to_string(),
-                    content_type: ContentType::Series,
-                },
-                NamingPattern {
-                    description: "Alternative Anime format".to_string(),
-                    pattern: r"^Anime/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/[^/]+ S\d{2}E\d{2} [^/]+\.\w+$".to_string(),
-                    example: "Anime/Attack on Titan/Season 01/Attack on Titan S01E01 To You, in 2000 Years.mkv".to_string(),
-                    content_type: ContentType::Series,
-                },
-                // Series patterns (shows)  
-                NamingPattern {
-                    description: "Standard Series format".to_string(),
-                    pattern: r"^Series/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/[^/]+ - s\d{2}e\d{2} - [^/]+\.\w+$".to_string(),
-                    example: "Series/Breaking Bad/Season 01/Breaking Bad - s01e01 - Pilot.mkv".to_string(),
-                    content_type: ContentType::Series,
-                },
-                NamingPattern {
-                    description: "Alternative Series format".to_string(),
-                    pattern: r"^Series/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/[^/]+ S\d{2}E\d{2} [^/]+\.\w+$".to_string(),
-                    example: "Series/Breaking Bad (2008) {tvdb-296861}/Season 01/Breaking Bad S01E01 Pilot.mkv".to_string(),
-                    content_type: ContentType::Series,
-                },
-                NamingPattern {
-                    description: "Simple Series format".to_string(),
-                    pattern: r"^Series/[^/]+(?:\s*\{tvdb-\d+\})?/Season \d{2}(?:\s*-[^/]*)*/S\d{2}E\d{2} - [^/]+\.\w+$".to_string(),
-                    example: "Series/Breaking Bad/Season 01/S01E01 - Pilot.mkv".to_string(),
-                    content_type: ContentType::Series,
-                },
-                // Movie patterns
-                NamingPattern {
-                    description: "Standard Movie format".to_string(),
-                    pattern: r"^Movies/[^/]+ \(\d{4}\)/[^/]+ \(\d{4}\)\.\w+$".to_string(),
-                    example: "Movies/The Dark Knight (2008)/The Dark Knight (2008).mkv".to_string(),
-                    content_type: ContentType::Movie,
-                },
-                NamingPattern {
-                    description: "Collection Movie format".to_string(),
-                    pattern: r"^Movies/[^/]+ Collection/[^/]+ \(\d{4}\)\.\w+$".to_string(),
-                    example: "Movies/Marvel Cinematic Universe Collection/Iron Man (2008).mkv".to_string(),
-                    content_type: ContentType::Movie,
-                },
-            ],
-        }
-    }
 }
 
 impl ValidateCommand {
     /// Create a new validate command
     pub fn new(media_root: PathBuf) -> Self {
-        let patterns = NamingPatterns::default();
-        let compiled_patterns = Self::compile_patterns(&patterns);
-
-        Self {
-            media_root,
-            patterns,
-            compiled_patterns,
-        }
-    }
-
-    /// Compile all regex patterns once for better performance
-    fn compile_patterns(patterns: &NamingPatterns) -> Vec<CompiledPattern> {
-        patterns
-            .patterns
-            .iter()
-            .filter_map(|pattern| match Regex::new(&pattern.pattern) {
-                Ok(regex) => Some(CompiledPattern { regex }),
-                Err(e) => {
-                    debug!(
-                        "Failed to compile regex pattern '{}': {}",
-                        pattern.pattern, e
-                    );
-                    None
-                }
-            })
-            .collect()
+        Self { media_root }
     }
 
     /// Execute the validation command
@@ -302,7 +200,7 @@ impl ValidateCommand {
         let pb = Arc::new(validate_pb);
 
         // Process files in parallel using rayon
-        let issues: Vec<ValidationIssue> = media_files
+        let mut issues: Vec<ValidationIssue> = media_files
             .par_iter()
             .filter_map(|path| {
                 let relative_path = match path.strip_prefix(media_root.as_ref()) {
@@ -310,11 +208,15 @@ impl ValidateCommand {
                     Err(_) => return None,
                 };
 
-                let result = self.validate_file_path(&self.compiled_patterns, relative_path, path);
+                let result = self.assess_file(relative_path);
                 pb.inc(1);
                 result
             })
             .collect();
+
+        // Rayon returns work in whatever order it finished; a report is read
+        // top to bottom, so order it the way the library is laid out.
+        issues.sort_by(|left, right| left.path.cmp(&right.path));
 
         pb.finish_and_clear();
 
@@ -323,7 +225,6 @@ impl ValidateCommand {
         let report = ValidationReport {
             scanned_files: media_files.len(),
             issues,
-            patterns_used: self.patterns.clone(),
             scan_path: self.media_root.clone(),
             validation_time,
         };
@@ -338,97 +239,23 @@ impl ValidateCommand {
         Ok(report)
     }
 
-    /// Validate a single file path against the precompiled patterns
-    fn validate_file_path(
-        &self,
-        compiled_patterns: &[CompiledPattern],
-        relative_path: &Path,
-        full_path: &Path,
-    ) -> Option<ValidationIssue> {
-        let path_str = to_forward_slashes(relative_path);
+    /// Assess a single file against the canonical naming form.
+    fn assess_file(&self, relative_path: &std::path::Path) -> Option<ValidationIssue> {
+        let path = to_forward_slashes(relative_path);
 
-        // Try all compiled patterns (much faster than recompiling regex each time)
-        for pattern in compiled_patterns.iter() {
-            if pattern.regex.is_match(&path_str) {
-                return None; // Valid
-            }
+        match assess(relative_path) {
+            Assessment::Canonical => None,
+            Assessment::Rename { destination } => Some(ValidationIssue {
+                path,
+                kind: IssueKind::Rename { destination },
+            }),
+            Assessment::Unresolvable(reason) => Some(ValidationIssue {
+                path,
+                kind: IssueKind::NeedsDecision {
+                    reason: reason.reason(),
+                },
+            }),
         }
-
-        // If we reach here, the file doesn't match any pattern
-        // Determine the expected content type based on directory
-        let issue_type = self.determine_issue_type(&path_str);
-
-        let description = match issue_type {
-            IssueType::ShowNaming => "Show file doesn't match expected naming pattern".to_string(),
-            IssueType::MovieNaming => {
-                "Movie file doesn't match expected naming pattern".to_string()
-            }
-            IssueType::DirectoryStructure => {
-                format!(
-                    "File is not in a recognized directory structure ({})",
-                    DIRECTORY_MAPPING
-                        .iter()
-                        .map(|(dir, _)| *dir)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            }
-            _ => "Unknown naming issue".to_string(),
-        };
-
-        Some(ValidationIssue {
-            file_path: full_path.to_path_buf(),
-            issue_type: issue_type.clone(),
-            description,
-            suggested_path: self.suggest_path(&path_str, &issue_type),
-        })
-    }
-
-    /// Determine issue type based on directory structure
-    fn determine_issue_type(&self, path_str: &str) -> IssueType {
-        for (dir_name, content_type) in DIRECTORY_MAPPING {
-            if path_str.starts_with(&format!("{}/", dir_name)) {
-                return match content_type {
-                    ContentType::Series => IssueType::ShowNaming,
-                    ContentType::Movie => IssueType::MovieNaming,
-                };
-            }
-        }
-        IssueType::DirectoryStructure
-    }
-
-    /// Suggest a corrected path for a file
-    fn suggest_path(&self, path_str: &str, issue_type: &IssueType) -> Option<PathBuf> {
-        // This is a simplified suggestion system
-        // In a full implementation, this would be more sophisticated
-        if let IssueType::DirectoryStructure = issue_type {
-            // If it's not in Movies/ or TV Shows/, suggest moving to Movies/
-            if let Some(filename) = Path::new(path_str).file_name() {
-                let filename_str = filename.to_string_lossy();
-                // Try to extract year from filename
-                if let Some(_year_match) = Regex::new(r"\((\d{4})\)")
-                    .ok()
-                    .and_then(|re| re.find(&filename_str))
-                {
-                    let filename_string = filename_str.to_string();
-                    let base_name = filename_string.replace(
-                        &format!(
-                            ".{}",
-                            Path::new(&filename_string)
-                                .extension()
-                                .and_then(|ext| ext.to_str())
-                                .unwrap_or("")
-                        ),
-                        "",
-                    );
-                    return Some(PathBuf::from(format!(
-                        "Movies/{}/{}",
-                        base_name, filename_str
-                    )));
-                }
-            }
-        }
-        None
     }
 
     /// Print the validation report to stdout
@@ -438,22 +265,26 @@ impl ValidateCommand {
 
     /// Render the validation report.
     ///
-    /// Every path is rendered with `/` separators so that reported paths read the
-    /// same way as the patterns listed at the end of the report, which are
-    /// forward-slash by definition.
+    /// Paths are shown relative to the scanned root, which is printed once at the
+    /// top: a rename is two paths that differ in one component, and that
+    /// difference is what the reader is looking for.
     pub fn render_report(&self, report: &ValidationReport) -> String {
         use std::fmt::Write;
         let mut out = String::new();
 
-        let _ = writeln!(out, "\n📊 Plex Naming Scheme Validation Report");
-        let _ = writeln!(out, "═══════════════════════════════════════");
+        let renames: Vec<_> = report.renames().collect();
+        let decisions: Vec<_> = report.needing_decision().collect();
+
+        let _ = writeln!(out, "\n📊 Library Naming Report");
+        let _ = writeln!(out, "═══════════════════════");
         let _ = writeln!(
             out,
             "📂 Scanned directory: {}",
             to_forward_slashes(&report.scan_path)
         );
         let _ = writeln!(out, "📁 Files scanned: {}", report.scanned_files);
-        let _ = writeln!(out, "⚠️  Issues found: {}", report.issues.len());
+        let _ = writeln!(out, "✏️  Renames proposed: {}", renames.len());
+        let _ = writeln!(out, "🤔 Needing a decision: {}", decisions.len());
         let _ = writeln!(
             out,
             "⏱️  Validation time: {:.2}s",
@@ -461,69 +292,53 @@ impl ValidateCommand {
         );
 
         if report.issues.is_empty() {
-            let _ = writeln!(out, "\n✅ All files conform to Plex naming conventions!");
+            let _ = writeln!(out, "\n✅ Every file is already in canonical form.");
             return out;
         }
 
-        let _ = writeln!(out, "\n🔍 Issues Found:");
-        let _ = writeln!(out, "─────────────────");
-
-        let mut issue_counts: HashMap<String, usize> = HashMap::new();
-
-        for issue in &report.issues {
-            let issue_type_str = match issue.issue_type {
-                IssueType::ShowNaming => "Show Naming",
-                IssueType::MovieNaming => "Movie Naming",
-                IssueType::DirectoryStructure => "Directory Structure",
-                IssueType::FileExtension => "File Extension",
-                IssueType::UnknownContentType => "Unknown Content Type",
-            };
-
-            *issue_counts.entry(issue_type_str.to_string()).or_insert(0) += 1;
-
-            let _ = writeln!(out, "\n❌ {}", to_forward_slashes(&issue.file_path));
-            let _ = writeln!(out, "   Issue: {}", issue.description);
-
-            if let Some(suggested) = &issue.suggested_path {
-                let _ = writeln!(out, "   Suggested: {}", to_forward_slashes(suggested));
+        if !renames.is_empty() {
+            let _ = writeln!(out, "\n✏️  Proposed renames:");
+            let _ = writeln!(out, "─────────────────────");
+            for issue in &renames {
+                if let IssueKind::Rename { destination } = &issue.kind {
+                    let _ = writeln!(out, "\n  {}", issue.path);
+                    let _ = writeln!(out, "→ {destination}");
+                }
             }
         }
 
-        let _ = writeln!(out, "\n📈 Issue Summary:");
-        let _ = writeln!(out, "─────────────────");
-        for (issue_type, count) in issue_counts {
-            let _ = writeln!(out, "• {}: {} files", issue_type, count);
-        }
-
-        let _ = writeln!(out, "\n💡 Supported Patterns:");
-        let _ = writeln!(out, "─────────────────────");
-
-        let show_patterns: Vec<_> = report
-            .patterns_used
-            .patterns
-            .iter()
-            .filter(|p| p.content_type == ContentType::Series)
-            .collect();
-        let movie_patterns: Vec<_> = report
-            .patterns_used
-            .patterns
-            .iter()
-            .filter(|p| p.content_type == ContentType::Movie)
-            .collect();
-
-        if !show_patterns.is_empty() {
-            let _ = writeln!(out, "📺 Shows:");
-            for pattern in show_patterns {
-                let _ = writeln!(out, "   • {}", pattern.example);
+        if !decisions.is_empty() {
+            let _ = writeln!(out, "\n🤔 Needing a decision:");
+            let _ = writeln!(out, "──────────────────────");
+            for issue in &decisions {
+                if let IssueKind::NeedsDecision { reason } = &issue.kind {
+                    let _ = writeln!(out, "\n  {}", issue.path);
+                    let _ = writeln!(out, "  {reason}");
+                }
             }
         }
 
-        if !movie_patterns.is_empty() {
-            let _ = writeln!(out, "\n🎬 Movies:");
-            for pattern in movie_patterns {
-                let _ = writeln!(out, "   • {}", pattern.example);
+        let _ = writeln!(out, "\n💡 Canonical form:");
+        let _ = writeln!(out, "──────────────────");
+        for root in LibraryRoot::all() {
+            if root.is_episodic() {
+                let _ = writeln!(
+                    out,
+                    "   {}/Show Name/Season NN/Show Name - SNNENN - Episode Title [quality].ext",
+                    root.as_str()
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "   {}/Film Name (Year)/Film Name (Year).ext",
+                    root.as_str()
+                );
             }
         }
+        let _ = writeln!(
+            out,
+            "\n   Nothing has been changed on disk; this report is a dry run."
+        );
 
         out
     }
@@ -534,6 +349,17 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// The single destination a report proposes, for tests that create one file.
+    fn only_destination(report: &ValidationReport) -> String {
+        match report.issues.as_slice() {
+            [ValidationIssue {
+                kind: IssueKind::Rename { destination },
+                ..
+            }] => destination.clone(),
+            other => panic!("expected exactly one proposed rename, got {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn test_validate_empty_directory() {
@@ -557,7 +383,7 @@ mod tests {
         // Create correctly named TV show (using Series instead of TV Shows)
         let tv_path = media_root.join("Series/Breaking Bad/Season 01");
         fs::create_dir_all(&tv_path).unwrap();
-        fs::write(tv_path.join("Breaking Bad - s01e01 - Pilot.mkv"), "").unwrap();
+        fs::write(tv_path.join("Breaking Bad - S01E01 - Pilot.mkv"), "").unwrap();
 
         let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
         let result = validate_cmd.execute().await;
@@ -577,7 +403,7 @@ mod tests {
         let anime_path = media_root.join("Anime/Attack on Titan/Season 01");
         fs::create_dir_all(&anime_path).unwrap();
         fs::write(
-            anime_path.join("Attack on Titan - s01e01 - To You, in 2000 Years.mkv"),
+            anime_path.join("Attack on Titan - S01E01 - To You, in 2000 Years.mkv"),
             "",
         )
         .unwrap();
@@ -733,21 +559,10 @@ mod tests {
         let report = result.unwrap();
         assert_eq!(report.scanned_files, 1);
 
-        // Print debug info to understand what's happening
-        for issue in &report.issues {
-            println!(
-                "Issue: {} - {}",
-                issue.file_path.display(),
-                issue.description
-            );
-        }
-
-        // Now this should pass - TVDB id in series name should be valid
         assert_eq!(
-            report.issues.len(),
-            0,
-            "TVDB id in series name should be valid, but found {} issues",
-            report.issues.len()
+            only_destination(&report),
+            "Series/Critical Role (2015) {tvdb-296861}/Season 01/Critical Role - S01E01 - Arrival at Kraghammer.mp4",
+            "the tvdb id and the year on the directory are kept as they are"
         );
     }
 
@@ -773,21 +588,10 @@ mod tests {
         let report = result.unwrap();
         assert_eq!(report.scanned_files, 1);
 
-        // Print debug info
-        for issue in &report.issues {
-            println!(
-                "Complex case issue: {} - {}",
-                issue.file_path.display(),
-                issue.description
-            );
-        }
-
-        // This should now pass with updated patterns
         assert_eq!(
-            report.issues.len(),
-            0,
-            "Complex TVDB case should be valid, but found {} issues",
-            report.issues.len()
+            only_destination(&report),
+            "Series/Critical Role (2015) {tvdb-296861}/Season 01 - Vox Machina/Critical Role - S01E01 - Arrival at Kraghammer [1080p30].mp4",
+            "the season arc name survives; the dash before the quality bracket does not"
         );
     }
 
@@ -811,7 +615,11 @@ mod tests {
         assert!(result.is_ok());
         let report = result.unwrap();
         assert_eq!(report.scanned_files, 1);
-        assert_eq!(report.issues.len(), 0, "Anime with TVDB id should be valid");
+        assert_eq!(
+            only_destination(&report),
+            "Anime/Attack on Titan {tvdb-123456}/Season 01/Attack on Titan - S01E01 - To You in 2000 Years.mkv",
+            "an anime directory carrying a tvdb id is left alone"
+        );
     }
 
     #[tokio::test]
@@ -856,23 +664,29 @@ mod tests {
     }
 
     #[test]
-    fn render_report_uses_one_separator_style_for_every_path() {
+    fn render_report_shows_the_destination_next_to_the_current_path() {
         let root = PathBuf::from("C:/media").join("library");
         let command = ValidateCommand::new(root.clone());
 
         let report = ValidationReport {
-            scanned_files: 1,
-            issues: vec![ValidationIssue {
-                file_path: root
-                    .join("Series")
-                    .join("Elementary")
-                    .join("Season 6")
-                    .join("Elementary - S06E08 Sand Trap.mkv"),
-                issue_type: IssueType::ShowNaming,
-                description: "Show file doesn't match expected naming pattern".to_string(),
-                suggested_path: Some(PathBuf::from("Series").join("Elementary")),
-            }],
-            patterns_used: NamingPatterns::default(),
+            scanned_files: 2,
+            issues: vec![
+                ValidationIssue {
+                    path: "Series/Elementary/Season 6/Elementary - S06E08 Sand Trap.mkv"
+                        .to_string(),
+                    kind: IssueKind::Rename {
+                        destination:
+                            "Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap.mkv"
+                                .to_string(),
+                    },
+                },
+                ValidationIssue {
+                    path: "Series/Veronica Mars/Series/Veronica Mars S02E04.mp4".to_string(),
+                    kind: IssueKind::NeedsDecision {
+                        reason: "'Series' appears twice in this path".to_string(),
+                    },
+                },
+            ],
             scan_path: root,
             validation_time: Duration::from_secs(0),
         };
@@ -883,6 +697,99 @@ mod tests {
             !rendered.contains('\\'),
             "report should render every path with forward slashes: {rendered}"
         );
-        assert!(rendered.contains("C:/media/library/Series/Elementary/Season 6/"));
+        assert!(rendered.contains("C:/media/library"));
+        assert!(rendered.contains("Renames proposed: 1"));
+        assert!(rendered.contains("Needing a decision: 1"));
+        assert!(
+            rendered.contains("Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap.mkv"),
+            "the destination belongs in the report: {rendered}"
+        );
+        assert!(rendered.contains("'Series' appears twice in this path"));
+    }
+
+    #[test]
+    fn a_clean_library_says_so() {
+        let root = PathBuf::from("C:/media");
+        let command = ValidateCommand::new(root.clone());
+
+        let report = ValidationReport {
+            scanned_files: 12,
+            issues: Vec::new(),
+            scan_path: root,
+            validation_time: Duration::from_secs(0),
+        };
+
+        assert!(command
+            .render_report(&report)
+            .contains("Every file is already in canonical form."));
+    }
+
+    #[tokio::test]
+    async fn a_lowercase_episode_marker_is_reported_rather_than_accepted() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        let season = media_root.join("Series/Breaking Bad/Season 01");
+        fs::create_dir_all(&season).unwrap();
+        fs::write(season.join("Breaking Bad - s01e01 - Pilot.mkv"), "").unwrap();
+
+        let report = ValidateCommand::new(media_root.to_path_buf())
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            only_destination(&report),
+            "Series/Breaking Bad/Season 01/Breaking Bad - S01E01 - Pilot.mkv"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_duplicated_library_root_is_left_for_a_person_to_resolve() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        let nested = media_root.join("Series/Veronica Mars/Series/Veronica Mars S02E04/Season 01");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("Veronica Mars S02E04.mp4"), "").unwrap();
+
+        let report = ValidateCommand::new(media_root.to_path_buf())
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report.renames().count(),
+            0,
+            "no destination may be proposed"
+        );
+        assert_eq!(report.needing_decision().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn reported_issues_are_ordered_by_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        for name in ["Zulu", "Alpha", "Mike"] {
+            let season = media_root.join(format!("Series/{name}/Season 1"));
+            fs::create_dir_all(&season).unwrap();
+            fs::write(season.join(format!("{name}.S01E01.Pilot.mkv")), "").unwrap();
+        }
+
+        let report = ValidateCommand::new(media_root.to_path_buf())
+            .execute()
+            .await
+            .unwrap();
+
+        let paths: Vec<&str> = report
+            .issues
+            .iter()
+            .map(|issue| issue.path.as_str())
+            .collect();
+        let mut sorted = paths.clone();
+        sorted.sort();
+
+        assert_eq!(paths, sorted, "a report is read top to bottom");
     }
 }

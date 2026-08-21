@@ -304,57 +304,66 @@ plexify clean /home/user/Videos --work-dir /home/user/plexify-queue
 plexify validate /home/user/Videos
 ```
 
-## Plex Naming Scheme Validation
+## Library Naming Validation
 
-The `validate` command checks your media files against Plex naming conventions and generates a detailed report:
+The `validate` command reads your library and reports what is not in canonical form. It
+changes nothing on disk.
 
 ```bash
 plexify validate /path/to/media
 ```
 
-### Supported Naming Patterns
+### The canonical form
 
-**TV Series:**
-- `Series/Show Name/Season NN/Show Name - sNNeNN - Episode Name.ext`
-- `Series/Show Name/Season NN/Show Name SNNeNN Episode Name.ext`  
-- `Series/Show Name/Season NN/SNNeNN - Episode Name.ext`
-- `Series/Show Name {tvdb-XXXXXX}/Season NN/Show Name SNNeNN Episode Name.ext` (with TVDB id)
-- `Series/Show Name {tvdb-XXXXXX}/Season NN - Arc Name/Show Name - SNNeNN - Episode Name.ext` (with extended season name)
-
-**Anime:**
-- `Anime/Show Name/Season NN/Show Name - sNNeNN - Episode Name.ext`
-- `Anime/Show Name/Season NN/Show Name SNNeNN Episode Name.ext`
-- `Anime/Show Name {tvdb-XXXXXX}/Season NN/Show Name SNNeNN Episode Name.ext` (with TVDB id)
-
-**Movies:**
-- `Movies/Movie Name (Year)/Movie Name (Year).ext`
-- `Movies/Collection Name/Movie Name (Year).ext`
-
-### Example Output
+Every file in the library is driven toward one shape:
 
 ```
-📊 Plex Naming Scheme Validation Report
-═══════════════════════════════════════
+Series/Show Name/Season NN/Show Name - SNNENN - Episode Title [quality].ext
+Anime/Show Name/Season NN/Show Name - SNNENN - Episode Title [quality].ext
+Movies/Film Name (Year)/Film Name (Year).ext
+```
+
+- Season directories are zero-padded to two digits: `Season 06`, not `Season 6`.
+- Episode markers are uppercase: `S06E08`, not `s06e08`.
+- A dash with spaces around it separates the show name, the marker, and the title.
+- Quality metadata goes in square brackets, after the title, with no dash before it.
+- The episode title and the quality are both optional, and disappear cleanly when a name
+  does not carry them: `Scrubs - S09E02.avi`.
+
+A series directory may carry a year and a TVDB id — `Breaking Bad (2008) {tvdb-81189}` — and
+a season directory may carry an arc name — `Season 01 - Vox Machina`. Both are preserved as
+they are. Directories are never renamed apart from padding the season number.
+
+### Example output
+
+```
+📊 Library Naming Report
+═══════════════════════
 📂 Scanned directory: /home/user/Videos
 📁 Files scanned: 12
-⚠️  Issues found: 3
+✏️  Renames proposed: 2
+🤔 Needing a decision: 1
 
-🔍 Issues Found:
-─────────────────
+✏️  Proposed renames:
+─────────────────────
 
-❌ /home/user/Videos/random/movie.mkv
-   Issue: File is not in a recognized directory structure (Movies/ or TV Shows/)
+  Series/Elementary/Season 6/Elementary - S06E08 Sand Trap.mkv
+→ Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap.mkv
 
-❌ /home/user/Videos/TV Shows/Show/episode.mkv
-   Issue: TV show file doesn't match expected naming pattern
+  Series/Scrubs/Season 9/Scrubs.S09E02.RETAIL.DVDRip.XviD-REWARD.avi
+→ Series/Scrubs/Season 09/Scrubs - S09E02.avi
 
-📈 Issue Summary:
-─────────────────
-• Directory Structure: 1 files
-• TV Show Naming: 2 files
+🤔 Needing a decision:
+──────────────────────
+
+  Series/Veronica Mars/Series/Veronica Mars S02E04/Season 01/Veronica Mars S02E04.mp4
+  'Series' appears twice in this path; the correct location is ambiguous
 ```
 
-The report helps you identify files that need to be renamed for optimal Plex organization.
+A file is reported one of two ways. A **proposed rename** is a destination the tool derived
+from the file's own name and can act on. **Needing a decision** means the name could not be
+decomposed — a duplicated library root, a missing episode marker, a film with no year — and
+nothing is proposed, because the right answer is not recoverable from the path.
 
 ## Configuration
 
