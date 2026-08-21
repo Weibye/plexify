@@ -10,7 +10,7 @@ use walkdir::WalkDir;
 
 use crate::fix::FixOutcome;
 use crate::ignore::IgnoreFilter;
-use crate::naming::{assess, Assessment, LibraryRoot};
+use crate::naming::{assess, scope_for, Assessment, LibraryRoot, Scope};
 use crate::paths::to_forward_slashes;
 
 /// Media file extensions that should be validated
@@ -41,6 +41,10 @@ pub enum IssueKind {
 pub struct ValidationReport {
     pub scanned_files: usize,
     pub issues: Vec<ValidationIssue>,
+    /// The directory every path in `issues` is relative to.
+    pub library_root: PathBuf,
+    /// The subtree that was actually walked. Differs from the root when a run
+    /// was narrowed to one series or season.
     pub scan_path: PathBuf,
     pub validation_time: Duration,
 }
@@ -63,17 +67,20 @@ impl ValidationReport {
 
 /// Command to validate library naming conformity
 pub struct ValidateCommand {
-    media_root: PathBuf,
+    scope: Scope,
     /// Whether the caller intends to act on the report. Validation itself is
     /// read-only either way; this only decides what the report says it is.
     fixing: bool,
 }
 
 impl ValidateCommand {
-    /// Create a new validate command
-    pub fn new(media_root: PathBuf) -> Self {
+    /// Create a new validate command.
+    ///
+    /// The path may be the library root or any directory inside it; a narrower
+    /// path narrows the run without changing what canonical means.
+    pub fn new(path: PathBuf) -> Self {
         Self {
-            media_root,
+            scope: scope_for(&path),
             fixing: false,
         }
     }
@@ -89,22 +96,34 @@ impl ValidateCommand {
     pub async fn execute(&self) -> Result<ValidationReport> {
         let start_time = Instant::now();
 
-        if !self.media_root.exists() {
+        if !self.scope.scan_path.exists() {
             return Err(anyhow!(
                 "Media directory does not exist: {:?}",
-                self.media_root
+                self.scope.scan_path
             ));
         }
 
-        if !self.media_root.is_dir() {
-            return Err(anyhow!("Path is not a directory: {:?}", self.media_root));
+        if !self.scope.scan_path.is_dir() {
+            return Err(anyhow!(
+                "Path is not a directory: {:?}",
+                self.scope.scan_path
+            ));
         }
 
-        info!("🔍 Validating Plex naming scheme in: {:?}", self.media_root);
+        info!(
+            "🔍 Validating library naming in: {:?}",
+            self.scope.scan_path
+        );
+        if !self.scope.is_whole_library() {
+            info!(
+                "📐 Judging against library root: {:?}",
+                self.scope.library_root
+            );
+        }
         info!("📁 Recursively scanning all subdirectories...");
 
         // Initialize ignore filter
-        let ignore_filter = match IgnoreFilter::new(self.media_root.clone()) {
+        let ignore_filter = match IgnoreFilter::new(self.scope.library_root.clone()) {
             Ok(filter) => Some(filter),
             Err(e) => {
                 warn!("Failed to load .plexifyignore patterns: {}", e);
@@ -130,14 +149,14 @@ impl ValidateCommand {
         scan_pb.set_message("Collecting media files...");
         scan_pb.enable_steady_tick(std::time::Duration::from_millis(120));
 
-        for entry in WalkDir::new(&self.media_root)
+        for entry in WalkDir::new(&self.scope.scan_path)
             .follow_links(false)
             .into_iter()
             .filter_entry(|e| {
                 let path = e.path();
 
                 // Always allow the root directory
-                if path == self.media_root {
+                if path == self.scope.scan_path {
                     return true;
                 }
 
@@ -210,14 +229,14 @@ impl ValidateCommand {
         validate_pb.set_message("files");
 
         // Create shared reference to self for parallel processing
-        let media_root = Arc::new(&self.media_root);
+        let library_root = Arc::new(&self.scope.library_root);
         let pb = Arc::new(validate_pb);
 
         // Process files in parallel using rayon
         let mut issues: Vec<ValidationIssue> = media_files
             .par_iter()
             .filter_map(|path| {
-                let relative_path = match path.strip_prefix(media_root.as_ref()) {
+                let relative_path = match path.strip_prefix(library_root.as_ref()) {
                     Ok(rel_path) => rel_path,
                     Err(_) => return None,
                 };
@@ -239,7 +258,8 @@ impl ValidateCommand {
         let report = ValidationReport {
             scanned_files: media_files.len(),
             issues,
-            scan_path: self.media_root.clone(),
+            library_root: self.scope.library_root.clone(),
+            scan_path: self.scope.scan_path.clone(),
             validation_time,
         };
 
@@ -376,6 +396,15 @@ impl ValidateCommand {
             "📂 Scanned directory: {}",
             to_forward_slashes(&report.scan_path)
         );
+        // Only worth saying when the two differ: a scoped run judges paths
+        // against a root it did not walk, and the reader should know which.
+        if report.scan_path != report.library_root {
+            let _ = writeln!(
+                out,
+                "📐 Library root: {}",
+                to_forward_slashes(&report.library_root)
+            );
+        }
         let _ = writeln!(out, "📁 Files scanned: {}", report.scanned_files);
         let _ = writeln!(out, "✏️  Renames proposed: {}", renames.len());
         let _ = writeln!(out, "🤔 Needing a decision: {}", decisions.len());
@@ -786,6 +815,7 @@ mod tests {
                     },
                 },
             ],
+            library_root: root.clone(),
             scan_path: root,
             validation_time: Duration::from_secs(0),
         };
@@ -814,6 +844,7 @@ mod tests {
         let report = ValidationReport {
             scanned_files: 12,
             issues: Vec::new(),
+            library_root: root.clone(),
             scan_path: root,
             validation_time: Duration::from_secs(0),
         };
@@ -930,6 +961,83 @@ mod tests {
             only_destination(&report),
             "Series/Misfiled/Season 04/Misfiled - S04E02 - Wrong Home.mkv",
             "the marker in the filename decides, not the directory it sat in"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoping_to_one_series_reports_library_relative_paths() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        let season = media_root.join("Series/Elementary/Season 6");
+        fs::create_dir_all(&season).unwrap();
+        fs::write(season.join("Elementary - S06E08 Sand Trap.mkv"), "").unwrap();
+
+        // A second series that must not appear in a scoped run.
+        let other = media_root.join("Series/Firefly/Season 1");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("Firefly - s01e02 - The Train Job.mkv"), "").unwrap();
+
+        let report = ValidateCommand::new(media_root.join("Series/Elementary"))
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(report.scanned_files, 1, "only the scoped series is walked");
+        assert_eq!(
+            only_destination(&report),
+            "Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap.mkv",
+            "paths stay relative to the library root, not the directory scanned"
+        );
+        assert_eq!(report.library_root, media_root);
+        assert_eq!(report.scan_path, media_root.join("Series/Elementary"));
+    }
+
+    #[tokio::test]
+    async fn scoping_to_a_season_directory_works_the_same_way() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        let season = media_root.join("Anime/Cowboy Bebop/Season 1");
+        fs::create_dir_all(&season).unwrap();
+        fs::write(season.join("Cowboy Bebop.S01E05.Ballad.mkv"), "").unwrap();
+
+        let report = ValidateCommand::new(media_root.join("Anime/Cowboy Bebop/Season 1"))
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            only_destination(&report),
+            "Anime/Cowboy Bebop/Season 01/Cowboy Bebop - S01E05 - Ballad.mkv"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scoped_run_still_honours_the_library_root_ignore_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        fs::write(
+            media_root.join(".plexifyignore"),
+            "*.tmp
+Series/Elementary/
+",
+        )
+        .unwrap();
+
+        let season = media_root.join("Series/Elementary/Season 6");
+        fs::create_dir_all(&season).unwrap();
+        fs::write(season.join("Elementary - S06E08 Sand Trap.mkv"), "").unwrap();
+
+        let report = ValidateCommand::new(media_root.join("Series/Elementary"))
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report.scanned_files, 0,
+            "the root said to skip this series; scoping into it must not override that"
         );
     }
 }

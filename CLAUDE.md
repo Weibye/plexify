@@ -114,6 +114,18 @@ Consequences to preserve when changing it:
   across, and season zero renders as `Specials`. `Episode::season_directory` records what
   was found and is not what gets rendered - reading it in `render` would undo this.
 
+**A run can be narrowed without changing what canonical means.** `naming::scope_for` splits
+the path a user gave into a `library_root` (the parent of the outermost `Series`/`Anime`/
+`Movies` component) and a `scan_path` (what to walk). Validation walks the scan path and
+judges every file against the root, because a path starting `Season 06/` names no series and
+would be unresolvable. Two consequences that are easy to break:
+
+- `fix` resolves destinations from `library_root`, never `scan_path`. A destination routinely
+  falls outside the scanned subtree — correcting `Season 6` to `Season 06` moves a file into
+  a sibling directory.
+- `IgnoreFilter` is built from `library_root`, so scoping into a directory cannot override a
+  `.plexifyignore` rule written at the root.
+
 Paths are matched **relative to the media root, with `/` separators**. On Windows they must
 go through `crate::paths::to_forward_slashes` first, or every component comparison is wrong.
 
