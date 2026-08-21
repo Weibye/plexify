@@ -7,7 +7,7 @@ A simple, distributed media transcoding CLI tool that converts .webm and .mkv fi
 ## Features
 
 - **Distributed Processing**: Queue-based system allows multiple workers to process jobs concurrently
-- **Subtitle Support**: Handles external .vtt subtitles for .webm files and embedded subtitles for .mkv files
+- **Subtitle Support**: External .vtt subtitles for .webm files, and every embedded subtitle track for .mkv files
 - **Background Processing**: Run workers in low-priority background mode
 - **Configurable**: Customizable FFmpeg settings via environment variables
 - **Atomic Job Processing**: Race condition-free job claiming for multiple workers
@@ -456,9 +456,13 @@ FFMPEG_CRF="18" plexify scan --preset balanced /path/to/media
 - Output: `video.mp4` with embedded subtitles
 
 ### .mkv Files
-- Uses embedded subtitles from the source file
 - Example: `video.mkv` → `video.mp4`
-- Automatically maps first video, audio, and subtitle streams
+- Every video, audio and subtitle stream is carried across, not just the first of each, so a
+  commentary track or a second language survives the conversion. Stream metadata — language
+  tags, dispositions — comes with them.
+- A file with no subtitle stream converts normally.
+- Bitmap subtitles (PGS from Blu-ray, VobSub from DVD) cannot be stored in MP4 and currently
+  fail the job rather than being dropped silently.
 
 ## Directory Structure
 

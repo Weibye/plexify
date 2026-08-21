@@ -79,6 +79,13 @@ bakes the fully-resolved `QualitySettings` into the job file at scan time. A job
 week transcodes with the settings it was created with; changing `FFMPEG_CRF` afterwards has
 no effect on it. Workers therefore need no shared configuration.
 
+**FFmpeg's command line is positional, so `FFmpegCommandBuilder` assembles it in buckets.**
+An option applies to the next file that follows it, and options after the output path are
+silently discarded. The builder therefore keeps global, input, and output arguments apart and
+joins them in FFmpeg's order at `build` time, so a caller cannot break the command by
+chaining in a different order — which is exactly what happened when `with_output` was called
+before the stream mappings and every `-map` was thrown away.
+
 **Transcoded output is written to the work folder, then moved.** `FFmpegProcessor::process_job`
 encodes to `job.work_folder_output_path(work_folder)` and only then calls
 `move_to_destination`. This keeps a media server from indexing a half-written `.mp4` sitting
