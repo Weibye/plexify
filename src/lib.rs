@@ -3,6 +3,7 @@ pub mod config;
 pub mod ffmpeg;
 pub mod ignore;
 pub mod job;
+pub mod naming;
 pub mod paths;
 pub mod queue;
 pub mod worker;
