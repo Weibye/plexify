@@ -590,8 +590,8 @@ mod tests {
 
         assert_eq!(
             only_destination(&report),
-            "Series/Critical Role (2015) {tvdb-296861}/Season 01 - Vox Machina/Critical Role - S01E01 - Arrival at Kraghammer [1080p30].mp4",
-            "the season arc name survives; the dash before the quality bracket does not"
+            "Series/Critical Role (2015) {tvdb-296861}/Season 01/Critical Role - S01E01 - Arrival at Kraghammer [1080p30].mp4",
+            "the arc name leaves the season directory; the year and tvdb id stay"
         );
     }
 
