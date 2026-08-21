@@ -28,12 +28,6 @@ updates:
     labels:
       - "dependencies"
       - "rust"
-    # Only create PRs for security updates and version updates
-    # Ignore dev dependencies for patch updates to reduce noise
-    ignore:
-      - dependency-name: "*"
-        dependency-type: "development"
-        update-types: ["version-update:semver-patch"]
 
   # Enable version updates for GitHub Actions
   - package-ecosystem: "github-actions"
