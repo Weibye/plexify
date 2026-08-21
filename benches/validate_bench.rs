@@ -1,7 +1,8 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use plexify::commands::validate::ValidateCommand;
 use plexify::ignore::IgnoreFilter;
 use std::fs;
+use std::hint::black_box;
 use tempfile::TempDir;
 use tokio::runtime::Runtime;
 use walkdir::WalkDir;
