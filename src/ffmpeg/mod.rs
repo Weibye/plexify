@@ -522,17 +522,29 @@ mod tests {
 
     /// Whether a real FFmpeg is available to exercise the transcoding path.
     ///
-    /// The tests below are the only ones that prove what FFmpeg actually does
-    /// with the arguments we build, so they are skipped rather than failed when
-    /// it is missing - the argument order tests above still run everywhere.
-    fn ffmpeg_available() -> bool {
-        std::process::Command::new("ffmpeg")
+    /// The tests below are the only ones that prove what FFmpeg does with the
+    /// arguments we build, so a developer without FFmpeg installed skips them
+    /// rather than failing - but **CI must actually run them**. A skipped test
+    /// and a passing one are indistinguishable in the log, so if these quietly
+    /// stopped running nobody would find out until a library lost a track.
+    fn ffmpeg_present() -> bool {
+        let available = std::process::Command::new("ffmpeg")
             .arg("-version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .map(|status| status.success())
-            .unwrap_or(false)
+            .unwrap_or(false);
+
+        if !available {
+            assert!(
+                std::env::var("CI").is_err(),
+                "FFmpeg must be installed in CI: these tests are the only check that every stream survives a transcode, and skipping them silently would leave that unverified"
+            );
+            eprintln!("skipping: ffmpeg is not on PATH");
+        }
+
+        available
     }
 
     /// Codec type and language of every stream in a file, via ffprobe.
@@ -576,8 +588,7 @@ mod tests {
 
     #[test]
     fn keeps_every_audio_track_and_its_language() {
-        if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg is not on PATH");
+        if !ffmpeg_present() {
             return;
         }
 
@@ -632,8 +643,7 @@ mod tests {
 
     #[test]
     fn transcodes_a_file_that_has_no_subtitles() {
-        if !ffmpeg_available() {
-            eprintln!("skipping: ffmpeg is not on PATH");
+        if !ffmpeg_present() {
             return;
         }
 
