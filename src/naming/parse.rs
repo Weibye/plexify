@@ -12,35 +12,27 @@ use regex::Regex;
 
 use super::{Episode, LibraryRoot, MediaName, Movie, SeasonDirectory, Unresolvable};
 
-/// Tokens that describe how a file was produced rather than what it contains.
+/// Tokens that can only describe how a file was produced.
 ///
-/// Matched case-insensitively against whole tokens, so `WEB` here does not
-/// affect a title containing the word "web". Extending the list is the intended
-/// way to teach the parser about a new flavour of scene naming.
+/// A source, codec or container name is never a word an episode is titled with,
+/// so finding one is what identifies a name as a scene release at all.
+///
+/// Matching is case-insensitive and by whole token, which cuts both ways: `web`
+/// does not touch "Cobweb", but it would take the whole word "Web" - which is
+/// why words that double as English live in [`AMBIGUOUS_RELEASE_TOKENS`] instead.
 const RELEASE_TOKENS: &[&str] = &[
-    "retail",
-    "dvdrip",
-    "dvdscr",
-    "bdrip",
-    "brrip",
-    "bluray",
-    "webrip",
+    "dvdrip", "dvdscr", "bdrip", "brrip", "bluray", "webrip", "webdl", "hdtv", "pdtv", "hdrip",
+    "xvid", "divx", "x264", "x265", "h264", "h265", "hevc", "aac", "ac3", "dts", "mp3",
+];
+
+/// Release tokens that are also ordinary words.
+///
+/// "The Web", "Extended Family" and "Proper Villains" are all plausible episode
+/// titles, so these are only dropped from a name that already carried one of the
+/// unmistakable tokens above. In isolation they are treated as part of the title.
+const AMBIGUOUS_RELEASE_TOKENS: &[&str] = &[
     "web",
-    "webdl",
-    "hdtv",
-    "pdtv",
-    "hdrip",
-    "xvid",
-    "divx",
-    "x264",
-    "x265",
-    "h264",
-    "h265",
-    "hevc",
-    "aac",
-    "ac3",
-    "dts",
-    "mp3",
+    "retail",
     "proper",
     "repack",
     "internal",
@@ -218,7 +210,7 @@ fn parse_movie(
 
     let title = clean_name(&strip_release_tokens(&dots_to_spaces(before_year)));
     if title.is_empty() {
-        return Err(Unresolvable::NoSeriesName);
+        return Err(Unresolvable::NoMovieTitle);
     }
 
     Ok(MediaName::Movie(Movie {
@@ -236,7 +228,10 @@ fn parse_title_and_quality(remainder: &str) -> (Option<String>, Option<String>) 
         .find(remainder)
         .map(|found| found.as_str().to_lowercase());
 
-    let without_quality = quality_marker().replace_all(remainder, " ");
+    // Cut the quality out rather than blanking it: a space here would make a
+    // dotted name look spaced, and `dots_to_spaces` would then leave its dots
+    // alone - `Show.S01E01.Pilot.1080p` would keep the dots it needs converted.
+    let without_quality = quality_marker().replace_all(remainder, "");
     let title = clean_name(&strip_release_tokens(&dots_to_spaces(&without_quality)));
 
     (if title.is_empty() { None } else { Some(title) }, quality)
@@ -274,10 +269,13 @@ fn dots_to_spaces(text: &str) -> String {
 
 /// Drop tokens that describe the release rather than the content.
 ///
-/// The release group - the bare capitalised token scene releases end with - is
-/// only dropped when the name also carried a recognised release token. That
-/// keeps a genuine title like `TKO` intact in a name that shows no other sign of
-/// being a scene release.
+/// Three kinds of token go, and each is gated differently:
+///
+/// - An unmistakable one ([`RELEASE_TOKENS`]) always goes.
+/// - One that doubles as a word ([`AMBIGUOUS_RELEASE_TOKENS`]) goes only in a
+///   name that carried an unmistakable one, so "The Web" keeps its title.
+/// - The release group - the shouted token a scene release signs off with - goes
+///   under the same condition, so a genuine title like `TKO` survives.
 fn strip_release_tokens(text: &str) -> String {
     let subtokens: Vec<&str> = text
         .split_whitespace()
@@ -285,16 +283,24 @@ fn strip_release_tokens(text: &str) -> String {
         .filter(|token| !token.is_empty())
         .collect();
 
-    let is_release_token = |token: &str| {
-        RELEASE_TOKENS
+    let matches_any = |token: &str, known: &[&str]| {
+        known
             .iter()
-            .any(|known| token.eq_ignore_ascii_case(known))
+            .any(|candidate| token.eq_ignore_ascii_case(candidate))
     };
-    let looks_like_a_scene_release = subtokens.iter().any(|token| is_release_token(token));
+
+    // One unmistakable token is what makes the rest of the name readable as
+    // release metadata rather than as words.
+    let looks_like_a_scene_release = subtokens
+        .iter()
+        .any(|token| matches_any(token, RELEASE_TOKENS));
 
     let mut kept: Vec<&str> = Vec::new();
     for token in subtokens {
-        if is_release_token(token) {
+        if matches_any(token, RELEASE_TOKENS) {
+            continue;
+        }
+        if looks_like_a_scene_release && matches_any(token, AMBIGUOUS_RELEASE_TOKENS) {
             continue;
         }
         // The release group is the shouted token a scene release signs off with.
@@ -487,6 +493,51 @@ mod tests {
         assert_eq!(
             parse("Series/Show/Season 01/no-extension"),
             Err(Unresolvable::NotAMediaFile)
+        );
+    }
+
+    #[test]
+    fn keeps_title_words_that_double_as_release_tokens() {
+        for (name, expected) in [
+            (
+                "Series/Show/Season 01/Show - S01E01 - The Web.mkv",
+                "The Web",
+            ),
+            (
+                "Series/Show/Season 01/Show - S01E02 - Extended Family.mkv",
+                "Extended Family",
+            ),
+            (
+                "Series/Show/Season 01/Show - S01E03 - Proper Villains.mkv",
+                "Proper Villains",
+            ),
+            (
+                "Series/Show/Season 01/Show - S01E04 - The Limited.mkv",
+                "The Limited",
+            ),
+        ] {
+            assert_eq!(episode(name).title.as_deref(), Some(expected), "for {name}");
+        }
+    }
+
+    #[test]
+    fn drops_those_same_words_from_a_name_that_is_plainly_a_release() {
+        let parsed =
+            episode("Series/Show/Season 01/Show.S01E01.PROPER.EXTENDED.720p.BluRay.x264.mkv");
+
+        assert_eq!(parsed.title, None);
+        assert_eq!(parsed.quality.as_deref(), Some("720p"));
+    }
+
+    #[test]
+    fn a_movie_with_no_title_left_says_so_in_movie_terms() {
+        assert_eq!(
+            parse("Movies/Unsorted/2008.1080p.BluRay.x264.mkv"),
+            Err(Unresolvable::NoMovieTitle)
+        );
+        assert_eq!(
+            Unresolvable::NoMovieTitle.reason(),
+            "no film title left once the year and release metadata are removed"
         );
     }
 }

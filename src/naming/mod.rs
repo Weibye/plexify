@@ -157,6 +157,8 @@ pub enum Unresolvable {
     NoEpisodeMarker,
     /// Neither the filename nor the directory it sits in names the series.
     NoSeriesName,
+    /// A movie file whose name is nothing but a year and release metadata.
+    NoMovieTitle,
     /// A movie file with no release year, which cannot be invented.
     NoReleaseYear,
     /// The path has no filename, or a filename with no extension.
@@ -184,6 +186,9 @@ impl Unresolvable {
             }
             Unresolvable::NoSeriesName => {
                 "neither the file nor its directory names the series".to_string()
+            }
+            Unresolvable::NoMovieTitle => {
+                "no film title left once the year and release metadata are removed".to_string()
             }
             Unresolvable::NoReleaseYear => {
                 "no release year in the name; the year cannot be guessed".to_string()
