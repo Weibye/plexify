@@ -28,7 +28,14 @@ jobs:
       with:
         toolchain: ${{ matrix.rust }}
         components: rustfmt, clippy
-        
+
+    # The transcoding tests are the only check that every stream survives a
+    # conversion, and they skip themselves when FFmpeg is missing. The runner
+    # image does not carry it, so without this they would quietly never run -
+    # which is why they refuse to skip when CI is set.
+    - name: Install FFmpeg
+      run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
     - name: Cache cargo dependencies
       uses: actions/cache@v6
       with:
