@@ -100,8 +100,12 @@ Consequences to preserve when changing it:
   twice. There is a test for this; keep it passing.
 - Recovery heuristics may drop what they are confident is noise and may leave a field empty,
   but must never invent a value. Unrecoverable paths return `Unresolvable` with a reason.
-- Rules apply per path component. The series directory is not renamed, and a file with no
-  season directory is not moved into one.
+- Rules apply per path component, and a component with no rule is preserved. The series
+  directory is not renamed.
+- The season directory is the exception: it is **derived from the episode's own marker**,
+  not preserved. A file with no season directory is moved into one, a misfiled file moves
+  across, and season zero renders as `Specials`. `Episode::season_directory` records what
+  was found and is not what gets rendered - reading it in `render` would undo this.
 
 Paths are matched **relative to the media root, with `/` separators**. On Windows they must
 go through `crate::paths::to_forward_slashes` first, or every component comparison is wrong.

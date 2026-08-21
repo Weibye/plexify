@@ -21,10 +21,13 @@
 //! Rules apply per path component, and a component with no rule is preserved as
 //! it is. The series directory is never renamed here, so a file whose name
 //! disagrees with its directory keeps its own name rather than being pulled
-//! toward a directory that may itself be wrong. A file that sits directly in a
-//! series directory with no season directory stays there. Both are conservative
-//! on purpose: this runs against a library that cannot be reconstructed, and
-//! moving a file between directories is a bigger claim than fixing its name.
+//! toward a directory that may itself be wrong.
+//!
+//! The season directory is the exception, and it is not preserved but derived:
+//! every episode belongs in the season its own marker names, so a file with no
+//! season directory is moved into one and a file in the wrong one is moved
+//! across. The directory is evidence of where a file ended up; the marker is
+//! evidence of what it is, and the marker wins.
 //!
 //! ## When we refuse
 //!
@@ -110,7 +113,16 @@ pub struct Episode {
     /// Directories between the root and the season directory, preserved as they
     /// are. Usually just the series directory. Nothing here renames them.
     pub directories: Vec<String>,
+    /// The season directory as it was found, which is evidence rather than
+    /// instruction: what gets rendered comes from the marker in the filename.
+    /// `Absent` means the file was not in one, and it will be moved into the
+    /// season directory its own marker names.
     pub season_directory: SeasonDirectory,
+    /// Directories between the season directory and the file. Rare - an
+    /// `Extras` folder inside a season - and preserved as they are. Keeping
+    /// them separate is what stops a second season directory being created
+    /// underneath the first.
+    pub nested_directories: Vec<String>,
     /// The series name as the *file* gives it, cleaned of separators. Falls back
     /// to the series directory only when the filename carries no name at all.
     pub series: String,
@@ -286,17 +298,69 @@ mod tests {
         );
     }
 
+    /// The quality metadata moves into brackets, and the file moves into a
+    /// season directory.
+    ///
+    /// Issue #51 wrote this case out with the file staying loose in the series
+    /// directory, because at the time nothing created season directories.
+    /// Issue #86 supersedes that: an episode belongs in the season its marker
+    /// names, and `Season 01` here does not exist yet.
     #[test]
-    fn moves_quality_metadata_into_brackets() {
+    fn moves_quality_metadata_into_brackets_and_the_file_into_its_season() {
         assert_eq!(
             assess(Path::new(
                 "Series/Super Best Friends Play - FFX/Super Best Friends Play - Final Fantasy X - S01E13 (1080p60).webm"
             )),
             Assessment::Rename {
                 destination:
-                    "Series/Super Best Friends Play - FFX/Super Best Friends Play - Final Fantasy X - S01E13 [1080p60].webm"
+                    "Series/Super Best Friends Play - FFX/Season 01/Super Best Friends Play - Final Fantasy X - S01E13 [1080p60].webm"
                         .to_string()
             }
+        );
+    }
+
+    #[test]
+    fn moves_an_episode_out_of_the_wrong_season_directory() {
+        assert_eq!(
+            assess(Path::new(
+                "Series/Elementary/Season 05/Elementary - S06E08 - Sand Trap.mkv"
+            )),
+            Assessment::Rename {
+                destination: "Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap.mkv"
+                    .to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn corrects_the_season_directory_without_nesting_a_second_one() {
+        assert_eq!(
+            assess(Path::new(
+                "Series/Elementary/Season 6/Extras/Elementary - S06E08 - Sand Trap.mkv"
+            )),
+            Assessment::Rename {
+                destination:
+                    "Series/Elementary/Season 06/Extras/Elementary - S06E08 - Sand Trap.mkv"
+                        .to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn files_a_season_zero_episode_under_specials() {
+        assert_eq!(
+            assess(Path::new(
+                "Series/Firefly/Season 00/Firefly - S00E01 - Making Of.mkv"
+            )),
+            Assessment::Rename {
+                destination: "Series/Firefly/Specials/Firefly - S00E01 - Making Of.mkv".to_string()
+            }
+        );
+        assert_eq!(
+            assess(Path::new(
+                "Series/Firefly/Specials/Firefly - S00E01 - Making Of.mkv"
+            )),
+            Assessment::Canonical
         );
     }
 
@@ -386,6 +450,8 @@ mod tests {
             "Series/Scrubs/Season 9/Scrubs.S09E02.RETAIL.DVDRip.XviD-REWARD.avi",
             "Series/Samurai Jack (2001)/Season 3/Samurai.Jack.S03E10.XXXVI.Jack.The.Monks.avi",
             "Series/Super Best Friends Play - FFX/Super Best Friends Play - S01E13 (1080p60).webm",
+            "Series/Some Show/Some Show - S02E03 - Loose Episode.mkv",
+            "Series/Some Show/Season 01/Extras/Some Show - S01E02 - Behind It.mkv",
             "Series/Breaking Bad {tvdb-81189}/Season 01/Breaking Bad - s01e01 - Pilot.mkv",
             "Anime/Cowboy Bebop/Season 1/Cowboy Bebop.S01E05.Ballad.of.Fallen.Angels.mkv",
             "Movies/The Dark Knight (2008)/The Dark Knight (2008).mkv",

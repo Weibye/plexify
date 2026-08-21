@@ -13,7 +13,7 @@
 //! parsed again to decide whether a file is already correct, so anything it
 //! emits has to be something the parser reads back unchanged.
 
-use super::{Episode, MediaName, Movie, SeasonDirectory};
+use super::{Episode, MediaName, Movie};
 
 /// Render a parsed name into its canonical path, relative to the media root.
 pub fn render(name: &MediaName) -> String {
@@ -27,18 +27,17 @@ fn render_episode(episode: &Episode) -> String {
     let mut components = vec![episode.root.as_str().to_string()];
     components.extend(episode.directories.iter().cloned());
 
-    match &episode.season_directory {
-        // An arc name parsed off the directory is not rendered back. Plex's
-        // scanner reads a season directory as the word "Season" and a number;
-        // anything appended stops it parsing and can collapse two seasons into
-        // one. The name is not lost - it belongs to the season in metadata, and
-        // the proposed rename shows what is being dropped.
-        SeasonDirectory::Numbered { number, .. } => {
-            components.push(format!("Season {number:02}"));
-        }
-        SeasonDirectory::Specials => components.push("Specials".to_string()),
-        SeasonDirectory::Absent => {}
-    }
+    // The season directory comes from the episode's own marker, not from the
+    // directory it happened to be in. That is what moves a loose file into a
+    // season directory and a misfiled one across - and it is why the parsed
+    // `season_directory` is not consulted here.
+    //
+    // An arc name is dropped along the way. Plex's scanner reads a season
+    // directory as the word "Season" and a number; anything appended stops it
+    // parsing and can collapse two seasons into one. What the arc named belongs
+    // to the season in metadata, and the proposed rename shows it going.
+    components.push(season_directory_for(episode.season));
+    components.extend(episode.nested_directories.iter().cloned());
 
     let mut filename = format!(
         "{} - S{:02}E{:02}",
@@ -58,6 +57,18 @@ fn render_episode(episode: &Episode) -> String {
     components.join("/")
 }
 
+/// The directory an episode of this season belongs in.
+///
+/// Season zero is `Specials` rather than `Season 00`. Plex reads both, and this
+/// is the one a person reads at a glance.
+fn season_directory_for(season: u32) -> String {
+    if season == 0 {
+        "Specials".to_string()
+    } else {
+        format!("Season {season:02}")
+    }
+}
+
 fn render_movie(movie: &Movie) -> String {
     let mut components = vec![movie.root.as_str().to_string()];
     components.extend(movie.directories.iter().cloned());
@@ -71,7 +82,7 @@ fn render_movie(movie: &Movie) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{parse, LibraryRoot};
+    use super::super::{parse, LibraryRoot, SeasonDirectory};
     use super::*;
 
     fn episode() -> Episode {
@@ -82,6 +93,7 @@ mod tests {
                 number: 6,
                 suffix: String::new(),
             },
+            nested_directories: Vec::new(),
             series: "Elementary".to_string(),
             season: 6,
             number: 8,
@@ -126,7 +138,7 @@ mod tests {
     }
 
     #[test]
-    fn leaves_out_the_season_directory_when_there_was_none() {
+    fn puts_a_loose_episode_into_the_season_its_marker_names() {
         let no_season_directory = Episode {
             season_directory: SeasonDirectory::Absent,
             ..episode()
@@ -134,7 +146,54 @@ mod tests {
 
         assert_eq!(
             render(&MediaName::Episode(no_season_directory)),
-            "Series/Elementary/Elementary - S06E08 - Sand Trap.mkv"
+            "Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap.mkv",
+            "a file with no season directory belongs in the one its marker names"
+        );
+    }
+
+    #[test]
+    fn moves_a_misfiled_episode_to_the_season_its_marker_names() {
+        let misfiled = Episode {
+            season_directory: SeasonDirectory::Numbered {
+                number: 2,
+                suffix: String::new(),
+            },
+            ..episode()
+        };
+
+        assert_eq!(
+            render(&MediaName::Episode(misfiled)),
+            "Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap.mkv",
+            "the marker says season six; the directory it sat in does not decide"
+        );
+    }
+
+    #[test]
+    fn season_zero_is_the_specials_directory() {
+        let special = Episode {
+            season_directory: SeasonDirectory::Absent,
+            season: 0,
+            number: 1,
+            ..episode()
+        };
+
+        assert_eq!(
+            render(&MediaName::Episode(special)),
+            "Series/Elementary/Specials/Elementary - S00E01 - Sand Trap.mkv"
+        );
+    }
+
+    #[test]
+    fn keeps_a_directory_nested_under_the_season_directory() {
+        let nested = Episode {
+            nested_directories: vec!["Extras".to_string()],
+            ..episode()
+        };
+
+        assert_eq!(
+            render(&MediaName::Episode(nested)),
+            "Series/Elementary/Season 06/Extras/Elementary - S06E08 - Sand Trap.mkv",
+            "the season directory is corrected in place, not added underneath"
         );
     }
 
@@ -185,6 +244,14 @@ mod tests {
             MediaName::Episode(Episode {
                 season_directory: SeasonDirectory::Specials,
                 season: 0,
+                ..episode()
+            }),
+            MediaName::Episode(Episode {
+                season_directory: SeasonDirectory::Absent,
+                ..episode()
+            }),
+            MediaName::Episode(Episode {
+                nested_directories: vec!["Extras".to_string()],
                 ..episode()
             }),
         ];

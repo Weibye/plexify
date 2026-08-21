@@ -131,14 +131,20 @@ fn parse_episode(
         .parse()
         .map_err(|_| Unresolvable::NoEpisodeMarker)?;
 
-    // The season directory is the last directory that looks like one; anything
-    // above it is structure we keep out of.
-    let (season_directory, directories) = match directories.split_last() {
-        Some((last, above)) => match parse_season_directory(last) {
-            Some(season_dir) => (season_dir, above),
-            None => (SeasonDirectory::Absent, directories),
-        },
-        None => (SeasonDirectory::Absent, directories),
+    // Find the season directory anywhere in the chain rather than only at the
+    // end: a file in `Season 01/Extras` is still in season one, and treating
+    // `Extras` as "no season directory" would nest a second one inside it.
+    let season_position = directories
+        .iter()
+        .rposition(|component| parse_season_directory(component).is_some());
+
+    let (season_directory, directories, nested_directories) = match season_position {
+        Some(position) => (
+            parse_season_directory(directories[position]).expect("just matched"),
+            &directories[..position],
+            &directories[position + 1..],
+        ),
+        None => (SeasonDirectory::Absent, directories, &directories[..0]),
     };
 
     // The name in the file wins over the name of the directory holding it: a
@@ -161,6 +167,10 @@ fn parse_episode(
         root,
         directories: directories.iter().map(|part| part.to_string()).collect(),
         season_directory,
+        nested_directories: nested_directories
+            .iter()
+            .map(|part| part.to_string())
+            .collect(),
         series,
         season,
         number,
