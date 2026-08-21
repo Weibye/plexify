@@ -85,12 +85,17 @@ impl LibraryRoot {
 /// A season directory, or its absence.
 ///
 /// `Season 6` and `Season 06` parse to the same number and render the same way,
-/// which is what makes zero-padding a fix rather than a separate rule. A trailing
-/// arc name (`Season 01 - The Long Night`) is kept verbatim: it is information the
-/// library holds and nothing here is entitled to drop it.
+/// which is what makes zero-padding a fix rather than a separate rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SeasonDirectory {
     /// A numbered season directory, with anything that followed the number.
+    ///
+    /// The suffix holds an arc name such as `Season 01 - Vox Machina`. It is
+    /// parsed because it is there, and deliberately not rendered: Plex's scanner
+    /// expects the word "Season" and a number, and text appended to that stops it
+    /// parsing the season - reportedly collapsing several seasons into one. So
+    /// the canonical directory is always `Season NN`, and the arc name lives in
+    /// metadata rather than in the path.
     Numbered { number: u32, suffix: String },
     /// A `Specials` directory, kept under its own name.
     Specials,

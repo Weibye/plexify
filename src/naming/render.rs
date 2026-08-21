@@ -28,8 +28,13 @@ fn render_episode(episode: &Episode) -> String {
     components.extend(episode.directories.iter().cloned());
 
     match &episode.season_directory {
-        SeasonDirectory::Numbered { number, suffix } => {
-            components.push(format!("Season {number:02}{suffix}"));
+        // An arc name parsed off the directory is not rendered back. Plex's
+        // scanner reads a season directory as the word "Season" and a number;
+        // anything appended stops it parsing and can collapse two seasons into
+        // one. The name is not lost - it belongs to the season in metadata, and
+        // the proposed rename shows what is being dropped.
+        SeasonDirectory::Numbered { number, .. } => {
+            components.push(format!("Season {number:02}"));
         }
         SeasonDirectory::Specials => components.push("Specials".to_string()),
         SeasonDirectory::Absent => {}
@@ -134,7 +139,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_the_arc_name_on_a_season_directory() {
+    fn drops_an_arc_name_from_the_season_directory() {
         let with_arc = Episode {
             season_directory: SeasonDirectory::Numbered {
                 number: 6,
@@ -145,7 +150,8 @@ mod tests {
 
         assert_eq!(
             render(&MediaName::Episode(with_arc)),
-            "Series/Elementary/Season 06 - The Long Night/Elementary - S06E08 - Sand Trap.mkv"
+            "Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap.mkv",
+            "an arc name appended to a season directory stops Plex parsing the season"
         );
     }
 
