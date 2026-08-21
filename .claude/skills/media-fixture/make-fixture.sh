@@ -20,12 +20,14 @@ touch_file() {
     : > "$ROOT/$1"
 }
 
-# --- Valid: these must validate clean -----------------------------------------
+# --- Canonical: these must validate clean -------------------------------------
 touch_file "Series/Charmed/Season 06/Charmed - S06E17 - Hyde School Reunion.avi"
-touch_file "Series/Breaking Bad {tvdb-81189}/Season 01/Breaking Bad - s01e01 - Pilot.mkv"
-touch_file "Anime/Cowboy Bebop/Season 01/Cowboy Bebop - s01e01 - Asteroid Blues.mkv"
+touch_file "Anime/Cowboy Bebop/Season 01/Cowboy Bebop - S01E01 - Asteroid Blues.mkv"
 touch_file "Movies/The Dark Knight (2008)/The Dark Knight (2008).mkv"
 touch_file "Movies/Marvel Cinematic Universe Collection/Iron Man (2008).mkv"
+
+# --- Lowercase episode marker -------------------------------------------------
+touch_file "Series/Breaking Bad {tvdb-81189}/Season 01/Breaking Bad - s01e01 - Pilot.mkv"
 
 # --- Unpadded season, missing dash before the episode title -------------------
 touch_file "Series/Elementary/Season 6/Elementary - S06E08 Sand Trap.mkv"

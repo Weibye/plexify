@@ -24,17 +24,19 @@ directly. The transcoding commands do need real media; see below.
 
 ## What is in it
 
-Valid content that must report clean:
+Canonical content that must report clean:
 
 - `Series/Charmed/Season 06/Charmed - S06E17 - Hyde School Reunion.avi`
-- `Series/Breaking Bad {tvdb-81189}/Season 01/Breaking Bad - s01e01 - Pilot.mkv`
-- `Anime/Cowboy Bebop/Season 01/Cowboy Bebop - s01e01 - Asteroid Blues.mkv`
+- `Anime/Cowboy Bebop/Season 01/Cowboy Bebop - S01E01 - Asteroid Blues.mkv`
 - `Movies/The Dark Knight (2008)/The Dark Knight (2008).mkv`
+- `Movies/Marvel Cinematic Universe Collection/Iron Man (2008).mkv`
 
 Malformed content, one directory per defect, drawn from the cases in issue #51:
 
 | Directory | Defect |
 |---|---|
+| `Series/Breaking Bad {tvdb-81189}/Season 01/` | Lowercase episode marker; the tvdb id on the directory must survive the fix |
+| `Series/Firefly/Season 1/` | Lowercase marker plus an unpadded season directory |
 | `Series/Elementary/Season 6/` | Season number not zero-padded; missing dash before episode title |
 | `Series/Scrubs/Season 9/` | Scene-release naming, dots for spaces, release-group cruft |
 | `Series/Samurai Jack (2001)/Season 3/` | Dotted name plus unpadded season, apostrophe in episode title |
