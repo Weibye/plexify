@@ -945,3 +945,105 @@ fn test_rescanning_a_library_does_not_duplicate_jobs() {
         "second scan should recognise both jobs as already queued"
     );
 }
+
+#[test]
+fn test_validate_reports_without_changing_anything() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+
+    let season = temp_path.join("Series/Elementary/Season 6");
+    fs::create_dir_all(&season).unwrap();
+    let original = season.join("Elementary - S06E08 Sand Trap.mkv");
+    fs::write(&original, "").unwrap();
+
+    let output = Command::new(PLEXIFY_BIN)
+        .args(["validate", temp_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute validate command");
+
+    assert!(output.status.success(), "Validate command failed");
+
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap.mkv"),
+        "the report should name the destination, got: {text}"
+    );
+    assert!(
+        original.exists(),
+        "a report without --fix must leave the library alone"
+    );
+}
+
+#[test]
+fn test_validate_fix_moves_files_to_their_canonical_paths() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+    let plans = TempDir::new().unwrap();
+
+    let season = temp_path.join("Series/Elementary/Season 6");
+    fs::create_dir_all(&season).unwrap();
+    fs::write(season.join("Elementary - S06E08 Sand Trap.mkv"), "").unwrap();
+    fs::write(season.join("Elementary - S06E08 Sand Trap.en.srt"), "").unwrap();
+
+    // A path nothing can be proposed for, which must survive untouched.
+    let nested = temp_path.join("Series/Veronica Mars/Series/Season 01");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("Veronica Mars S02E04.mp4"), "").unwrap();
+
+    let output = Command::new(PLEXIFY_BIN)
+        .args(["validate", temp_path.to_str().unwrap(), "--fix"])
+        .current_dir(plans.path())
+        .output()
+        .expect("Failed to execute validate --fix command");
+
+    assert!(output.status.success(), "Validate --fix command failed");
+
+    let fixed = temp_path.join("Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap.mkv");
+    assert!(
+        fixed.exists(),
+        "the episode should be at its canonical path"
+    );
+    assert!(
+        temp_path
+            .join("Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap.en.srt")
+            .exists(),
+        "the subtitle should have followed its episode"
+    );
+    assert!(
+        nested.join("Veronica Mars S02E04.mp4").exists(),
+        "a path needing a decision must not be moved"
+    );
+
+    // The run records what it did, next to where it was run from.
+    let plan_files: Vec<_> = std::fs::read_dir(plans.path())
+        .unwrap()
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().to_string_lossy().to_string();
+            name.starts_with("plexify-fix-").then_some(name)
+        })
+        .collect();
+    assert_eq!(
+        plan_files.len(),
+        1,
+        "expected one plan file: {plan_files:?}"
+    );
+
+    // Running again finds nothing left to rename.
+    let second = Command::new(PLEXIFY_BIN)
+        .args(["validate", temp_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute validate command");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(
+        text.contains("Renames proposed: 0"),
+        "the fix should be idempotent, got: {text}"
+    );
+}

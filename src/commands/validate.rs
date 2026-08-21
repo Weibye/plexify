@@ -8,12 +8,13 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
+use crate::fix::FixOutcome;
 use crate::ignore::IgnoreFilter;
 use crate::naming::{assess, Assessment, LibraryRoot};
 use crate::paths::to_forward_slashes;
 
 /// Media file extensions that should be validated
-const MEDIA_EXTENSIONS: &[&str] = &["mkv", "mp4", "avi", "webm", "mov", "m4v"];
+pub const MEDIA_EXTENSIONS: &[&str] = &["mkv", "mp4", "avi", "webm", "mov", "m4v"];
 
 /// Something the library holds that is not in canonical form.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,12 +64,25 @@ impl ValidationReport {
 /// Command to validate library naming conformity
 pub struct ValidateCommand {
     media_root: PathBuf,
+    /// Whether the caller intends to act on the report. Validation itself is
+    /// read-only either way; this only decides what the report says it is.
+    fixing: bool,
 }
 
 impl ValidateCommand {
     /// Create a new validate command
     pub fn new(media_root: PathBuf) -> Self {
-        Self { media_root }
+        Self {
+            media_root,
+            fixing: false,
+        }
+    }
+
+    /// State that the report will be acted on, so it does not describe itself
+    /// as a dry run.
+    pub fn fixing(mut self) -> Self {
+        self.fixing = true;
+        self
     }
 
     /// Execute the validation command
@@ -258,6 +272,86 @@ impl ValidateCommand {
         }
     }
 
+    /// Print what a fix run did to stdout
+    pub fn print_fix_outcome(&self, outcome: &FixOutcome) {
+        print!("{}", self.render_fix_outcome(outcome));
+    }
+
+    /// Render the result of a fix run.
+    ///
+    /// The renames that succeeded are not listed again - the report printed
+    /// immediately above named every one of them, and the plan file records
+    /// them. What is worth reading here is what did *not* happen.
+    pub fn render_fix_outcome(&self, outcome: &FixOutcome) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+
+        let _ = writeln!(
+            out,
+            "
+🔧 Fix"
+        );
+        let _ = writeln!(out, "──────");
+        let _ = writeln!(out, "✅ Renamed: {}", outcome.applied.len());
+        if !outcome.refusals.is_empty() {
+            let _ = writeln!(out, "⛔ Refused: {}", outcome.refusals.len());
+        }
+        if !outcome.failed.is_empty() {
+            let _ = writeln!(out, "❌ Failed: {}", outcome.failed.len());
+        }
+        let _ = writeln!(out, "📄 Plan: {}", to_forward_slashes(&outcome.plan_file));
+
+        if !outcome.refusals.is_empty() {
+            let _ = writeln!(
+                out,
+                "
+⛔ Refused, and left exactly as they were:"
+            );
+            let _ = writeln!(out, "──────────────────────────────────────────");
+            for refusal in &outcome.refusals {
+                let _ = writeln!(
+                    out,
+                    "
+  {}",
+                    refusal.path
+                );
+                let _ = writeln!(out, "  {}", refusal.reason.explain());
+            }
+        }
+
+        if !outcome.failed.is_empty() {
+            let _ = writeln!(
+                out,
+                "
+❌ Attempted and failed:"
+            );
+            let _ = writeln!(out, "────────────────────────");
+            for failure in &outcome.failed {
+                let _ = writeln!(
+                    out,
+                    "
+  {}",
+                    failure.attempted.from
+                );
+                let _ = writeln!(out, "  {}", failure.error);
+            }
+        }
+
+        if !outcome.emptied_directories.is_empty() {
+            let _ = writeln!(
+                out,
+                "
+📁 Left empty by this run, and not removed:"
+            );
+            let _ = writeln!(out, "───────────────────────────────────────────");
+            for directory in &outcome.emptied_directories {
+                let _ = writeln!(out, "   {directory}");
+            }
+        }
+
+        out
+    }
+
     /// Print the validation report to stdout
     pub fn print_report(&self, report: &ValidationReport) {
         print!("{}", self.render_report(report));
@@ -337,7 +431,12 @@ impl ValidateCommand {
         }
         let _ = writeln!(
             out,
-            "\n   Nothing has been changed on disk; this report is a dry run."
+            "{}",
+            if self.fixing {
+                "\n   Carrying these out now."
+            } else {
+                "\n   Nothing has been changed on disk. Re-run with --fix to carry these out."
+            }
         );
 
         out

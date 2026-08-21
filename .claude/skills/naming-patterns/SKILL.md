@@ -110,8 +110,20 @@ user cannot easily reconstruct:
   `Season 6/Season 01/` instead of replacing the season directory.
 - Rewriting a season directory means **replacing** that path component, not appending to the
   original path.
-- Refuse to overwrite an existing destination.
+- Refuse to overwrite an existing destination, and refuse a destination that two sources
+  both resolve to.
 - Dry-run is the default; actually moving files is opt-in.
+
+`src/fix.rs` implements all of that and is the only place a library file is moved. Two things
+about it are easy to break by accident:
+
+- **Sidecars move with their media file.** A `.vtt` left behind when its `.webm` is renamed
+  breaks the pairing `work` depends on, and does it silently. The group moves together or
+  the whole group is refused.
+- **A case-only rename is not a collision.** On Windows and macOS the destination of
+  `s01e01` -> `S01E01` already "exists" - it is the same file. Treating that as a collision
+  would refuse the most common fix in the library, so the check compares canonicalised paths
+  rather than testing existence alone.
 
 ## Checking your work
 

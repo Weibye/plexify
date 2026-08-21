@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod config;
 pub mod ffmpeg;
+pub mod fix;
 pub mod ignore;
 pub mod job;
 pub mod naming;
