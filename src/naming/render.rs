@@ -34,8 +34,9 @@ fn render_episode(episode: &Episode) -> String {
     //
     // An arc name is dropped along the way. Plex's scanner reads a season
     // directory as the word "Season" and a number; anything appended stops it
-    // parsing and can collapse two seasons into one. What the arc named belongs
-    // to the season in metadata, and the proposed rename shows it going.
+    // parsing and can collapse two seasons into one. The arc name belongs to the
+    // season in metadata rather than in a path component, and the proposed
+    // rename shows it going.
     components.push(season_directory_for(episode.season));
     components.extend(episode.nested_directories.iter().cloned());
 
