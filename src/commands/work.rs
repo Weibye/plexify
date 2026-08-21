@@ -279,7 +279,7 @@ mod tests {
             false,
             JobPriority::None,
         );
-        let processor = FFmpegProcessor::new(Config::default(), false);
+        let processor = FFmpegProcessor::new(false);
 
         let processed = work_cmd.process_next_job(&queue, &processor).await.unwrap();
 
