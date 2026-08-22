@@ -438,7 +438,9 @@ notice. It refuses, per file, when:
   not a re-encode that happens to be the same length.
 
 An undo writes its own record, `plexify-undo-<timestamp>.json`, so it can be reversed in
-turn.
+turn. Like a fix, it writes what it intends before it starts and replaces that with what it
+did — so a run interrupted halfway leaves a file that says what it meant to do, and cannot be
+mistaken for a record of what happened.
 
 ## Configuration
 

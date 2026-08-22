@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::fix::{
@@ -41,12 +42,20 @@ pub fn read_record(plan_file: &Path) -> Result<FixOutcome> {
     let contents = fs::read_to_string(plan_file)
         .with_context(|| format!("could not read the plan file {plan_file:?}"))?;
 
-    serde_json::from_str(&contents)
-        .with_context(|| format!("{plan_file:?} is not a plan file plexify wrote"))
+    serde_json::from_str(&contents).with_context(|| {
+        format!(
+            "could not read {plan_file:?} as a record of a completed run - it may be from an              older version of plexify, or from a run that was interrupted before it finished"
+        )
+    })
 }
 
 /// What reversing a fix run would do.
-#[derive(Debug, Clone)]
+///
+/// Written to disk before any of it happens, and deliberately a different shape
+/// from the outcome that replaces it: `moves` is an intention, `applied` is a
+/// fact. An undo interrupted halfway therefore leaves a file that says what it
+/// meant to do, and cannot be mistaken for a record of what it did.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UndoPlan {
     pub media_root: PathBuf,
     pub moves: Vec<PlannedMove>,
@@ -139,15 +148,11 @@ pub fn plan(record: &FixOutcome, reversing: &Path) -> UndoPlan {
 
 /// Put the files back, writing a record of this run before touching anything.
 pub fn apply(plan: &UndoPlan, record_file: &Path) -> Result<FixOutcome> {
-    let intended = FixOutcome {
-        media_root: plan.media_root.clone(),
-        applied: plan.moves.clone(),
-        failed: Vec::new(),
-        refusals: plan.refusals.clone(),
-        emptied_directories: Vec::new(),
-        plan_file: record_file.to_path_buf(),
-    };
-    write_record(&intended, record_file)?;
+    // The intention first, in its own shape. Nothing here may be written into
+    // an `applied` list before it has actually happened: a run that dies halfway
+    // would then claim moves it never made, and undoing *that* record would try
+    // to reverse work that was never done.
+    write_plan(plan, record_file)?;
 
     let mut applied = Vec::new();
     let mut failed = Vec::new();
@@ -198,6 +203,12 @@ pub fn default_record_file() -> PathBuf {
         .unwrap_or_default();
 
     PathBuf::from(format!("plexify-undo-{seconds}.json"))
+}
+
+fn write_plan(plan: &UndoPlan, record_file: &Path) -> Result<()> {
+    let contents = serde_json::to_string_pretty(plan)?;
+    fs::write(record_file, contents)
+        .with_context(|| format!("could not write the undo plan to {record_file:?}"))
 }
 
 fn write_record(outcome: &FixOutcome, record_file: &Path) -> Result<()> {
@@ -565,6 +576,53 @@ mod tests {
     }
 
     #[test]
+    fn an_interrupted_undo_leaves_a_record_that_claims_nothing() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        touch(
+            root,
+            "Series/Show/Season 1/Show - S01E01 Pilot.mkv",
+            "video",
+        );
+
+        let (record, plan_file) = fix(
+            root,
+            &[(
+                "Series/Show/Season 1/Show - S01E01 Pilot.mkv",
+                "Series/Show/Season 01/Show - S01E01 - Pilot.mkv",
+            )],
+        );
+
+        let undo_plan = plan(&record, &plan_file);
+        let record_file = root.join("undo.json");
+
+        // What is on disk between the first write and the last one: an undo
+        // that died here must not look like an undo that finished.
+        write_plan(&undo_plan, &record_file).unwrap();
+
+        assert!(
+            read_record(&record_file).is_err(),
+            "an intention must not read back as a record of completed work"
+        );
+
+        let unfinished: UndoPlan =
+            serde_json::from_str(&fs::read_to_string(&record_file).unwrap()).unwrap();
+        assert_eq!(unfinished.moves.len(), 1, "it says what it meant to do");
+    }
+
+    #[test]
+    fn the_size_mismatch_reads_as_one_line() {
+        let refusal = RefusalReason::ContentChanged {
+            expected_bytes: 5,
+            actual_bytes: 43,
+        };
+
+        assert_eq!(
+            refusal.explain(),
+            "this is no longer the file that was moved here: 5 bytes then, 43 now"
+        );
+    }
+    #[test]
     fn reads_back_a_record_written_by_a_fix() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
@@ -594,11 +652,17 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_file_that_is_not_a_plan() {
+    fn refuses_a_file_that_is_not_a_record() {
         let temp = TempDir::new().unwrap();
         let not_a_plan = temp.path().join("notes.json");
         fs::write(&not_a_plan, "{\"hello\": \"world\"}").unwrap();
 
-        assert!(read_record(&not_a_plan).is_err());
+        let error = read_record(&not_a_plan).unwrap_err();
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains("older version") && message.contains("interrupted"),
+            "a parse failure is not proof the file is foreign: {message}"
+        );
     }
 }

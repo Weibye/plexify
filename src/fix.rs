@@ -89,7 +89,7 @@ impl RefusalReason {
                 expected_bytes,
                 actual_bytes,
             } => format!(
-                "this is no longer the file that was moved here: {expected_bytes} bytes then,                  {actual_bytes} now"
+                "this is no longer the file that was moved here: {expected_bytes} bytes then, {actual_bytes} now"
             ),
         }
     }
