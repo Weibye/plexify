@@ -1047,3 +1047,84 @@ fn test_validate_fix_moves_files_to_their_canonical_paths() {
         "the fix should be idempotent, got: {text}"
     );
 }
+
+#[test]
+fn test_validate_fix_scoped_to_one_series_leaves_the_rest_alone() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+    let plans = TempDir::new().unwrap();
+
+    let target = temp_path.join("Series/Elementary/Season 6");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("Elementary - S06E08 Sand Trap.mkv"), "").unwrap();
+
+    let untouched = temp_path.join("Series/Scrubs/Season 9");
+    fs::create_dir_all(&untouched).unwrap();
+    let scrubs = untouched.join("Scrubs.S09E02.RETAIL.DVDRip.XviD-REWARD.avi");
+    fs::write(&scrubs, "").unwrap();
+
+    let output = Command::new(PLEXIFY_BIN)
+        .args([
+            "validate",
+            temp_path.join("Series/Elementary").to_str().unwrap(),
+            "--fix",
+        ])
+        .current_dir(plans.path())
+        .output()
+        .expect("Failed to execute scoped validate --fix");
+
+    assert!(output.status.success(), "Scoped validate --fix failed");
+
+    assert!(
+        temp_path
+            .join("Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap.mkv")
+            .exists(),
+        "the scoped series should have been fixed"
+    );
+    assert!(
+        scrubs.exists(),
+        "a series outside the scope must not be touched"
+    );
+
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("Library root:"),
+        "a scoped run should say what it is judging against: {text}"
+    );
+}
+
+#[test]
+fn test_validate_accepts_a_relative_path_from_inside_the_library() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+
+    let season = temp_path.join("Series/Elementary/Season 6");
+    fs::create_dir_all(&season).unwrap();
+    fs::write(season.join("Elementary - S06E08 Sand Trap.mkv"), "").unwrap();
+
+    // Run from inside the library, naming the series relatively.
+    let output = Command::new(PLEXIFY_BIN)
+        .args(["validate", "Series/Elementary"])
+        .current_dir(temp_path)
+        .output()
+        .expect("Failed to execute validate");
+
+    assert!(
+        output.status.success(),
+        "validate failed on a relative path"
+    );
+
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        text.contains("Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap.mkv"),
+        "a relative path should resolve to the same destination as an absolute one: {text}"
+    );
+}
