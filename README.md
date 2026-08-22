@@ -444,6 +444,31 @@ every move as a `from`/`to` pair, so an interrupted run leaves a record of how f
 Running `validate` again after a fix proposes nothing: the destinations it produces are
 themselves canonical.
 
+### Putting a fix back
+
+```bash
+plexify undo plexify-fix-1787309398.json          # say what would be reversed
+plexify undo plexify-fix-1787309398.json --apply  # reverse it
+```
+
+Undo reverses only what the fix actually applied, so an interrupted run puts back exactly
+what it managed to move. Sidecars come back with their media file.
+
+It is checked against the disk the same way a fix is, and for a stronger reason: a fix acts
+on a report seconds old, while an undo acts on a record written however long ago you took to
+notice. It refuses, per file, when:
+
+- the file is no longer where the fix put it;
+- something else now occupies the path it came from;
+- the file is no longer the one that was moved — its size no longer matches what the record
+  says. That is weak evidence, and deliberately so: it catches a file having been replaced,
+  not a re-encode that happens to be the same length.
+
+An undo writes its own record, `plexify-undo-<timestamp>.json`, so it can be reversed in
+turn. Like a fix, it writes what it intends before it starts and replaces that with what it
+did — so a run interrupted halfway leaves a file that says what it meant to do, and cannot be
+mistaken for a record of what happened.
+
 ## Configuration
 
 Plexify offers two ways to configure encoding settings:

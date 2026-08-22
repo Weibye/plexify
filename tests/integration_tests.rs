@@ -1128,3 +1128,90 @@ fn test_validate_accepts_a_relative_path_from_inside_the_library() {
         "a relative path should resolve to the same destination as an absolute one: {text}"
     );
 }
+
+#[test]
+fn test_undo_puts_a_fix_run_back() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+    let plans = TempDir::new().unwrap();
+
+    let season = temp_path.join("Series/Elementary/Season 6");
+    fs::create_dir_all(&season).unwrap();
+    let original = season.join("Elementary - S06E08 Sand Trap.mkv");
+    fs::write(&original, "video").unwrap();
+    let original_subtitle = season.join("Elementary - S06E08 Sand Trap.en.srt");
+    fs::write(&original_subtitle, "subs").unwrap();
+
+    let fix = Command::new(PLEXIFY_BIN)
+        .args(["validate", temp_path.to_str().unwrap(), "--fix"])
+        .current_dir(plans.path())
+        .output()
+        .expect("Failed to execute validate --fix");
+    assert!(fix.status.success(), "validate --fix failed");
+    assert!(!original.exists(), "the fix should have moved the episode");
+
+    let plan_file = std::fs::read_dir(plans.path())
+        .unwrap()
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().to_string_lossy().to_string();
+            name.starts_with("plexify-fix-").then_some(name)
+        })
+        .next()
+        .expect("the fix should have written a plan");
+
+    // A dry run says what it would do and touches nothing.
+    let dry_run = Command::new(PLEXIFY_BIN)
+        .args(["undo", &plan_file])
+        .current_dir(plans.path())
+        .output()
+        .expect("Failed to execute undo");
+    assert!(dry_run.status.success(), "undo dry run failed");
+    assert!(
+        !original.exists(),
+        "a dry run must not put anything back yet"
+    );
+
+    let applied = Command::new(PLEXIFY_BIN)
+        .args(["undo", &plan_file, "--apply"])
+        .current_dir(plans.path())
+        .output()
+        .expect("Failed to execute undo --apply");
+    assert!(applied.status.success(), "undo --apply failed");
+
+    assert!(original.exists(), "the episode should be back where it was");
+    assert!(
+        original_subtitle.exists(),
+        "the subtitle should have come back with it"
+    );
+
+    let undo_records = std::fs::read_dir(plans.path())
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .map(|e| e.file_name().to_string_lossy().starts_with("plexify-undo-"))
+                .unwrap_or(false)
+        })
+        .count();
+    assert_eq!(
+        undo_records, 1,
+        "an undo records what it did, so it can be undone in turn"
+    );
+}
+
+#[test]
+fn test_undo_rejects_a_file_that_is_not_a_plan() {
+    let temp_dir = TempDir::new().unwrap();
+    let not_a_plan = temp_dir.path().join("notes.json");
+    fs::write(&not_a_plan, "{\"unrelated\": true}").unwrap();
+
+    let output = Command::new(PLEXIFY_BIN)
+        .args(["undo", not_a_plan.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute undo");
+
+    assert!(
+        !output.status.success(),
+        "undo should refuse a file it did not write"
+    );
+}

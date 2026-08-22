@@ -145,6 +145,14 @@ library. Its rules exist because it runs against a library nobody can reconstruc
   an interrupted run leaves a record of what it intended and how far it got.
 - Directories the run empties are reported, never removed.
 
+`src/undo.rs` reverses a run from that record, and is the only other code that moves a
+library file. It reverses only what the record says was *applied*, checks every reversal
+against the disk first, and refuses on three counts: the file is gone from where the fix put
+it, something else now holds the original path, or the file's size no longer matches what was
+recorded. The record therefore has to carry the media root and the size of each moved file -
+without them it is a log, not something that can be acted on. An undo writes its own record,
+so it is reversible in turn.
+
 ### Cross-cutting
 
 **`.plexifyignore`** (`src/ignore.rs`) is gitignore-like, supports nesting, and child patterns
