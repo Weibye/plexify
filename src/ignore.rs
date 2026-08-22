@@ -30,22 +30,63 @@ struct IgnorePattern {
 impl IgnoreFilter {
     /// Create a new ignore filter starting from the given root directory
     pub fn new(root: PathBuf) -> Result<Self> {
+        Self::for_scope(root.clone(), &root)
+    }
+
+    /// Create a filter for a run that only walks part of the tree.
+    ///
+    /// Patterns still belong to the root - a rule written there governs the whole
+    /// library, and narrowing a run must not quietly escape it. But only two sets
+    /// of `.plexifyignore` files can affect the subtree being walked: the ones in
+    /// directories above it, and the ones inside it. Everything else is a sibling
+    /// branch whose rules can never match a path under `scan_path`, so walking the
+    /// whole library to find them would cost the run its reason for being narrow.
+    pub fn for_scope(root: PathBuf, scan_path: &Path) -> Result<Self> {
         let mut filter = Self {
             patterns_by_dir: HashMap::new(),
             root,
         };
 
-        // Load all .plexifyignore files in the tree
-        filter.load_ignore_files()?;
+        filter.load_ignore_files_above(scan_path)?;
+        filter.load_ignore_files_under(scan_path)?;
+
+        debug!(
+            "Loaded .plexifyignore patterns from {} directories",
+            filter.patterns_by_dir.len()
+        );
 
         Ok(filter)
     }
 
-    /// Load all .plexifyignore files in the directory tree
-    fn load_ignore_files(&mut self) -> Result<()> {
+    /// Load the ignore files in the directories between the root and the scan
+    /// path, which govern it without being inside it.
+    fn load_ignore_files_above(&mut self, scan_path: &Path) -> Result<()> {
+        let root = self.root.clone();
+        let mut ancestors: Vec<PathBuf> = scan_path
+            .ancestors()
+            .skip(1)
+            .take_while(|ancestor| ancestor.starts_with(&root))
+            .map(|ancestor| ancestor.to_path_buf())
+            .collect();
+        ancestors.push(root);
+        ancestors.reverse();
+        ancestors.dedup();
+
+        for ancestor in ancestors {
+            let candidate = ancestor.join(".plexifyignore");
+            if candidate.is_file() {
+                self.load_ignore_file(&candidate)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Load every ignore file inside the subtree being walked.
+    fn load_ignore_files_under(&mut self, scan_path: &Path) -> Result<()> {
         use walkdir::WalkDir;
 
-        for entry in WalkDir::new(&self.root)
+        for entry in WalkDir::new(scan_path)
             .follow_links(false)
             .into_iter()
             .filter_map(|e| e.ok())
@@ -55,11 +96,6 @@ impl IgnoreFilter {
                 self.load_ignore_file(path)?;
             }
         }
-
-        debug!(
-            "Loaded .plexifyignore patterns from {} directories",
-            self.patterns_by_dir.len()
-        );
 
         Ok(())
     }
@@ -485,5 +521,71 @@ mod tests {
 
         // Should not skip root directory
         assert!(!filter.should_skip_dir(root));
+    }
+
+    #[test]
+    fn a_scoped_filter_reads_the_rules_above_it_and_inside_it() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        fs::write(
+            root.join(".plexifyignore"),
+            "*.tmp
+",
+        )
+        .unwrap();
+
+        let series = root.join("Series/Elementary");
+        fs::create_dir_all(series.join("Season 06")).unwrap();
+        fs::write(
+            series.join(".plexifyignore"),
+            "*.nfo
+",
+        )
+        .unwrap();
+
+        // A sibling branch that cannot affect the scoped subtree.
+        let sibling = root.join("Series/Firefly");
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(
+            sibling.join(".plexifyignore"),
+            "*.mkv
+",
+        )
+        .unwrap();
+
+        let filter = IgnoreFilter::for_scope(root.to_path_buf(), &series).unwrap();
+
+        assert!(
+            filter.should_ignore(&series.join("Season 06/artwork.tmp")),
+            "a rule at the library root still governs a scoped run"
+        );
+        assert!(
+            filter.should_ignore(&series.join("Season 06/episode.nfo")),
+            "a rule inside the scope applies"
+        );
+        assert!(
+            !filter.should_ignore(&series.join("Season 06/episode.mkv")),
+            "a sibling's rules were never in scope, and are not loaded"
+        );
+    }
+
+    #[test]
+    fn a_whole_library_filter_still_sees_every_rule() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        let deep = root.join("Series/Firefly/Season 01");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(
+            deep.join(".plexifyignore"),
+            "*.mkv
+",
+        )
+        .unwrap();
+
+        let filter = IgnoreFilter::new(root.to_path_buf()).unwrap();
+
+        assert!(filter.should_ignore(&deep.join("episode.mkv")));
     }
 }

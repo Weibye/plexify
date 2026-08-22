@@ -80,6 +80,11 @@ impl Scope {
 ///
 /// A path containing no library root at all is taken to be the library root, so
 /// a whole-library run works exactly as before.
+///
+/// Give this an absolute path. A relative one that *starts* at a root - plain
+/// `Series/Elementary` - has nothing before that component to be the library
+/// root, and the current directory stands in. Callers that take a path from a
+/// user should resolve it first, so that what the report prints is unambiguous.
 pub fn scope_for(path: &Path) -> Scope {
     let components: Vec<Component> = path.components().collect();
 
@@ -89,10 +94,18 @@ pub fn scope_for(path: &Path) -> Scope {
     });
 
     match root_position {
-        Some(position) => Scope {
-            library_root: components[..position].iter().collect(),
-            scan_path: path.to_path_buf(),
-        },
+        Some(position) => {
+            let library_root: PathBuf = components[..position].iter().collect();
+
+            Scope {
+                library_root: if library_root.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    library_root
+                },
+                scan_path: path.to_path_buf(),
+            }
+        }
         None => Scope {
             library_root: path.to_path_buf(),
             scan_path: path.to_path_buf(),
@@ -601,5 +614,17 @@ mod tests {
             }
         );
         assert_eq!(scope.library_root, PathBuf::from("/media/library"));
+    }
+
+    #[test]
+    fn a_relative_path_starting_at_a_root_falls_back_to_the_current_directory() {
+        let scope = scope_for(Path::new("Series/Elementary"));
+
+        assert_eq!(
+            scope.library_root,
+            PathBuf::from("."),
+            "an empty root would give the ignore filter nothing to walk"
+        );
+        assert_eq!(scope.scan_path, PathBuf::from("Series/Elementary"));
     }
 }

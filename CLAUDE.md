@@ -124,7 +124,9 @@ would be unresolvable. Two consequences that are easy to break:
   falls outside the scanned subtree — correcting `Season 6` to `Season 06` moves a file into
   a sibling directory.
 - `IgnoreFilter` is built from `library_root`, so scoping into a directory cannot override a
-  `.plexifyignore` rule written at the root.
+  `.plexifyignore` rule written at the root. `for_scope` loads only the rules that can reach
+  the scanned subtree - those above it and inside it - so a narrow run stays narrow instead of
+  walking the library to find rules that could never match.
 
 Paths are matched **relative to the media root, with `/` separators**. On Windows they must
 go through `crate::paths::to_forward_slashes` first, or every component comparison is wrong.

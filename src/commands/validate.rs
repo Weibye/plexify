@@ -79,8 +79,19 @@ impl ValidateCommand {
     /// The path may be the library root or any directory inside it; a narrower
     /// path narrows the run without changing what canonical means.
     pub fn new(path: PathBuf) -> Self {
+        // Resolve first: a relative path such as `Series/Elementary` has no
+        // components before the root, which would leave nothing to measure
+        // against and no directory for the ignore filter to walk.
+        let absolute = if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&path))
+                .unwrap_or(path)
+        };
+
         Self {
-            scope: scope_for(&path),
+            scope: scope_for(&absolute),
             fixing: false,
         }
     }
@@ -123,13 +134,17 @@ impl ValidateCommand {
         info!("📁 Recursively scanning all subdirectories...");
 
         // Initialize ignore filter
-        let ignore_filter = match IgnoreFilter::new(self.scope.library_root.clone()) {
-            Ok(filter) => Some(filter),
-            Err(e) => {
-                warn!("Failed to load .plexifyignore patterns: {}", e);
-                None
-            }
-        };
+        // Rules belong to the library root even when the run is narrower, but only
+        // the files above and inside the scanned subtree can affect it - see
+        // `IgnoreFilter::for_scope`.
+        let ignore_filter =
+            match IgnoreFilter::for_scope(self.scope.library_root.clone(), &self.scope.scan_path) {
+                Ok(filter) => Some(filter),
+                Err(e) => {
+                    warn!("Failed to load .plexifyignore patterns: {}", e);
+                    None
+                }
+            };
 
         // Create a lookup set for media extensions for faster checks
         let media_extensions: std::collections::HashSet<&str> =
