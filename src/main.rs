@@ -29,6 +29,9 @@
 //!
 //! # Carry out the renames it proposes
 //! plexify validate /path/to/media --fix
+//!
+//! # Put a fix run back the way it found things
+//! plexify undo plexify-fix-1787309398.json --apply
 //! ```
 
 use anyhow::Result;
@@ -103,6 +106,14 @@ enum Commands {
         #[arg(long, short = 'w')]
         work_dir: Option<PathBuf>,
     },
+    /// Put a library back the way a fix run found it
+    Undo {
+        /// The plan file a `validate --fix` run wrote
+        plan: PathBuf,
+        /// Carry out the reversal instead of only reporting it
+        #[arg(long)]
+        apply: bool,
+    },
     /// Report what in the library is not in canonical form
     Validate {
         /// Path to the media directory to validate
@@ -173,6 +184,30 @@ async fn main() -> Result<()> {
                 path, work_root
             );
             CleanCommand::new(path, work_root).execute().await
+        }
+        Commands::Undo { plan, apply } => {
+            info!("Starting undo for plan: {:?}, apply: {}", plan, apply);
+
+            match plexify::undo::read_record(&plan) {
+                Ok(record) => {
+                    let undo_plan = plexify::undo::plan(&record, &plan);
+
+                    if apply {
+                        let record_file = plexify::undo::default_record_file();
+                        match plexify::undo::apply(&undo_plan, &record_file) {
+                            Ok(outcome) => {
+                                print!("{}", plexify::undo::render(&undo_plan, Some(&outcome)));
+                                Ok(())
+                            }
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        print!("{}", plexify::undo::render(&undo_plan, None));
+                        Ok(())
+                    }
+                }
+                Err(e) => Err(e),
+            }
         }
         Commands::Validate { path, fix } => {
             info!(

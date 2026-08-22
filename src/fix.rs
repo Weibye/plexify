@@ -41,6 +41,12 @@ pub struct PlannedMove {
     /// media file itself - a subtitle, an `.nfo`, artwork named after it.
     #[serde(default)]
     pub sidecar: bool,
+    /// The size of the file when it was moved, recorded so that an undo can
+    /// notice it is no longer the same file. Weak evidence - a re-encode of the
+    /// same length would pass - but free, and it catches the ordinary case of a
+    /// file having been replaced since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
 }
 
 /// A proposal that will not be attempted, and why.
@@ -59,6 +65,11 @@ pub enum RefusalReason {
     DestinationClaimedTwice { destination: String },
     /// The file named by the report is no longer where it was.
     SourceMissing,
+    /// The file is no longer the one that was moved there.
+    ContentChanged {
+        expected_bytes: u64,
+        actual_bytes: u64,
+    },
 }
 
 impl RefusalReason {
@@ -74,6 +85,12 @@ impl RefusalReason {
             RefusalReason::SourceMissing => {
                 "the file is no longer at the path that was reported".to_string()
             }
+            RefusalReason::ContentChanged {
+                expected_bytes,
+                actual_bytes,
+            } => format!(
+                "this is no longer the file that was moved here: {expected_bytes} bytes then,                  {actual_bytes} now"
+            ),
         }
     }
 }
@@ -90,6 +107,9 @@ pub struct FixPlan {
 /// What a fix run actually did.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FixOutcome {
+    /// The root every path here is relative to. Without it the record is not
+    /// enough to act on, which is what an undo needs it for.
+    pub media_root: PathBuf,
     pub applied: Vec<PlannedMove>,
     pub failed: Vec<FailedMove>,
     pub refusals: Vec<Refusal>,
@@ -123,6 +143,7 @@ pub fn plan(report: &ValidationReport) -> FixPlan {
                     from: issue.path.clone(),
                     to: destination.clone(),
                     sidecar: false,
+                    size: None,
                 };
                 let mut group = vec![media];
                 group.extend(sidecars_of(media_root, &issue.path, destination));
@@ -207,7 +228,10 @@ pub fn apply(plan: &FixPlan, plan_file: &Path) -> Result<FixOutcome> {
                         source_directories.push(parent.to_path_buf());
                     }
                 }
-                applied.push(planned.clone());
+                applied.push(PlannedMove {
+                    size: fs::metadata(&destination).ok().map(|file| file.len()),
+                    ..planned.clone()
+                });
             }
             Err(error) => {
                 warn!("Failed to rename {:?}: {}", source, error);
@@ -222,6 +246,7 @@ pub fn apply(plan: &FixPlan, plan_file: &Path) -> Result<FixOutcome> {
     let emptied_directories = emptied(&plan.media_root, source_directories);
 
     let outcome = FixOutcome {
+        media_root: plan.media_root.clone(),
         applied,
         failed,
         refusals: plan.refusals.clone(),
@@ -244,7 +269,7 @@ pub fn default_plan_file(created_unix_seconds: u64) -> PathBuf {
     PathBuf::from(format!("plexify-fix-{created_unix_seconds}.json"))
 }
 
-fn rename(source: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn rename(source: &Path, destination: &Path) -> Result<()> {
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("could not create directory {parent:?}"))?;
@@ -307,6 +332,7 @@ fn sidecars_of(media_root: &Path, from: &str, to: &str) -> Vec<PlannedMove> {
                 from: rejoin(parent_of(from), &name),
                 to: rejoin(parent_of(to), &format!("{destination_stem}.{suffix}")),
                 sidecar: true,
+                size: None,
             })
         })
         .collect();
@@ -352,7 +378,7 @@ fn rejoin(parent: &str, name: &str) -> String {
 ///
 /// Split on `/` rather than handing the whole string to `join`, so the result
 /// carries native separators on every platform.
-fn absolute(media_root: &Path, relative: &str) -> PathBuf {
+pub(crate) fn absolute(media_root: &Path, relative: &str) -> PathBuf {
     let mut path = media_root.to_path_buf();
     for component in relative.split('/').filter(|part| !part.is_empty()) {
         path.push(component);
@@ -367,7 +393,7 @@ fn absolute(media_root: &Path, relative: &str) -> PathBuf {
 /// both exist and both are the file being renamed, so treating "destination
 /// exists" as a collision would refuse every correction of a lowercase marker -
 /// the single most common fix in a real library.
-fn is_same_file(left: &Path, right: &Path) -> bool {
+pub(crate) fn is_same_file(left: &Path, right: &Path) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
         (Ok(left), Ok(right)) => left == right,
         _ => false,
@@ -375,7 +401,7 @@ fn is_same_file(left: &Path, right: &Path) -> bool {
 }
 
 /// Which of the directories a run moved files out of are now empty.
-fn emptied(media_root: &Path, mut directories: Vec<PathBuf>) -> Vec<String> {
+pub(crate) fn emptied(media_root: &Path, mut directories: Vec<PathBuf>) -> Vec<String> {
     directories.sort();
     directories.dedup();
 

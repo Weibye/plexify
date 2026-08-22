@@ -7,6 +7,7 @@ pub mod job;
 pub mod naming;
 pub mod paths;
 pub mod queue;
+pub mod undo;
 
 use clap::ValueEnum;
 
