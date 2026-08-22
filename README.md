@@ -380,6 +380,33 @@ from the file's own name and can act on. **Needing a decision** means the name c
 decomposed — a duplicated library root, a missing episode marker, a film with no year — and
 nothing is proposed, because the right answer is not recoverable from the path.
 
+### Narrowing a run
+
+The path can be the library root or any directory inside it:
+
+```bash
+plexify validate /path/to/media                          # the whole library
+plexify validate /path/to/media/Series                   # one root
+plexify validate "/path/to/media/Series/Elementary"      # one series
+plexify validate "/path/to/media/Series/Elementary/Season 6"
+```
+
+Judgement is always made against the library root, whichever directory you point at —
+plexify finds the root by looking for `Series`, `Anime`, or `Movies` in the path, and says
+which one it settled on. That matters because canonical form is defined from the root: a
+path starting `Season 06/` names no series and belongs to no root.
+
+This is the safe way to start on a library you care about. Fix one series, let Plex rescan
+it, and widen once you trust the result:
+
+```bash
+plexify validate "/media/Series/Elementary" --fix
+```
+
+Files outside the directory you named are not touched, but destinations may still land
+outside it — correcting `Season 6` to `Season 06` moves a file into a sibling directory, and
+that is the point.
+
 ### Carrying the renames out
 
 ```bash

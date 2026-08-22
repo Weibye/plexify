@@ -130,7 +130,11 @@ pub struct FailedMove {
 ///
 /// Reads the filesystem but changes nothing.
 pub fn plan(report: &ValidationReport) -> FixPlan {
-    let media_root = &report.scan_path;
+    // The library root, not the directory that was walked. A run narrowed to one
+    // season still proposes destinations relative to the root - and a file's
+    // destination is often outside the subtree that was scanned, since correcting
+    // `Season 6` to `Season 06` moves it into a sibling directory.
+    let media_root = &report.library_root;
 
     // A media file and the files named after it move together or not at all.
     // Renaming a `.webm` and leaving its `.vtt` behind would break the pairing
@@ -438,6 +442,7 @@ mod tests {
         ValidationReport {
             scanned_files: issues.len(),
             issues,
+            library_root: root.to_path_buf(),
             scan_path: root.to_path_buf(),
             validation_time: Duration::from_secs(0),
         }
@@ -793,5 +798,42 @@ mod tests {
         );
         assert_eq!(outcome.refusals.len(), 1);
         assert!(absolute(root, "Series/Show/Season 1/Show - S01E01 Pilot.mkv").exists());
+    }
+
+    #[test]
+    fn a_scoped_run_moves_files_out_of_the_subtree_that_was_scanned() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        touch(
+            root,
+            "Series/Elementary/Season 6/Elementary - S06E08 Sand Trap.mkv",
+        );
+
+        // What `validate` produces when pointed at the season directory: paths
+        // relative to the library root, but only that subtree walked.
+        let scoped = ValidationReport {
+            scanned_files: 1,
+            issues: vec![rename_issue(
+                "Series/Elementary/Season 6/Elementary - S06E08 Sand Trap.mkv",
+                "Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap.mkv",
+            )],
+            library_root: root.to_path_buf(),
+            scan_path: root.join("Series/Elementary/Season 6"),
+            validation_time: Duration::from_secs(0),
+        };
+
+        let outcome = apply(&plan(&scoped), &temp.path().join("plan.json")).unwrap();
+
+        assert_eq!(
+            outcome.applied.len(),
+            1,
+            "destinations resolve from the library root, not the scanned directory: {:?}",
+            outcome.refusals
+        );
+        assert!(absolute(
+            root,
+            "Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap.mkv"
+        )
+        .exists());
     }
 }

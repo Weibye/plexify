@@ -39,12 +39,79 @@
 mod parse;
 mod render;
 
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use crate::paths::to_forward_slashes;
 
 pub use parse::parse;
 pub use render::render;
+
+/// Which part of the library to look at, and what to measure it against.
+///
+/// Every judgement here is made on a path relative to the library root, so a
+/// caller who points at one series still has to be measured from the root - a
+/// path starting `Season 06/` names no series and belongs to no root, and would
+/// be refused as unresolvable.
+///
+/// Separating the two lets a run be narrowed to a corner of the library without
+/// changing what canonical means: walk `scan_path`, judge against `library_root`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scope {
+    /// The directory holding `Series`, `Anime`, and `Movies`.
+    pub library_root: PathBuf,
+    /// The subtree to actually walk. Equal to the root for a whole-library run.
+    pub scan_path: PathBuf,
+}
+
+impl Scope {
+    /// Whether this run covers the whole library.
+    pub fn is_whole_library(&self) -> bool {
+        self.library_root == self.scan_path
+    }
+}
+
+/// Work out which library a path belongs to, and how much of it to walk.
+///
+/// The library root is the parent of the **outermost** component named after a
+/// root. Outermost rather than nearest matters for a tree that was nested into
+/// itself: pointing into `Series/Veronica Mars/Series/...` finds the outer
+/// `Series`, so the duplication is still reported rather than being read as a
+/// library in its own right.
+///
+/// A path containing no library root at all is taken to be the library root, so
+/// a whole-library run works exactly as before.
+///
+/// Give this an absolute path. A relative one that *starts* at a root - plain
+/// `Series/Elementary` - has nothing before that component to be the library
+/// root, and the current directory stands in. Callers that take a path from a
+/// user should resolve it first, so that what the report prints is unambiguous.
+pub fn scope_for(path: &Path) -> Scope {
+    let components: Vec<Component> = path.components().collect();
+
+    let root_position = components.iter().position(|component| match component {
+        Component::Normal(name) => LibraryRoot::from_component(&name.to_string_lossy()).is_some(),
+        _ => false,
+    });
+
+    match root_position {
+        Some(position) => {
+            let library_root: PathBuf = components[..position].iter().collect();
+
+            Scope {
+                library_root: if library_root.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    library_root
+                },
+                scan_path: path.to_path_buf(),
+            }
+        }
+        None => Scope {
+            library_root: path.to_path_buf(),
+            scan_path: path.to_path_buf(),
+        },
+    }
+}
 
 /// The top-level directories a library is organised into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -472,5 +539,92 @@ mod tests {
                 "proposed destination is not canonical: {path} -> {destination}"
             );
         }
+    }
+
+    #[test]
+    fn a_path_with_no_library_root_is_the_library_root() {
+        let scope = scope_for(Path::new("/media/library"));
+
+        assert_eq!(scope.library_root, PathBuf::from("/media/library"));
+        assert_eq!(scope.scan_path, PathBuf::from("/media/library"));
+        assert!(scope.is_whole_library());
+    }
+
+    #[test]
+    fn pointing_at_a_series_still_measures_from_the_library_root() {
+        let scope = scope_for(Path::new("/media/library/Series/Elementary"));
+
+        assert_eq!(scope.library_root, PathBuf::from("/media/library"));
+        assert_eq!(
+            scope.scan_path,
+            PathBuf::from("/media/library/Series/Elementary")
+        );
+        assert!(!scope.is_whole_library());
+    }
+
+    #[test]
+    fn pointing_at_a_season_works_the_same_way() {
+        let scope = scope_for(Path::new("/media/library/Anime/Cowboy Bebop/Season 01"));
+
+        assert_eq!(scope.library_root, PathBuf::from("/media/library"));
+    }
+
+    #[test]
+    fn pointing_at_a_root_directory_scopes_to_it() {
+        let scope = scope_for(Path::new("/media/library/Movies"));
+
+        assert_eq!(scope.library_root, PathBuf::from("/media/library"));
+        assert_eq!(scope.scan_path, PathBuf::from("/media/library/Movies"));
+    }
+
+    #[test]
+    fn a_tree_nested_into_itself_resolves_to_the_outer_root() {
+        let scope = scope_for(Path::new(
+            "/media/library/Series/Veronica Mars/Series/Season 01",
+        ));
+
+        assert_eq!(
+            scope.library_root,
+            PathBuf::from("/media/library"),
+            "the inner Series is the duplication we report, not a library of its own"
+        );
+    }
+
+    #[test]
+    fn a_directory_merely_containing_a_root_name_is_not_one() {
+        let scope = scope_for(Path::new("/media/library/Movies About Series"));
+
+        assert_eq!(
+            scope.library_root,
+            PathBuf::from("/media/library/Movies About Series")
+        );
+    }
+
+    #[test]
+    fn scoping_does_not_change_what_canonical_means() {
+        let scope = scope_for(Path::new("/media/library/Series/Elementary"));
+        let file = Path::new("Series/Elementary/Season 6/Elementary - S06E08 Sand Trap.mkv");
+
+        // The relative path is what gets judged, and it is the same either way.
+        assert_eq!(
+            assess(file),
+            Assessment::Rename {
+                destination: "Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap.mkv"
+                    .to_string()
+            }
+        );
+        assert_eq!(scope.library_root, PathBuf::from("/media/library"));
+    }
+
+    #[test]
+    fn a_relative_path_starting_at_a_root_falls_back_to_the_current_directory() {
+        let scope = scope_for(Path::new("Series/Elementary"));
+
+        assert_eq!(
+            scope.library_root,
+            PathBuf::from("."),
+            "an empty root would give the ignore filter nothing to walk"
+        );
+        assert_eq!(scope.scan_path, PathBuf::from("Series/Elementary"));
     }
 }
