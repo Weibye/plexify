@@ -44,7 +44,7 @@ pub fn read_record(plan_file: &Path) -> Result<FixOutcome> {
 
     serde_json::from_str(&contents).with_context(|| {
         format!(
-            "could not read {plan_file:?} as a record of a completed run - it may be from an              older version of plexify, or from a run that was interrupted before it finished"
+            "could not read {plan_file:?} as a record of a completed run - it may be from an older version of plexify, or from a run that was interrupted before it finished"
         )
     })
 }
@@ -662,8 +662,10 @@ mod tests {
         let message = format!("{error:#}");
 
         assert!(
-            message.contains("older version") && message.contains("interrupted"),
-            "a parse failure is not proof the file is foreign: {message}"
+            message.contains(
+                "it may be from an older version of plexify, or from a run that was interrupted before it finished"
+            ),
+            "a parse failure is not proof the file is foreign, and the sentence saying so has to read as one: {message}"
         );
     }
 }
