@@ -22,7 +22,8 @@ use super::{Episode, LibraryRoot, MediaName, Movie, SeasonDirectory, Unresolvabl
 /// why words that double as English live in [`AMBIGUOUS_RELEASE_TOKENS`] instead.
 const RELEASE_TOKENS: &[&str] = &[
     "dvdrip", "dvdscr", "bdrip", "brrip", "bluray", "webrip", "webdl", "hdtv", "pdtv", "hdrip",
-    "xvid", "divx", "x264", "x265", "h264", "h265", "hevc", "aac", "ac3", "dts", "mp3",
+    "xvid", "divx", "x264", "x265", "h264", "h265", "hevc", "avc", "aac", "eac3", "ac3", "dts",
+    "truehd", "atmos", "flac", "opus", "mp3", "10bit", "8bit", "hi10p", "remux",
 ];
 
 /// Release tokens that are also ordinary words.
@@ -47,7 +48,10 @@ const AMBIGUOUS_RELEASE_TOKENS: &[&str] = &[
 /// `S01E02`, `s1e2`, `S01.E02` - the marker that makes a file an episode.
 fn episode_marker() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)\bs(\d{1,3})[\s._-]*e(\d{1,3})\b").unwrap())
+    // The trailing group catches `S01E13.5`, a half episode. It is captured
+    // rather than ignored so the parser can refuse it instead of reading `E13`
+    // and quietly putting it on top of the real one.
+    RE.get_or_init(|| Regex::new(r"(?i)\bs(\d{1,3})[\s._-]*e(\d{1,3})(\.\d+)?\b").unwrap())
 }
 
 /// `Season 6`, `season 06 - The Arc Name`.
@@ -60,6 +64,12 @@ fn season_directory() -> &'static Regex {
 fn quality_marker() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?i)\b(\d{3,4}p(?:\d{2,3})?|4k)\b").unwrap())
+}
+
+/// A bracketed or parenthesised group: `[1080p]`, `(720p60)`, `[HorribleSubs]`.
+fn bracketed_group() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"[\[(][^\])]*[\])]").unwrap())
 }
 
 /// A four digit year, as a whole token.
@@ -123,6 +133,13 @@ fn parse_episode(
         .captures(stem)
         .ok_or(Unresolvable::NoEpisodeMarker)?;
     let whole_marker = marker.get(0).expect("group 0 always exists");
+
+    // `S01E13.5` is a half episode - a recap or a special that sits between two
+    // numbered ones. There is no canonical form for it, and rounding it to E13
+    // would put it on top of the real E13.
+    if marker.get(3).is_some() {
+        return Err(Unresolvable::FractionalEpisode);
+    }
 
     let season = marker[1]
         .parse()
@@ -198,27 +215,43 @@ fn parse_movie(
     stem: &str,
     extension: &str,
 ) -> Result<MediaName, Unresolvable> {
-    // Prefer the year the file states; fall back to the one its directory does,
-    // which is where a `Title (2008)` directory holding a bare filename keeps it.
-    let (year, before_year) = match year_marker().find(stem) {
-        Some(found) => (
-            found
-                .as_str()
-                .parse()
-                .map_err(|_| Unresolvable::NoReleaseYear)?,
-            &stem[..found.start()],
-        ),
-        None => {
-            let from_directory = directories
-                .last()
-                .and_then(|directory| year_marker().find(directory))
-                .and_then(|found| found.as_str().parse().ok())
-                .ok_or(Unresolvable::NoReleaseYear)?;
-            (from_directory, stem)
+    // Quality is read before anything is cut away, since it usually lives in one
+    // of the bracketed groups that are about to go.
+    let quality = quality_marker()
+        .find(stem)
+        .map(|found| found.as_str().to_lowercase());
+
+    // A film's own name carries its year; the directory usually repeats it. When
+    // both say so and they disagree, one of them is wrong about which film this
+    // is, and nothing in the path says which.
+    let from_file = year_marker()
+        .find(stem)
+        .and_then(|found| found.as_str().parse::<u32>().ok().map(|year| (year, found)));
+    let from_directory = directories
+        .last()
+        .and_then(|directory| year_marker().find(directory))
+        .and_then(|found| found.as_str().parse::<u32>().ok());
+
+    if let (Some((file_year, _)), Some(directory_year)) = (&from_file, from_directory) {
+        if *file_year != directory_year {
+            return Err(Unresolvable::ConflictingYear {
+                directory: directory_year,
+                file: *file_year,
+            });
         }
+    }
+
+    let (year, before_year) = match (from_file, from_directory) {
+        (Some((file_year, found)), _) => (file_year, &stem[..found.start()]),
+        (None, Some(directory_year)) => (directory_year, stem),
+        (None, None) => return Err(Unresolvable::NoReleaseYear),
     };
 
-    let title = clean_name(&strip_release_tokens(&dots_to_spaces(before_year)));
+    // Bracketed groups describe the file, not the film - `[1080p]`,
+    // `[Multiple Subtitle]`, a fansub tag. Dropping them whole is what keeps a
+    // name carrying several of them from having their fragments read as a title.
+    let without_groups = bracketed_group().replace_all(before_year, " ");
+    let title = clean_name(&strip_release_tokens(&dots_to_spaces(&without_groups)));
     if title.is_empty() {
         return Err(Unresolvable::NoMovieTitle);
     }
@@ -228,6 +261,7 @@ fn parse_movie(
         directories: directories.iter().map(|part| part.to_string()).collect(),
         title,
         year,
+        quality,
         extension: extension.to_string(),
     }))
 }
@@ -238,10 +272,15 @@ fn parse_title_and_quality(remainder: &str) -> (Option<String>, Option<String>) 
         .find(remainder)
         .map(|found| found.as_str().to_lowercase());
 
+    // Whatever a bracketed group holds - `[1080p]`, `[HorribleSubs]`, a CRC32
+    // stamped on by a fansub tool - describes the file rather than names the
+    // episode. Quality has just been read out of them; the groups go.
+    let without_groups = bracketed_group().replace_all(remainder, " ");
+
     // Cut the quality out rather than blanking it: a space here would make a
     // dotted name look spaced, and `dots_to_spaces` would then leave its dots
     // alone - `Show.S01E01.Pilot.1080p` would keep the dots it needs converted.
-    let without_quality = quality_marker().replace_all(remainder, "");
+    let without_quality = quality_marker().replace_all(&without_groups, "");
     let title = clean_name(&strip_release_tokens(&dots_to_spaces(&without_quality)));
 
     (if title.is_empty() { None } else { Some(title) }, quality)
@@ -287,16 +326,24 @@ fn dots_to_spaces(text: &str) -> String {
 /// - The release group - the shouted token a scene release signs off with - goes
 ///   under the same condition, so a genuine title like `TKO` survives.
 fn strip_release_tokens(text: &str) -> String {
+    // Split on whitespace only. A hyphen belongs to the title far more often
+    // than to the release - `Dungeons & Dragons - Honour Among Thieves` - and
+    // the one place it separates metadata, the `x265-iVy` sign-off, sits inside
+    // the tail that gets cut below.
     let subtokens: Vec<&str> = text
         .split_whitespace()
-        .flat_map(|token| token.split('-'))
         .filter(|token| !token.is_empty())
         .collect();
 
     let matches_any = |token: &str, known: &[&str]| {
-        known
-            .iter()
-            .any(|candidate| token.eq_ignore_ascii_case(candidate))
+        known.iter().any(|candidate| {
+            token.eq_ignore_ascii_case(candidate)
+                // `x265-iVy`: the token is the codec with its group attached.
+                || token
+                    .split('-')
+                    .next()
+                    .is_some_and(|head| head.eq_ignore_ascii_case(candidate))
+        })
     };
 
     // One unmistakable token is what makes the rest of the name readable as
@@ -305,11 +352,21 @@ fn strip_release_tokens(text: &str) -> String {
         .iter()
         .any(|token| matches_any(token, RELEASE_TOKENS));
 
+    // A scene name is a title followed by a tail of technical tokens, so the
+    // first unmistakable one marks where the title ended. Cutting there is what
+    // removes the parts no list could enumerate: the `2.0` channel layout of
+    // `EAC3.2.0`, and a release group whose capitalisation - `iVy` - defeats
+    // reading it as shouted.
+    let subtokens = match subtokens
+        .iter()
+        .position(|token| matches_any(token, RELEASE_TOKENS))
+    {
+        Some(tail) => &subtokens[..tail],
+        None => &subtokens[..],
+    };
+
     let mut kept: Vec<&str> = Vec::new();
-    for token in subtokens {
-        if matches_any(token, RELEASE_TOKENS) {
-            continue;
-        }
+    for token in subtokens.iter().copied() {
         if looks_like_a_scene_release && matches_any(token, AMBIGUOUS_RELEASE_TOKENS) {
             continue;
         }

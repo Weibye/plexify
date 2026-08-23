@@ -13,7 +13,7 @@
 //! parsed again to decide whether a file is already correct, so anything it
 //! emits has to be something the parser reads back unchanged.
 
-use super::{Episode, MediaName, Movie};
+use super::{Episode, MediaName, Movie, SeasonDirectory};
 
 /// Render a parsed name into its canonical path, relative to the media root.
 pub fn render(name: &MediaName) -> String {
@@ -27,17 +27,24 @@ fn render_episode(episode: &Episode) -> String {
     let mut components = vec![episode.root.as_str().to_string()];
     components.extend(episode.directories.iter().cloned());
 
-    // The season directory comes from the episode's own marker, not from the
+    // The season *number* comes from the episode's own marker, not from the
     // directory it happened to be in. That is what moves a loose file into a
-    // season directory and a misfiled one across - and it is why the parsed
-    // `season_directory` is not consulted here.
+    // season directory and a misfiled one across.
     //
-    // An arc name is dropped along the way. Plex's scanner reads a season
-    // directory as the word "Season" and a number; anything appended stops it
-    // parsing and can collapse two seasons into one. The arc name belongs to the
-    // season in metadata rather than in a path component, and the proposed
-    // rename shows it going.
-    components.push(season_directory_for(episode.season));
+    // An arc name on that directory is kept, though - `Season 02 - The Mighty
+    // Nein`. Plex takes the season from the marker in the filename, so the arc
+    // name costs it nothing, and it is information somebody curated: One Piece
+    // arcs here carry their episode ranges. It survives only where the directory
+    // already agrees with the marker; a file being moved to another season
+    // cannot bring the old season's arc name with it.
+    components.push(match &episode.season_directory {
+        SeasonDirectory::Numbered { number, suffix }
+            if *number == episode.season && !suffix.is_empty() =>
+        {
+            format!("Season {:02}{}", episode.season, suffix)
+        }
+        _ => season_directory_for(episode.season),
+    });
     components.extend(episode.nested_directories.iter().cloned());
 
     let mut filename = format!(
@@ -73,11 +80,15 @@ fn season_directory_for(season: u32) -> String {
 fn render_movie(movie: &Movie) -> String {
     let mut components = vec![movie.root.as_str().to_string()];
     components.extend(movie.directories.iter().cloned());
-    components.push(format!(
-        "{} ({}).{}",
-        movie.title, movie.year, movie.extension
-    ));
 
+    let mut filename = format!("{} ({})", movie.title, movie.year);
+    if let Some(quality) = &movie.quality {
+        filename.push_str(&format!(" [{quality}]"));
+    }
+    filename.push('.');
+    filename.push_str(&movie.extension);
+
+    components.push(filename);
     components.join("/")
 }
 
@@ -199,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    fn drops_an_arc_name_from_the_season_directory() {
+    fn keeps_an_arc_name_the_season_directory_already_carries() {
         let with_arc = Episode {
             season_directory: SeasonDirectory::Numbered {
                 number: 6,
@@ -210,8 +221,40 @@ mod tests {
 
         assert_eq!(
             render(&MediaName::Episode(with_arc)),
+            "Series/Elementary/Season 06 - The Long Night/Elementary - S06E08 - Sand Trap.mkv",
+            "Plex reads the season from the marker, so the arc name costs nothing and is information somebody curated"
+        );
+    }
+
+    #[test]
+    fn pads_a_season_directory_while_keeping_its_arc_name() {
+        let with_arc = Episode {
+            season_directory: SeasonDirectory::Numbered {
+                number: 6,
+                suffix: " - The Long Night".to_string(),
+            },
+            season: 6,
+            ..episode()
+        };
+
+        assert!(render(&MediaName::Episode(with_arc)).contains("/Season 06 - The Long Night/"));
+    }
+
+    #[test]
+    fn does_not_carry_an_arc_name_into_another_season() {
+        let misfiled = Episode {
+            season_directory: SeasonDirectory::Numbered {
+                number: 2,
+                suffix: " - The Long Night".to_string(),
+            },
+            season: 6,
+            ..episode()
+        };
+
+        assert_eq!(
+            render(&MediaName::Episode(misfiled)),
             "Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap.mkv",
-            "an arc name appended to a season directory stops Plex parsing the season"
+            "season two's arc name does not describe season six"
         );
     }
 
@@ -222,6 +265,7 @@ mod tests {
             directories: vec!["Marvel Cinematic Universe Collection".to_string()],
             title: "Iron Man".to_string(),
             year: 2008,
+            quality: None,
             extension: "mkv".to_string(),
         };
 

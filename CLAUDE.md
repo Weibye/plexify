@@ -109,10 +109,12 @@ Consequences to preserve when changing it:
   but must never invent a value. Unrecoverable paths return `Unresolvable` with a reason.
 - Rules apply per path component, and a component with no rule is preserved. The series
   directory is not renamed.
-- The season directory is the exception: it is **derived from the episode's own marker**,
-  not preserved. A file with no season directory is moved into one, a misfiled file moves
-  across, and season zero renders as `Specials`. `Episode::season_directory` records what
-  was found and is not what gets rendered - reading it in `render` would undo this.
+- The season directory is the exception: its **number** comes from the episode's own marker,
+  not from the directory. A file with no season directory is moved into one, a misfiled file
+  moves across, and season zero renders as `Specials`. An arc name already on that directory
+  (`Season 02 - The Mighty Nein`) is kept, because Plex reads the season from the filename
+  marker and the arc name is curated information - but only where the directory already
+  agrees with the marker, since a file moving seasons cannot carry the old arc name along.
 
 **A run can be narrowed without changing what canonical means.** `naming::scope_for` splits
 the path a user gave into a `library_root` (the parent of the outermost `Series`/`Anime`/

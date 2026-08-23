@@ -343,9 +343,10 @@ comes from the episode marker in the filename, so:
 - A file with no season directory is moved into `Season NN`, created if it does not exist.
 - A file in the wrong season directory moves to the one its marker names.
 - Season zero is `Specials`.
-- An arc name appended to a season directory — `Season 01 - Vox Machina` — is removed. Plex's
-  scanner reads a season directory as the word "Season" and a number, and text after that
-  stops it parsing the season, which can collapse several seasons into one.
+- An arc name already on a season directory — `Season 02 - The Mighty Nein` — is kept. Plex
+  reads the season from the `SxxExx` marker in the filename, so the arc name costs nothing.
+  It is dropped only when a file moves to a different season, since the old season's arc name
+  does not describe the new one.
 
 A directory nested below the season directory, such as `Season 01/Extras`, stays where it is.
 

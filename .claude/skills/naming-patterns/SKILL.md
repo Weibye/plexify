@@ -45,10 +45,16 @@ Rules that hold across every entry:
 - Every episode is in the season directory its marker names, created if it does not exist.
   Season zero is `Specials`.
 - Season directories are zero-padded to two digits — `Season 6` is wrong, `Season 06` is
-  right — and carry nothing else. An arc name appended to one (`Season 01 - Vox Machina`)
-  is reported for removal: Plex's scanner reads the word "Season" and a number, and text
-  after that stops it parsing the season, which can collapse several seasons into one. The
-  arc name belongs to the season in metadata. `Specials` keeps its own name.
+  right. An arc name already on one (`Season 02 - The Mighty Nein`) is **kept**: Plex takes
+  the season from the marker in the filename, so the arc name costs it nothing, and it is
+  usually something a person curated — the One Piece arcs in the observed library carry their
+  episode ranges. It is dropped only when the file is moving to a different season, which the
+  old arc name does not describe. `Specials` keeps its own name.
+
+  This was the other way round once, on the strength of a forum thread. The library itself
+  settled it: three arc-named Critical Role seasons all render correctly, and the one season
+  that failed to appear in Plex was the one whose *files* carried no `SxxExx` marker. The
+  marker is what Plex reads; the directory name is decoration.
 - `SxxExx` markers are uppercase.
 - A dash with surrounding spaces separates series name, episode marker, and episode title.
 - Quality metadata goes in square brackets and comes after the title, with no dash before
