@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! {Root}/{Series Directory}/Season {NN}/{Series} - S{NN}E{NN} - {Title} [{quality}].{ext}
-//! {Root}/{Film Directory}/{Title} ({Year}).{ext}
+//! {Root}/{Film Directory}/{Title} ({Year}) [{quality}].{ext}
 //! ```
 //!
 //! Optional fields disappear cleanly rather than leaving their separators
@@ -38,8 +38,11 @@ fn render_episode(episode: &Episode) -> String {
     // already agrees with the marker; a file being moved to another season
     // cannot bring the old season's arc name with it.
     components.push(match &episode.season_directory {
+        // Season zero is `Specials` and nothing else. Letting an arc name through
+        // here would give it a second canonical home, and a file could then sit
+        // correctly in either.
         SeasonDirectory::Numbered { number, suffix }
-            if *number == episode.season && !suffix.is_empty() =>
+            if episode.season > 0 && *number == episode.season && !suffix.is_empty() =>
         {
             format!("Season {:02}{}", episode.season, suffix)
         }
@@ -77,6 +80,11 @@ fn season_directory_for(season: u32) -> String {
     }
 }
 
+/// A film: `{Title} ({Year}) [{quality}].{ext}`.
+///
+/// The quality is optional and disappears with its brackets, the same way an
+/// episode's does - a film keeps it for the same reason, that it is information
+/// the library holds.
 fn render_movie(movie: &Movie) -> String {
     let mut components = vec![movie.root.as_str().to_string()];
     components.extend(movie.directories.iter().cloned());

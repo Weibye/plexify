@@ -324,7 +324,7 @@ Every file in the library is driven toward one shape:
 ```
 Series/Show Name/Season NN/Show Name - SNNENN - Episode Title [quality].ext
 Anime/Show Name/Season NN/Show Name - SNNENN - Episode Title [quality].ext
-Movies/Film Name (Year)/Film Name (Year).ext
+Movies/Film Name (Year)/Film Name (Year) [quality].ext
 ```
 
 - Season directories are zero-padded to two digits: `Season 06`, not `Season 6`.

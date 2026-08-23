@@ -760,4 +760,133 @@ mod tests {
             })
         );
     }
+
+    /// Every one of these is a name the tail cut damaged, from review of the
+    /// change that introduced it. A title is not release metadata just because
+    /// it contains a word that also names a codec.
+    #[test]
+    fn a_technical_word_inside_a_title_does_not_end_it() {
+        for path in [
+            "Series/Show/Season 01/Show - S01E01 - The DTS Report.mkv",
+            "Series/Show/Season 01/Show - S01E01 - Atmos of Fear.mkv",
+            "Series/Show/Season 01/Show - S01E01 - Opus and Bill.mkv",
+        ] {
+            assert_eq!(
+                assess(Path::new(path)),
+                Assessment::Canonical,
+                "the title of {path} is already correct and must survive"
+            );
+        }
+    }
+
+    #[test]
+    fn a_film_named_after_a_codec_word_keeps_its_name() {
+        assert_eq!(
+            assess(Path::new(
+                "Movies/Mr Hollands Opus (1995)/Mr Hollands Opus (1995).mkv"
+            )),
+            Assessment::Canonical
+        );
+    }
+
+    #[test]
+    fn one_technical_word_is_not_enough_to_read_a_name_as_a_release() {
+        assert_eq!(
+            assess(Path::new(
+                "Series/Show/Season 01/Show - S01E01 - The Bluray Heist.mkv"
+            )),
+            Assessment::Canonical,
+            "a spaced name carrying one such word is a title, not a scene release"
+        );
+    }
+
+    #[test]
+    fn a_movie_does_not_keep_its_quality_in_the_title_as_well() {
+        assert_eq!(
+            assess(Path::new("Movies/Show (2001)/Show 2160p (2001).mkv")),
+            Assessment::Rename {
+                destination: "Movies/Show (2001)/Show (2001) [2160p].mkv".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_year_after_the_marker_is_not_a_fraction_of_an_episode() {
+        let assessment = assess(Path::new(
+            "Series/Show/Season 01/Show.S01E01.2020.1080p.WEB.mkv",
+        ));
+
+        assert!(
+            !matches!(
+                assessment,
+                Assessment::Unresolvable(Unresolvable::FractionalEpisode)
+            ),
+            "`.2020` is a year, not a half episode: {assessment:?}"
+        );
+    }
+
+    #[test]
+    fn a_parenthesised_part_of_a_title_is_kept() {
+        assert_eq!(
+            assess(Path::new(
+                "Series/Show/Season 01/Show - S01E01 - The Beginning (Part 1).mkv"
+            )),
+            Assessment::Canonical
+        );
+    }
+
+    /// What matters is that the edition survives, so the two cuts of one film
+    /// keep separate names. Dropping it made them collide, and `fix` then
+    /// refused both for ever. Leaving the name alone satisfies that and touches
+    /// nothing, which is the better of the two ways to satisfy it.
+    #[test]
+    fn an_edition_keeps_a_film_apart_from_the_plain_cut() {
+        let edition = "Movies/Alien (1979)/Alien (Directors Cut) (1979).mkv";
+        let plain = "Movies/Alien (1979)/Alien (1979).mkv";
+
+        assert_eq!(assess(Path::new(edition)), Assessment::Canonical);
+        assert_eq!(assess(Path::new(plain)), Assessment::Canonical);
+
+        // Where each one belongs, said plainly: two names in, two names out.
+        assert_ne!(
+            render(&parse(edition).unwrap()),
+            render(&parse(plain).unwrap()),
+            "two cuts of one film must not resolve to one name"
+        );
+    }
+
+    #[test]
+    fn season_zero_is_specials_whatever_the_directory_is_called() {
+        assert_eq!(
+            assess(Path::new(
+                "Series/Show/Season 00 - Extras/Show - S00E01 - Behind the Scenes.mkv"
+            )),
+            Assessment::Rename {
+                destination: "Series/Show/Specials/Show - S00E01 - Behind the Scenes.mkv"
+                    .to_string()
+            },
+            "an arc name must not give season zero a second canonical home"
+        );
+    }
+
+    #[test]
+    fn a_year_in_a_collection_directory_is_not_the_films_year() {
+        assert_eq!(
+            assess(Path::new(
+                "Movies/Marvel 2012 Collection/Iron Man 3 (2013).mkv"
+            )),
+            Assessment::Canonical
+        );
+    }
+
+    #[test]
+    fn a_number_in_a_film_title_is_not_its_year() {
+        assert_eq!(
+            assess(Path::new(
+                "Movies/Blade Runner 2049 (2017)/Blade Runner 2049 (2017).mkv"
+            )),
+            Assessment::Canonical,
+            "the parenthesised year is the year; 2049 is part of the name"
+        );
+    }
 }

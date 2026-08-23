@@ -468,7 +468,7 @@ impl ValidateCommand {
             } else {
                 let _ = writeln!(
                     out,
-                    "   {}/Film Name (Year)/Film Name (Year).ext",
+                    "   {}/Film Name (Year)/Film Name (Year) [quality].ext",
                     root.as_str()
                 );
             }
