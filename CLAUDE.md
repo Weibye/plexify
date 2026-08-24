@@ -122,6 +122,23 @@ behind is a live process: `kill_on_drop(true)` on the FFmpeg command is what sto
 cancelled encode from running on and writing the same work-folder path as the worker that
 later reclaims the job.
 
+**A long encode is resumable, and that is what the chunk directory in `_in_progress/` is.**
+A source over `MIN_CHUNKED_SECONDS` is encoded in `CHUNK_SECONDS` pieces into
+`{job-id}.chunks/`, each written as `{n}.ts.part` and renamed to `{n}.ts` only after FFmpeg
+exits successfully. A chunk file existing is therefore the whole record of progress —
+`encode_chunks` skips what is already there — so nothing may create one by any other route.
+The pieces are transport streams because that is the container built to be concatenated;
+separately encoded MP4s each carry their own encoder delay and the audio walks further out of
+sync at every join. Subtitles are held out of the chunks and muxed in during the join, from
+the source, so that no subtitle event is cut in half at a boundary. `reclaim_stranded_jobs`
+leaves the chunk directory alone for exactly this reason.
+
+**De-prioritising a background worker has no portable spelling.** `nice` is a POSIX utility
+and is not on a Windows PATH, so wrapping the command in it there does not lower FFmpeg's
+priority — it fails to spawn, and the job fails on every retry. `FFmpegProcessor::ffmpeg_command`
+keeps the two behind `cfg`: `nice -n 19` off Windows, `IDLE_PRIORITY_CLASS` as a creation flag
+on it. Both worker nodes matter; do not collapse this back to one branch.
+
 ### 2. Library validation (`validate`)
 
 `src/naming/` owns what a correct path looks like, and `validate` is a caller. The module
