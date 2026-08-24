@@ -49,6 +49,7 @@ a JSON file, and the queue is three directories that jobs move between:
 
 ```
 {work_root}/_queue/{uuid}.job  →  _in_progress/  →  _completed/
+                                              ↘  _failed/
 ```
 
 **A job is named after the file it transcodes.** The `{uuid}` is a v5 UUID derived from the
@@ -90,6 +91,24 @@ before the stream mappings and every `-map` was thrown away.
 encodes to `job.work_folder_output_path(work_folder)` and only then calls
 `move_to_destination`. This keeps a media server from indexing a half-written `.mp4` sitting
 next to the source. Preserve the write-then-move ordering.
+
+**A job that a worker stops running comes back, and a job that cannot succeed stops coming
+back.** Both are properties of the same three moves, and both are easy to undo by accident:
+
+- A worker holds a `{uuid}.job.heartbeat` beside the job it claimed and refreshes it every
+  `HEARTBEAT_INTERVAL`. `JobQueue::reclaim_stranded_jobs`, which runs at worker startup,
+  renames back to `_queue/` any job whose heartbeat has been quiet for `STALE_AFTER`. This is
+  what recovers a job from a worker that was killed: nothing else ever looks in
+  `_in_progress/`. It has to be a *separate* file — touching the job file itself risks a half
+  written job — and the sweep has to stay a rename, or two workers can both take one job.
+- `ClaimedJob::fail` counts the attempt *in the job file* and, past `MAX_ATTEMPTS`, renames
+  the job into `_failed/` instead of `_queue/`. The count lives in the file rather than the
+  name because the name is the v5 id and is what makes the queue addressable. `job_exists`
+  consults `_failed/`, so re-scanning the library cannot walk a parked job back into the
+  queue; moving the file out by hand is what asks for it to be tried again.
+
+Whatever an interrupted encode left in the work folder is left alone by the sweep. Deciding
+what of it is still usable belongs to the encoder, not the queue.
 
 ### 2. Library validation (`validate`)
 

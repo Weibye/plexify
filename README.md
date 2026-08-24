@@ -532,7 +532,8 @@ directory. See [The work directory](#the-work-directory) for how to choose it.
 /path/to/work/           # --work-dir, defaults to the current working directory
 ├── _queue/              # Pending jobs
 ├── _in_progress/        # Currently processing
-└── _completed/          # Finished jobs
+├── _completed/          # Finished jobs
+└── _failed/             # Jobs that failed too many times to keep retrying
 
 /path/to/media/          # Untouched except for the transcoded output
 ├── video1.webm
@@ -543,6 +544,26 @@ directory. See [The work directory](#the-work-directory) for how to choose it.
 Keeping the queue outside the media tree means your media server never sees Plexify's
 bookkeeping files, and lets several machines share one queue over a network mount while
 each reads media from its own path.
+
+### When a worker stops
+
+A worker that is interrupted — Ctrl-C, a kill, a machine losing power — leaves its job in
+`_in_progress/`. While a worker is running a job it keeps a `.heartbeat` file next to it, so
+the next worker to start can tell an abandoned job from one that is still being encoded, and
+moves the abandoned ones back to `_queue/`. That sweep runs at startup, and a job has to have
+been quiet for five minutes before it is taken back.
+
+### When a job cannot succeed
+
+A job that fails is returned to the queue and tried again, up to three times. After that it
+is moved to `_failed/`, where the job file records the attempt count and the last error:
+
+```bash
+cat /path/to/work/_failed/*.job
+```
+
+A parked job is left alone by later scans, so it will not quietly find its way back into the
+queue. Once the cause is fixed, move the job file back into `_queue/` to have it tried again.
 
 ## FFmpeg Processing Details
 

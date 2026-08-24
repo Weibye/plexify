@@ -16,6 +16,16 @@ pub struct Job {
     pub file_type: MediaFileType,
     pub quality_settings: QualitySettings,
     pub post_processing: PostProcessingSettings,
+    /// How many times a worker has tried and failed to transcode this file.
+    ///
+    /// Carried in the job file so it survives a worker restart, and defaulted so
+    /// that job files written before it existed still deserialize.
+    #[serde(default)]
+    pub attempts: u32,
+    /// What went wrong on the most recent failed attempt, so a job parked in
+    /// `_failed` says why it is there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// Quality settings for video encoding
@@ -125,6 +135,8 @@ impl Job {
             file_type,
             quality_settings,
             post_processing,
+            attempts: 0,
+            last_error: None,
         }
     }
 
