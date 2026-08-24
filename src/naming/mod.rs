@@ -160,12 +160,14 @@ impl LibraryRoot {
 pub enum SeasonDirectory {
     /// A numbered season directory, with anything that followed the number.
     ///
-    /// The suffix holds an arc name such as `Season 01 - Vox Machina`. It is
-    /// parsed because it is there, and deliberately not rendered: Plex's scanner
-    /// expects the word "Season" and a number, and text appended to that stops it
-    /// parsing the season - reportedly collapsing several seasons into one. So
-    /// the canonical directory is always `Season NN`, and the arc name lives in
-    /// metadata rather than in the path.
+    /// The suffix holds an arc name such as `Season 01 - Vox Machina`, and it is
+    /// kept. Plex takes the season from the marker in the filename, so the arc
+    /// name costs it nothing: a library observed with three arc-named seasons
+    /// renders all three correctly, while the one season that failed to appear
+    /// was the one whose *files* carried no marker.
+    ///
+    /// It is dropped in exactly one case, in `render`: a file moving to a
+    /// different season cannot bring the old season's arc name with it.
     Numbered { number: u32, suffix: String },
     /// A `Specials` directory, kept under its own name.
     Specials,
@@ -212,6 +214,10 @@ pub struct Movie {
     pub directories: Vec<String>,
     pub title: String,
     pub year: u32,
+    /// Resolution and frame rate, if the name carried them. Kept for the same
+    /// reason an episode keeps it: it is information the library holds, and
+    /// dropping it would be a silent loss.
+    pub quality: Option<String>,
     pub extension: String,
 }
 
@@ -234,12 +240,16 @@ pub enum Unresolvable {
     OutsideLibrary,
     /// An episode file with no recognisable season/episode marker.
     NoEpisodeMarker,
+    /// A marker naming a fraction of an episode, such as `S01E13.5`.
+    FractionalEpisode,
     /// Neither the filename nor the directory it sits in names the series.
     NoSeriesName,
     /// A movie file whose name is nothing but a year and release metadata.
     NoMovieTitle,
     /// A movie file with no release year, which cannot be invented.
     NoReleaseYear,
+    /// The file and the directory holding it name different years.
+    ConflictingYear { directory: u32, file: u32 },
     /// The path has no filename, or a filename with no extension.
     NotAMediaFile,
 }
@@ -263,12 +273,19 @@ impl Unresolvable {
             Unresolvable::NoEpisodeMarker => {
                 "no season and episode marker could be found in the name".to_string()
             }
+            Unresolvable::FractionalEpisode => {
+                "the marker names a fraction of an episode, which has no canonical form; calling it a whole episode would collide with the real one"
+                    .to_string()
+            }
             Unresolvable::NoSeriesName => {
                 "neither the file nor its directory names the series".to_string()
             }
             Unresolvable::NoMovieTitle => {
                 "no film title left once the year and release metadata are removed".to_string()
             }
+            Unresolvable::ConflictingYear { directory, file } => format!(
+                "the directory says {directory} and the file says {file}; which is right is not recoverable from the path"
+            ),
             Unresolvable::NoReleaseYear => {
                 "no release year in the name; the year cannot be guessed".to_string()
             }
@@ -626,5 +643,250 @@ mod tests {
             "an empty root would give the ignore filter nothing to walk"
         );
         assert_eq!(scope.scan_path, PathBuf::from("Series/Elementary"));
+    }
+
+    /// Names taken verbatim from a real library, each one a shape the parser got
+    /// wrong the first time it met it.
+    #[test]
+    fn strips_a_scene_release_tail_from_the_title() {
+        assert_eq!(
+            assess(Path::new(
+                "Series/Blackadder (1982)/Season 01/Blackadder.S01E01.The.Foretelling.1080p.BluRay.EAC3.2.0.1080p.x265-iVy.mkv"
+            )),
+            Assessment::Rename {
+                destination:
+                    "Series/Blackadder (1982)/Season 01/Blackadder - S01E01 - The Foretelling [1080p].mkv"
+                        .to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn keeps_a_dash_that_belongs_to_the_title() {
+        assert_eq!(
+            assess(Path::new(
+                "Series/Show/Season 01/Show - S01E01 - Dungeons & Dragons - Honour Among Thieves.mkv"
+            )),
+            Assessment::Canonical
+        );
+    }
+
+    #[test]
+    fn treats_bracketed_groups_as_metadata_rather_than_a_title() {
+        assert_eq!(
+            assess(Path::new(
+                "Anime/Kill la Kill/Season 01/Kill la Kill - S01E01 - [1080p][HorribleSubs].mkv"
+            )),
+            Assessment::Rename {
+                destination: "Anime/Kill la Kill/Season 01/Kill la Kill - S01E01 [1080p].mkv"
+                    .to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn discards_a_fansub_checksum() {
+        assert_eq!(
+            assess(Path::new(
+                "Anime/Made In Abyss/Season 02/Made In Abyss - S02E01 - [1080p][HorribleSubs] [73241537].mkv"
+            )),
+            Assessment::Rename {
+                destination: "Anime/Made In Abyss/Season 02/Made In Abyss - S02E01 [1080p].mkv"
+                    .to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn refuses_a_fractional_episode_rather_than_rounding_it_into_another() {
+        assert_eq!(
+            assess(Path::new(
+                "Anime/Shingeki no Kyojin/Season 01/Shingeki no Kyojin - S01E13.5 - [1080p][HorribleSubs].mkv"
+            )),
+            Assessment::Unresolvable(Unresolvable::FractionalEpisode),
+            "S01E13.5 is a half episode; calling it E13 would collide with the real one"
+        );
+    }
+
+    #[test]
+    fn keeps_the_quality_on_a_movie() {
+        assert_eq!(
+            assess(Path::new(
+                "Movies/Knives Out (2019)/Knives Out (2019) - [1080p].mp4"
+            )),
+            Assessment::Rename {
+                destination: "Movies/Knives Out (2019)/Knives Out (2019) [1080p].mp4".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn keeps_a_dash_in_a_movie_title() {
+        assert_eq!(
+            assess(Path::new(
+                "Movies/Dungeons & Dragons - Honour Among Thieves (2023)/Dungeons & Dragons - Honour Among Thieves (2023)[720p].mkv"
+            )),
+            Assessment::Rename {
+                destination:
+                    "Movies/Dungeons & Dragons - Honour Among Thieves (2023)/Dungeons & Dragons - Honour Among Thieves (2023) [720p].mkv"
+                        .to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn does_not_mangle_a_movie_carrying_several_bracketed_groups() {
+        assert_eq!(
+            assess(Path::new(
+                "Movies/Made In Abyss - Fukaki Tamashii no Reimei (2020)/Made in Abyss - Fukaki Tamashii no Reimei - [1080p][Multiple Subtitle].mkv"
+            )),
+            Assessment::Rename {
+                destination:
+                    "Movies/Made In Abyss - Fukaki Tamashii no Reimei (2020)/Made in Abyss - Fukaki Tamashii no Reimei (2020) [1080p].mkv"
+                        .to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn refuses_a_movie_whose_file_and_directory_disagree_about_the_year() {
+        assert_eq!(
+            assess(Path::new(
+                "Movies/Kubo and the Two Strings (2016)/Kubo and the Two Strings (2018) - [1080p].mkv"
+            )),
+            Assessment::Unresolvable(Unresolvable::ConflictingYear {
+                directory: 2016,
+                file: 2018
+            })
+        );
+    }
+
+    /// Every one of these is a name the tail cut damaged, from review of the
+    /// change that introduced it. A title is not release metadata just because
+    /// it contains a word that also names a codec.
+    #[test]
+    fn a_technical_word_inside_a_title_does_not_end_it() {
+        for path in [
+            "Series/Show/Season 01/Show - S01E01 - The DTS Report.mkv",
+            "Series/Show/Season 01/Show - S01E01 - Atmos of Fear.mkv",
+            "Series/Show/Season 01/Show - S01E01 - Opus and Bill.mkv",
+        ] {
+            assert_eq!(
+                assess(Path::new(path)),
+                Assessment::Canonical,
+                "the title of {path} is already correct and must survive"
+            );
+        }
+    }
+
+    #[test]
+    fn a_film_named_after_a_codec_word_keeps_its_name() {
+        assert_eq!(
+            assess(Path::new(
+                "Movies/Mr Hollands Opus (1995)/Mr Hollands Opus (1995).mkv"
+            )),
+            Assessment::Canonical
+        );
+    }
+
+    #[test]
+    fn one_technical_word_is_not_enough_to_read_a_name_as_a_release() {
+        assert_eq!(
+            assess(Path::new(
+                "Series/Show/Season 01/Show - S01E01 - The Bluray Heist.mkv"
+            )),
+            Assessment::Canonical,
+            "a spaced name carrying one such word is a title, not a scene release"
+        );
+    }
+
+    #[test]
+    fn a_movie_does_not_keep_its_quality_in_the_title_as_well() {
+        assert_eq!(
+            assess(Path::new("Movies/Show (2001)/Show 2160p (2001).mkv")),
+            Assessment::Rename {
+                destination: "Movies/Show (2001)/Show (2001) [2160p].mkv".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_year_after_the_marker_is_not_a_fraction_of_an_episode() {
+        let assessment = assess(Path::new(
+            "Series/Show/Season 01/Show.S01E01.2020.1080p.WEB.mkv",
+        ));
+
+        assert!(
+            !matches!(
+                assessment,
+                Assessment::Unresolvable(Unresolvable::FractionalEpisode)
+            ),
+            "`.2020` is a year, not a half episode: {assessment:?}"
+        );
+    }
+
+    #[test]
+    fn a_parenthesised_part_of_a_title_is_kept() {
+        assert_eq!(
+            assess(Path::new(
+                "Series/Show/Season 01/Show - S01E01 - The Beginning (Part 1).mkv"
+            )),
+            Assessment::Canonical
+        );
+    }
+
+    /// What matters is that the edition survives, so the two cuts of one film
+    /// keep separate names. Dropping it made them collide, and `fix` then
+    /// refused both for ever. Leaving the name alone satisfies that and touches
+    /// nothing, which is the better of the two ways to satisfy it.
+    #[test]
+    fn an_edition_keeps_a_film_apart_from_the_plain_cut() {
+        let edition = "Movies/Alien (1979)/Alien (Directors Cut) (1979).mkv";
+        let plain = "Movies/Alien (1979)/Alien (1979).mkv";
+
+        assert_eq!(assess(Path::new(edition)), Assessment::Canonical);
+        assert_eq!(assess(Path::new(plain)), Assessment::Canonical);
+
+        // Where each one belongs, said plainly: two names in, two names out.
+        assert_ne!(
+            render(&parse(edition).unwrap()),
+            render(&parse(plain).unwrap()),
+            "two cuts of one film must not resolve to one name"
+        );
+    }
+
+    #[test]
+    fn season_zero_is_specials_whatever_the_directory_is_called() {
+        assert_eq!(
+            assess(Path::new(
+                "Series/Show/Season 00 - Extras/Show - S00E01 - Behind the Scenes.mkv"
+            )),
+            Assessment::Rename {
+                destination: "Series/Show/Specials/Show - S00E01 - Behind the Scenes.mkv"
+                    .to_string()
+            },
+            "an arc name must not give season zero a second canonical home"
+        );
+    }
+
+    #[test]
+    fn a_year_in_a_collection_directory_is_not_the_films_year() {
+        assert_eq!(
+            assess(Path::new(
+                "Movies/Marvel 2012 Collection/Iron Man 3 (2013).mkv"
+            )),
+            Assessment::Canonical
+        );
+    }
+
+    #[test]
+    fn a_number_in_a_film_title_is_not_its_year() {
+        assert_eq!(
+            assess(Path::new(
+                "Movies/Blade Runner 2049 (2017)/Blade Runner 2049 (2017).mkv"
+            )),
+            Assessment::Canonical,
+            "the parenthesised year is the year; 2049 is part of the name"
+        );
     }
 }
