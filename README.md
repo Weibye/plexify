@@ -555,7 +555,7 @@ been quiet for five minutes before it is taken back.
 
 ### When a job cannot succeed
 
-A job that fails is returned to the queue and tried again, up to three times. After that it
+A job that fails is returned to the queue and tried again, three times in all. After that it
 is moved to `_failed/`, where the job file records the attempt count and the last error:
 
 ```bash
@@ -564,6 +564,14 @@ cat /path/to/work/_failed/*.job
 
 A parked job is left alone by later scans, so it will not quietly find its way back into the
 queue. Once the cause is fixed, move the job file back into `_queue/` to have it tried again.
+
+`plexify clean` is the exception: it empties `_failed/` along with the other queue
+directories, so the next scan queues those files again from scratch and the recorded errors
+are gone. Read `_failed/` before you clean.
+
+A job that takes its *worker* down rather than failing - an encode that runs the machine out
+of memory, say - is counted the same way when the next worker sweeps it back, so it cannot
+cycle indefinitely either.
 
 ## FFmpeg Processing Details
 

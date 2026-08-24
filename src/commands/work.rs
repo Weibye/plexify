@@ -7,7 +7,7 @@ use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::ffmpeg::FFmpegProcessor;
-use crate::queue::{ClaimedJob, FailureDisposition, JobQueue, HEARTBEAT_INTERVAL, STALE_AFTER};
+use crate::queue::{FailureDisposition, JobQueue, STALE_AFTER};
 use crate::JobPriority;
 
 /// Command to process jobs from the queue
@@ -61,11 +61,17 @@ impl WorkCommand {
         // A worker that was interrupted left its job sitting in _in_progress,
         // where nothing looks for it. Bring back anything that has gone quiet
         // long enough to be certain no worker is still on it.
-        let reclaimed = queue.reclaim_stranded_jobs(STALE_AFTER).await?;
-        if !reclaimed.is_empty() {
+        let swept = queue.reclaim_stranded_jobs(STALE_AFTER).await?;
+        if !swept.reclaimed.is_empty() {
             info!(
                 "♻️ Returned {} abandoned job(s) to the queue.",
-                reclaimed.len()
+                swept.reclaimed.len()
+            );
+        }
+        if !swept.parked.is_empty() {
+            error!(
+                "🚫 Moved {} job(s) to _failed after they repeatedly took their worker down.",
+                swept.parked.len()
             );
         }
 
@@ -158,11 +164,6 @@ impl WorkCommand {
             let job_name = claimed_job.job_name().to_string();
             let work_folder = &queue.in_progress_dir;
 
-            // While this worker holds the job, it says so on disk. If it stops
-            // saying so - killed, unplugged - another worker's startup sweep
-            // takes the job back rather than leaving it stranded forever.
-            let heartbeat = Heartbeat::start(&claimed_job).await;
-
             // The output can have appeared since the job was queued - another
             // worker got there first, or the queue outlived an earlier run.
             // Handing this to FFmpeg would re-encode a file that is already
@@ -173,7 +174,6 @@ impl WorkCommand {
                     "⏭️ Output already exists, nothing to do: {:?}",
                     job.full_output_path(media_root)
                 );
-                heartbeat.stop();
                 claimed_job.complete().await?;
                 return Ok(true);
             }
@@ -202,7 +202,6 @@ impl WorkCommand {
                     {
                         error!("Failed to move file from work folder: {}", e);
                         job_pb.finish_and_clear();
-                        heartbeat.stop();
                         claimed_job
                             .fail(&format!("failed to move output: {e}"))
                             .await?;
@@ -219,13 +218,11 @@ impl WorkCommand {
                     }
 
                     job_pb.finish_with_message(format!("✅ Completed: {}", job_name));
-                    heartbeat.stop();
                     claimed_job.complete().await?;
                 }
                 Err(e) => {
                     job_pb.finish_with_message(format!("❌ Failed: {}", job_name));
                     error!("❌ Conversion FAILED: {}", e);
-                    heartbeat.stop();
 
                     match claimed_job.fail(&e.to_string()).await? {
                         FailureDisposition::Parked { attempts } => {
@@ -248,50 +245,6 @@ impl WorkCommand {
         } else {
             Ok(false) // No job available
         }
-    }
-}
-
-/// A background task that keeps a claimed job's heartbeat fresh, and stops when
-/// this guard is dropped.
-///
-/// Dropping is what matters: when Ctrl-C cancels the job future mid-encode, the
-/// guard goes with it, the heartbeat goes stale, and the next worker's startup
-/// sweep can take the job back.
-struct Heartbeat {
-    handle: tokio::task::JoinHandle<()>,
-}
-
-impl Heartbeat {
-    async fn start(claimed_job: &ClaimedJob<'_>) -> Self {
-        // Write one immediately so the job is never judged by the mtime it
-        // happened to be claimed with.
-        if let Err(e) = claimed_job.heartbeat().await {
-            warn!("Could not write job heartbeat: {e}");
-        }
-
-        let path = claimed_job.heartbeat_path();
-        let handle = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(HEARTBEAT_INTERVAL).await;
-                if let Err(e) = tokio::fs::write(&path, b"").await {
-                    warn!("Could not refresh job heartbeat: {e}");
-                }
-            }
-        });
-
-        Self { handle }
-    }
-
-    fn stop(self) {
-        // Dropping does this too; calling it makes the ordering explicit at the
-        // points where the job file is about to be moved out from under it.
-        drop(self);
-    }
-}
-
-impl Drop for Heartbeat {
-    fn drop(&mut self) {
-        self.handle.abort();
     }
 }
 
