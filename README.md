@@ -618,18 +618,47 @@ ffmpeg -hide_banner -y -fflags +genpts -ss 300 -i input.mkv \
   -c:a aac -b:a 128k \
   -muxdelay 0 -muxpreload 0 -f mpegts 00001.ts
 
+# chunks.txt pins each chunk to the length it was cut to, so the joined
+# timeline matches the source rather than drifting a few ms per boundary:
+#   file '/work/.../00000.ts'
+#   duration 300.000
+
 # then, once, to join them
-ffmpeg -hide_banner -y -f concat -safe 0 -i chunks.txt -i input.mkv \
+ffmpeg -hide_banner -y -avoid_negative_ts make_zero \
+  -f concat -safe 0 -i chunks.txt \
+  -fix_sub_duration -i input.mkv \
   -map 0:v -map 0:a -map 1:s? \
   -c:v copy -c:a copy -c:s mov_text output.mp4
 ```
 
-The chunk directory is removed once the join succeeds.
+Note where `-fix_sub_duration` sits: it describes the source the subtitles are read from,
+not the list of chunks, so a long source converts its subtitles exactly as a short one
+does.
+
+And note the `duration` lines in the list. A chunk never ends exactly where it was asked
+to - `-t` cuts video on a frame boundary and audio on a 1024-sample AAC frame boundary, so
+each one runs a few milliseconds long. Left to itself the demuxer would start each chunk
+where the last actually ended, and because that error is per boundary it accumulates: a
+three-hour film crosses thirty-five of them. Declaring the length each chunk was cut to
+pins it to the position it came from.
+
+The chunk directory is removed once the join succeeds, and also if the job is given up on
+and parked in `_failed/`. It records the quality settings its chunks were encoded with, and
+chunks made with different settings are discarded rather than mixed into one output.
+
+While the join runs, the work directory holds both the full set of chunks and the assembled
+MP4, so **peak usage is roughly twice the size of the output**. Size the work directory for
+that, not for one copy.
 
 ### Background workers
 
 `--background` runs FFmpeg at the lowest priority the platform offers: `nice -n 19` on Linux
 and macOS, and `IDLE_PRIORITY_CLASS` on Windows.
+
+These are not quite equivalent. A `nice -n 19` process still gets scheduled under Linux's
+CFS, while an idle-priority process on Windows can be starved almost completely by ordinary
+desktop activity - which is what you want on a dedicated worker, and may be more than you
+want on a machine you are also using.
 
 ## Distributed Processing
 

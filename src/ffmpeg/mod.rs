@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::process::Command;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::job::{Job, MediaFileType, QualitySettings};
 use crate::paths::to_forward_slashes;
@@ -13,22 +13,34 @@ use crate::paths::to_forward_slashes;
 /// follows it, and the output file must come last. Options after the output are
 /// silently discarded, which is a quiet way to lose a stream mapping.
 ///
-/// So the builder does not append to one list. It keeps each kind of argument in
-/// its own bucket and assembles them in FFmpeg's order at `build` time:
+/// So the builder does not append to one list. It assembles the command in
+/// FFmpeg's order at `build` time:
 ///
 /// ```text
-/// {global} {input options} -i {input}... {output options} {output}
+/// {global} ({options for input n} -i {input n})... {output options} {output}
 /// ```
 ///
-/// Callers can then chain in whatever order reads best without changing what
-/// FFmpeg receives.
+/// Output options can be chained in whatever order reads best. Input options
+/// attach to the **next input declared**, which is what lets a command carry a
+/// different option for each of its inputs - `-fix_sub_duration` on the source
+/// a join takes subtitles from, but not on the list of chunks it copies. An
+/// earlier version kept every input option in one bucket ahead of every input,
+/// which silently put them all on input 0.
 #[derive(Debug, Default)]
 pub struct FFmpegCommandBuilder {
     global: Vec<String>,
-    input_options: Vec<String>,
-    inputs: Vec<String>,
+    /// Options waiting for the input they belong to.
+    pending_input_options: Vec<String>,
+    inputs: Vec<Input>,
     output_options: Vec<String>,
     output: Option<String>,
+}
+
+/// One input file and the options that apply to it.
+#[derive(Debug)]
+struct Input {
+    options: Vec<String>,
+    path: String,
 }
 
 impl FFmpegCommandBuilder {
@@ -41,25 +53,44 @@ impl FFmpegCommandBuilder {
     ///
     /// `+genpts` is a demuxer flag and belongs to the input; `avoid_negative_ts`
     /// is a muxer option and belongs to the output.
-    pub fn with_common_flags(mut self) -> Self {
-        self.input_options
-            .extend_from_slice(&["-fflags".to_string(), "+genpts".to_string()]);
+    pub fn with_common_flags(self) -> Self {
+        self.with_generated_pts().with_negative_timestamp_fix()
+    }
+
+    /// Have the demuxer generate presentation timestamps for the next input.
+    pub fn with_generated_pts(self) -> Self {
+        self.with_input_options(&["-fflags", "+genpts"])
+    }
+
+    /// Shift the output so no timestamp is negative.
+    pub fn with_negative_timestamp_fix(mut self) -> Self {
         self.output_options
             .extend_from_slice(&["-avoid_negative_ts".to_string(), "make_zero".to_string()]);
         self
     }
 
-    /// Add subtitle duration fixing flag
-    pub fn with_subtitle_duration_fix(mut self) -> Self {
-        self.input_options.push("-fix_sub_duration".to_string());
+    /// Trim subtitle events in the next input so they do not overlap.
+    ///
+    /// Belongs to the input the subtitles are decoded from. Without it a
+    /// subtitle keeps whatever duration the source declares, which for an
+    /// overlapping event means `mov_text` gets something it handles badly.
+    pub fn with_subtitle_duration_fix(self) -> Self {
+        self.with_input_options(&["-fix_sub_duration"])
+    }
+
+    /// Hold options for the next input declared.
+    pub fn with_input_options(mut self, options: &[&str]) -> Self {
+        self.pending_input_options
+            .extend(options.iter().map(|option| option.to_string()));
         self
     }
 
-    /// Add a single input file
+    /// Add a single input file, taking whatever options are waiting for it.
     pub fn with_input<P: AsRef<Path>>(mut self, input_path: P) -> Self {
-        self.inputs.push("-i".to_string());
-        self.inputs
-            .push(input_path.as_ref().to_string_lossy().to_string());
+        self.inputs.push(Input {
+            options: std::mem::take(&mut self.pending_input_options),
+            path: input_path.as_ref().to_string_lossy().to_string(),
+        });
         self
     }
 
@@ -121,10 +152,9 @@ impl FFmpegCommandBuilder {
     ///
     /// An input option, so it seeks the file rather than trimming the output,
     /// which is what makes a chunk cost only its own length to produce.
-    pub fn with_seek(mut self, seconds: f64) -> Self {
-        self.input_options.push("-ss".to_string());
-        self.input_options.push(format_seconds(seconds));
-        self
+    pub fn with_seek(self, seconds: f64) -> Self {
+        let seconds = format_seconds(seconds);
+        self.with_input_options(&["-ss", &seconds])
     }
 
     /// Stop after this much output.
@@ -136,18 +166,12 @@ impl FFmpegCommandBuilder {
 
     /// Read the inputs listed in a concat list file.
     ///
-    /// `-f concat` is an input option and applies to the input that follows it,
-    /// so this has to be the first input the builder is given.
-    pub fn with_concat_list<P: AsRef<Path>>(mut self, list_path: P) -> Self {
-        self.input_options
-            .extend_from_slice(&["-f".to_string(), "concat".to_string()]);
-        // The list holds absolute paths, which the demuxer refuses by default.
-        self.input_options
-            .extend_from_slice(&["-safe".to_string(), "0".to_string()]);
-        self.inputs.push("-i".to_string());
-        self.inputs
-            .push(list_path.as_ref().to_string_lossy().to_string());
-        self
+    /// `-safe 0` because the list holds absolute paths, which the demuxer
+    /// refuses by default. Both options attach to this input alone, so a later
+    /// input is still read as an ordinary file.
+    pub fn with_concat_list<P: AsRef<Path>>(self, list_path: P) -> Self {
+        self.with_input_options(&["-f", "concat", "-safe", "0"])
+            .with_input(list_path)
     }
 
     /// Write an MPEG-TS stream rather than guessing the format from the name.
@@ -189,8 +213,17 @@ impl FFmpegCommandBuilder {
     /// Build the final command arguments as a vector of strings
     pub fn build(self) -> Vec<String> {
         let mut args = self.global;
-        args.extend(self.input_options);
-        args.extend(self.inputs);
+
+        for input in self.inputs {
+            args.extend(input.options);
+            args.push("-i".to_string());
+            args.push(input.path);
+        }
+
+        // Options nothing claimed. A builder used for flags alone, with no
+        // input at all, still has to emit them.
+        args.extend(self.pending_input_options);
+
         args.extend(self.output_options);
         args.extend(self.output);
         args
@@ -214,6 +247,18 @@ pub const CHUNK_SECONDS: f64 = 300.0;
 /// Chunking only pays for itself when there is enough work to lose. A file
 /// shorter than this re-encodes from scratch faster than the seams are worth.
 pub const MIN_CHUNKED_SECONDS: f64 = 900.0;
+
+/// Where the chunk directory for a job lives.
+///
+/// Named after the job id, which is the v5 UUID of the input path, so the
+/// worker that reclaims an abandoned job finds the same directory the last one
+/// was filling.
+pub fn chunk_dir_for(job: &Job, work_folder: &Path) -> PathBuf {
+    work_folder.join(format!("{}.chunks", job.id))
+}
+
+/// Records the settings a chunk directory's contents were encoded with.
+const CHUNK_SETTINGS_FILE: &str = "settings.json";
 
 /// One piece of a resumable encode.
 #[derive(Debug, Clone, PartialEq)]
@@ -263,15 +308,37 @@ fn format_seconds(seconds: f64) -> String {
     format!("{seconds:.3}")
 }
 
-/// One line of a concat demuxer list file.
+/// One entry of a concat demuxer list file.
 ///
 /// The demuxer takes a quoted path, and treats a backslash as an escape, so a
 /// Windows path has to be handed over with forward slashes or every separator
 /// disappears. A single quote inside a filename is escaped the way the demuxer
 /// spells it.
-fn concat_list_line(path: &Path) -> String {
-    let path = to_forward_slashes(path).replace('\'', "'\\''");
-    format!("file '{path}'\n")
+///
+/// The `duration` line is what keeps a long file in sync. Without it the demuxer
+/// starts each chunk where the previous one actually ended, and a chunk never
+/// ends exactly where it was asked to: `-t` cuts video on a frame boundary and
+/// audio on a 1024-sample AAC frame boundary, so each one runs a few
+/// milliseconds long. That error is *per boundary*, so it accumulates - a
+/// three-hour film crosses thirty-five of them and ends a third of a second
+/// adrift, where a fifteen-minute episode crosses two and shows nothing.
+/// Declaring the length the chunk was cut to pins it to the position it came
+/// from, and the error cannot compound.
+///
+/// `declared_duration` is `None` for the last entry in a list. That chunk runs
+/// to wherever the source actually ended - which is not always where the plan
+/// said, because a container can over-report its duration and the chunk after
+/// the end is dropped - so declaring a length for it would hold the timeline
+/// open past the content. Nothing follows it whose start could be wrong anyway.
+fn concat_list_entry(chunk: &Chunk, chunk_dir: &Path, declared_duration: Option<f64>) -> String {
+    let path = to_forward_slashes(&chunk.path(chunk_dir)).replace('\'', "'\\''");
+    let mut entry = format!("file '{path}'\n");
+
+    if let Some(duration) = declared_duration {
+        entry.push_str(&format!("duration {}\n", format_seconds(duration)));
+    }
+
+    entry
 }
 
 /// How a source is divided up for a resumable encode.
@@ -324,15 +391,24 @@ impl FFmpegProcessor {
     /// expresses the same idea as a creation flag on the child, which needs no
     /// extra dependency.
     fn ffmpeg_command(&self) -> Command {
-        let mut command = self.ffmpeg_program();
+        let mut command = self.program("ffmpeg");
         // FFmpeg's build banner runs to a screenful and is reproduced in every
         // error a failed job records. Nothing reads it.
         command.arg("-hide_banner");
         command
     }
 
-    /// The command that runs FFmpeg, before any arguments.
-    fn ffmpeg_program(&self) -> Command {
+    /// Start an FFprobe command, de-prioritised on the same terms as FFmpeg.
+    ///
+    /// It goes through [`Self::program`] rather than spawning directly so that
+    /// there is one place where a background worker's priority is decided, and
+    /// no FFmpeg-family process that quietly bypasses it.
+    fn probe_command(&self) -> Command {
+        self.program("ffprobe")
+    }
+
+    /// The command that runs an FFmpeg-family program, before any arguments.
+    fn program(&self, program: &str) -> Command {
         #[cfg(windows)]
         {
             /// `IDLE_PRIORITY_CLASS` from the Windows process creation flags:
@@ -340,7 +416,7 @@ impl FFmpegProcessor {
             /// what `nice -n 19` buys on Unix.
             const IDLE_PRIORITY_CLASS: u32 = 0x0000_0040;
 
-            let mut command = Command::new("ffmpeg");
+            let mut command = Command::new(program);
             if self.background_mode {
                 command.creation_flags(IDLE_PRIORITY_CLASS);
             }
@@ -351,10 +427,10 @@ impl FFmpegProcessor {
         {
             if self.background_mode {
                 let mut command = Command::new("nice");
-                command.args(["-n", "19", "ffmpeg"]);
+                command.args(["-n", "19", program]);
                 command
             } else {
-                Command::new("ffmpeg")
+                Command::new(program)
             }
         }
     }
@@ -489,17 +565,23 @@ impl FFmpegProcessor {
         work_folder: &Path,
         duration: f64,
     ) -> Result<()> {
-        let chunk_dir = work_folder.join(format!("{}.chunks", job.id));
-        tokio::fs::create_dir_all(&chunk_dir).await?;
+        let chunk_dir = chunk_dir_for(job, work_folder);
+        self.prepare_chunk_dir(job, &chunk_dir).await?;
 
-        let chunks = plan_chunks(duration, self.chunking.chunk_seconds);
-        self.encode_chunks(job, input_path, &chunk_dir, &chunks)
+        let planned = plan_chunks(duration, self.chunking.chunk_seconds);
+        let chunks = self
+            .encode_chunks(job, input_path, &chunk_dir, &planned)
             .await?;
 
         let list_path = chunk_dir.join("chunks.txt");
+        let last = chunks.len() - 1;
         let list = chunks
             .iter()
-            .map(|chunk| concat_list_line(&chunk.path(&chunk_dir)))
+            .enumerate()
+            .map(|(position, chunk)| {
+                let declared = chunk.duration.filter(|_| position != last);
+                concat_list_entry(chunk, &chunk_dir, declared)
+            })
             .collect::<String>();
         tokio::fs::write(&list_path, list.as_bytes()).await?;
 
@@ -507,24 +589,32 @@ impl FFmpegProcessor {
         // again; only the subtitles, which were held back, are encoded here.
         let mux_builder = FFmpegCommandBuilder::new()
             .with_overwrite()
+            .with_negative_timestamp_fix()
             .with_concat_list(&list_path)
             .with_video_and_audio_copy()
             .with_subtitle_encoding()
             .with_output(output_path);
 
         let mux_builder = match external_subtitle {
+            // A `.vtt` carries its own durations; there is nothing to trim.
             Some(vtt_path) => mux_builder
                 .with_input(vtt_path)
                 .with_stream_mapping(&["0:v", "0:a", "1:s"]),
+            // The same treatment the one-pass encode gives an MKV's embedded
+            // subtitles, and it has to land on *this* input rather than on the
+            // chunk list - which is what the builder's per-input options are
+            // for. Without it a long source would convert its subtitles
+            // differently from a short one.
             None => mux_builder
+                .with_subtitle_duration_fix()
                 .with_input(input_path)
                 .with_stream_mapping(&["0:v", "0:a", "1:s?"]),
         };
 
         self.run(mux_builder.build(), "joining chunks").await?;
 
-        // The chunks have served their purpose. Anything left behind here would
-        // be re-used by a later run of a job whose settings may have changed.
+        // The chunks have served their purpose, and are the size of the output
+        // again. Anything left here would be re-used by a later run.
         tokio::fs::remove_dir_all(&chunk_dir).await?;
 
         info!(
@@ -546,7 +636,7 @@ impl FFmpegProcessor {
         input_path: &Path,
         chunk_dir: &Path,
         chunks: &[Chunk],
-    ) -> Result<()> {
+    ) -> Result<Vec<Chunk>> {
         let total = chunks.len();
 
         let already_encoded = chunks
@@ -587,11 +677,82 @@ impl FFmpegProcessor {
             )
             .await?;
 
+            // The plan came from a probed duration, and a container can
+            // over-report one. A chunk whose seek landed past the end of the
+            // source encodes happily and produces nothing; joined in, it would
+            // be swallowed without complaint. Treat it as the end of the file.
+            if self.probe_stream_count(&partial_path).await == Some(0) {
+                let _ = tokio::fs::remove_file(&partial_path).await;
+                debug!(
+                    "Chunk {} starts past the end of the source; the file is shorter than its \
+                     container claims",
+                    chunk.index + 1
+                );
+                break;
+            }
+
             tokio::fs::rename(&partial_path, &finished_path).await?;
             info!("📦 Encoded chunk {} of {total}", chunk.index + 1);
         }
 
+        let encoded: Vec<Chunk> = chunks
+            .iter()
+            .take_while(|chunk| chunk.path(chunk_dir).exists())
+            .cloned()
+            .collect();
+
+        if encoded.is_empty() {
+            return Err(anyhow!("FFmpeg produced no output for {input_path:?}"));
+        }
+
+        Ok(encoded)
+    }
+
+    /// Set up the chunk directory, discarding chunks encoded to a different
+    /// specification.
+    ///
+    /// The directory is keyed on the job id, which is the v5 UUID of the input
+    /// path and therefore stable forever. So chunks left by a parked job would
+    /// be found again by a job re-scanned for the same file - and if the quality
+    /// settings changed in between, half the output would be encoded one way and
+    /// half the other with nothing recording that it happened. The settings the
+    /// chunks were made with are written down beside them, and anything that
+    /// does not match them is thrown away rather than reused.
+    async fn prepare_chunk_dir(&self, job: &Job, chunk_dir: &Path) -> Result<()> {
+        let stamp_path = chunk_dir.join(CHUNK_SETTINGS_FILE);
+        let stamp = serde_json::to_string(&job.quality_settings)?;
+
+        if chunk_dir.exists() {
+            let existing = tokio::fs::read_to_string(&stamp_path).await.ok();
+            if existing.as_deref() != Some(stamp.as_str()) {
+                info!("🗑️ Discarding chunks encoded with different settings: {chunk_dir:?}");
+                tokio::fs::remove_dir_all(chunk_dir).await?;
+            }
+        }
+
+        tokio::fs::create_dir_all(chunk_dir).await?;
+        tokio::fs::write(&stamp_path, stamp.as_bytes()).await?;
         Ok(())
+    }
+
+    /// How many streams a file has, as far as FFprobe can tell.
+    async fn probe_stream_count(&self, path: &Path) -> Option<usize> {
+        let output = self
+            .probe_command()
+            .args(["-v", "error", "-show_entries", "stream=index", "-of", "csv"])
+            .arg(path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .ok()?;
+
+        Some(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count(),
+        )
     }
 
     /// How long the source runs, as far as FFprobe can tell.
@@ -600,7 +761,8 @@ impl FFmpegProcessor {
     /// that does not declare a duration. It is not an error: it only means the
     /// file cannot be divided up, so it is encoded in one pass instead.
     async fn probe_duration(&self, input_path: &Path) -> Option<f64> {
-        let output = Command::new("ffprobe")
+        let output = self
+            .probe_command()
             .args([
                 "-v",
                 "error",
@@ -636,6 +798,13 @@ impl FFmpegProcessor {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
+        // Tokio leaves a child running when the future holding it is dropped.
+        // Ctrl-C cancels this future mid-encode, and the job it belonged to is
+        // swept back to the queue a few minutes later - so without this, the
+        // worker that picks the job up starts a second FFmpeg writing the same
+        // chunk path as the first one, which is still going.
+        cmd.kill_on_drop(true);
+
         debug!("Executing FFmpeg command ({what}): {cmd:?}");
 
         let output = cmd
@@ -650,6 +819,46 @@ impl FFmpegProcessor {
         }
 
         Ok(())
+    }
+
+    /// Throw away everything a job left in the work folder.
+    ///
+    /// Called when a job is parked in `_failed`, because nothing will ever come
+    /// back for it: the job id is derived from the input path, so `job_exists`
+    /// sees the parked job and no re-scan will queue that file again. Its
+    /// chunks would otherwise sit in `_in_progress` at roughly the size of the
+    /// finished output, with nothing pointing at them.
+    pub async fn discard_work(&self, job: &Job, work_folder: &Path) {
+        self.discard_work_for_id(&job.id, work_folder).await;
+    }
+
+    /// The same, for a job known only by its id.
+    ///
+    /// The startup sweep parks jobs too - one that keeps taking its worker down
+    /// ends up in `_failed` the same way one that keeps failing does - and it
+    /// has only the job filename to go on. Everything a job leaves in the work
+    /// folder is named after its id, so that is enough.
+    pub async fn discard_work_for_id(&self, job_id: &str, work_folder: &Path) {
+        let chunk_dir = work_folder.join(format!("{job_id}.chunks"));
+        if chunk_dir.exists() {
+            match tokio::fs::remove_dir_all(&chunk_dir).await {
+                Ok(_) => info!("🗑️ Discarded the chunks of a parked job: {chunk_dir:?}"),
+                Err(e) => warn!("Could not remove {chunk_dir:?}: {e}"),
+            }
+        }
+
+        // A part-written output from before this file was chunked, or from the
+        // join that was interrupted. Named `{id}_{filename}`, so the filename
+        // this job would have used is not needed to find it.
+        let prefix = format!("{job_id}_");
+        let Ok(mut entries) = tokio::fs::read_dir(work_folder).await else {
+            return;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = tokio::fs::remove_file(entry.path()).await;
+            }
+        }
     }
 
     /// Move completed file from work folder to media folder
@@ -727,6 +936,32 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn a_list_cut_short_leaves_its_final_entry_open_ended() {
+        // The probe over-reported, the chunk past the end came back empty, and
+        // the entry that is now last may hold less than the plan asked for.
+        // Declaring a length for it would hold the timeline open past the
+        // content and freeze the end of the film.
+        let chunks = plan_chunks(1000.0, 300.0);
+        let kept = &chunks[..2];
+        let last = kept.len() - 1;
+
+        let list: String = kept
+            .iter()
+            .enumerate()
+            .map(|(position, chunk)| {
+                let declared = chunk.duration.filter(|_| position != last);
+                concat_list_entry(chunk, Path::new("/work/x.chunks"), declared)
+            })
+            .collect();
+
+        assert_eq!(
+            list,
+            "file '/work/x.chunks/00000.ts'\nduration 300.000\n\
+             file '/work/x.chunks/00001.ts'\n"
+        );
+    }
+
+    #[test]
     fn a_source_is_divided_into_whole_chunks_with_an_open_ended_last_one() {
         let chunks = plan_chunks(1000.0, 300.0);
 
@@ -801,14 +1036,44 @@ mod tests {
     }
 
     #[test]
-    fn a_concat_list_line_uses_separators_the_demuxer_does_not_eat() {
+    fn a_concat_list_entry_uses_separators_the_demuxer_does_not_eat() {
         // A backslash is an escape character to the concat demuxer, so a Windows
         // path handed over as-is would lose every separator.
-        let line = concat_list_line(Path::new(r"C:\work\abc.chunks\00000.ts"));
-        assert_eq!(line, "file 'C:/work/abc.chunks/00000.ts'\n");
+        let last = Chunk {
+            index: 0,
+            start: 0.0,
+            duration: None,
+        };
+        let entry = concat_list_entry(&last, Path::new(r"C:\work\abc.chunks"), None);
+        assert_eq!(entry, "file 'C:/work/abc.chunks/00000.ts'\n");
 
-        let quoted = concat_list_line(Path::new("/work/it's here/00000.ts"));
+        let quoted = concat_list_entry(&last, Path::new("/work/it's here"), None);
         assert_eq!(quoted, "file '/work/it'\\''s here/00000.ts'\n");
+    }
+
+    #[test]
+    fn every_chunk_but_the_last_declares_the_length_it_was_cut_to() {
+        // Without this the demuxer starts each chunk where the last one actually
+        // ended, and a chunk always runs a few milliseconds long. The error is
+        // per boundary, so it accumulates over a feature-length file.
+        let chunks = plan_chunks(1000.0, 300.0);
+        let last = chunks.len() - 1;
+        let list: String = chunks
+            .iter()
+            .enumerate()
+            .map(|(position, chunk)| {
+                let declared = chunk.duration.filter(|_| position != last);
+                concat_list_entry(chunk, Path::new("/work/x.chunks"), declared)
+            })
+            .collect();
+
+        assert_eq!(
+            list,
+            "file '/work/x.chunks/00000.ts'\nduration 300.000\n\
+             file '/work/x.chunks/00001.ts'\nduration 300.000\n\
+             file '/work/x.chunks/00002.ts'\nduration 300.000\n\
+             file '/work/x.chunks/00003.ts'\n"
+        );
     }
 
     #[test]
@@ -885,25 +1150,6 @@ mod tests {
     async fn test_background_mode() {
         let processor = FFmpegProcessor::new(true);
         assert!(processor.background_mode);
-    }
-
-    #[test]
-    fn test_ffmpeg_command_builder_basic() {
-        let args = FFmpegCommandBuilder::new()
-            .with_common_flags()
-            .with_overwrite()
-            .build();
-
-        assert_eq!(
-            args,
-            vec![
-                "-y",
-                "-fflags",
-                "+genpts",
-                "-avoid_negative_ts",
-                "make_zero"
-            ]
-        );
     }
 
     #[test]
@@ -1313,6 +1559,308 @@ mod tests {
             !work_folder.join(format!("{}.chunks", job.id)).exists(),
             "a source below the threshold should never be divided up"
         );
+    }
+
+    #[test]
+    fn an_input_option_lands_on_the_input_it_was_chained_before() {
+        let args = FFmpegCommandBuilder::new()
+            .with_concat_list("/work/chunks.txt")
+            .with_subtitle_duration_fix()
+            .with_input("/media/film.mkv")
+            .with_output("/work/film.mp4")
+            .build();
+
+        // `-f concat -safe 0` describes the list; `-fix_sub_duration` describes
+        // the source the subtitles come from. Held in one bucket ahead of every
+        // input, as an earlier version did, both would apply to the list.
+        assert_eq!(
+            args.join(" "),
+            "-f concat -safe 0 -i /work/chunks.txt -fix_sub_duration -i /media/film.mkv \
+             /work/film.mp4"
+        );
+    }
+
+    #[test]
+    fn options_with_no_input_to_attach_to_are_still_emitted() {
+        // A builder used for flags alone has nowhere to put them, and dropping
+        // them silently is exactly the failure the buckets exist to avoid.
+        let args = FFmpegCommandBuilder::new()
+            .with_common_flags()
+            .with_overwrite()
+            .build();
+
+        assert_eq!(
+            args,
+            vec![
+                "-y",
+                "-fflags",
+                "+genpts",
+                "-avoid_negative_ts",
+                "make_zero"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn chunks_encoded_with_other_settings_are_discarded_rather_than_reused() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("film.mkv");
+        build_chunking_source(&input, 6);
+
+        let work_folder = temp.path().join("work");
+        std::fs::create_dir_all(&work_folder).unwrap();
+
+        let job = chunking_job(&input);
+        let processor = FFmpegProcessor::new(false).with_chunking(TEST_CHUNKING);
+        let chunk_dir = chunk_dir_for(&job, &work_folder);
+
+        let chunks = plan_chunks(probed_duration(&input), TEST_CHUNKING.chunk_seconds);
+        processor.prepare_chunk_dir(&job, &chunk_dir).await.unwrap();
+        processor
+            .encode_chunks(&job, &input, &chunk_dir, &chunks[..1])
+            .await
+            .unwrap();
+        assert!(chunks[0].path(&chunk_dir).exists());
+
+        // The job file was moved out of _failed and the library re-scanned at a
+        // different quality. The id is derived from the input path, so the new
+        // job finds the same directory - and half an output at one CRF and half
+        // at another, with nothing recording it, is worse than redoing the work.
+        let mut requeued = job.clone();
+        requeued.quality_settings.ffmpeg_crf = "18".to_string();
+        processor
+            .prepare_chunk_dir(&requeued, &chunk_dir)
+            .await
+            .unwrap();
+
+        assert!(
+            !chunks[0].path(&chunk_dir).exists(),
+            "a chunk encoded to a different specification must not be reused"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunks_encoded_with_the_same_settings_survive_a_restart() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("film.mkv");
+        build_chunking_source(&input, 6);
+
+        let work_folder = temp.path().join("work");
+        std::fs::create_dir_all(&work_folder).unwrap();
+
+        let job = chunking_job(&input);
+        let processor = FFmpegProcessor::new(false).with_chunking(TEST_CHUNKING);
+        let chunk_dir = chunk_dir_for(&job, &work_folder);
+
+        let chunks = plan_chunks(probed_duration(&input), TEST_CHUNKING.chunk_seconds);
+        processor.prepare_chunk_dir(&job, &chunk_dir).await.unwrap();
+        processor
+            .encode_chunks(&job, &input, &chunk_dir, &chunks[..1])
+            .await
+            .unwrap();
+
+        processor.prepare_chunk_dir(&job, &chunk_dir).await.unwrap();
+
+        assert!(
+            chunks[0].path(&chunk_dir).exists(),
+            "guarding against a settings change must not throw away good work"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parked_job_does_not_leave_its_chunks_behind() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("film.mkv");
+        build_chunking_source(&input, 6);
+
+        let work_folder = temp.path().join("work");
+        std::fs::create_dir_all(&work_folder).unwrap();
+
+        let job = chunking_job(&input);
+        let processor = FFmpegProcessor::new(false).with_chunking(TEST_CHUNKING);
+        let chunk_dir = chunk_dir_for(&job, &work_folder);
+
+        let chunks = plan_chunks(probed_duration(&input), TEST_CHUNKING.chunk_seconds);
+        processor.prepare_chunk_dir(&job, &chunk_dir).await.unwrap();
+        processor
+            .encode_chunks(&job, &input, &chunk_dir, &chunks[..1])
+            .await
+            .unwrap();
+        assert!(chunk_dir.exists());
+
+        // And whatever the interrupted join had started writing.
+        let partial_output = job.work_folder_output_path(&work_folder);
+        std::fs::write(&partial_output, b"half a film").unwrap();
+
+        // By id, which is all the startup sweep has when it parks a job that
+        // kept taking its worker down.
+        processor.discard_work_for_id(&job.id, &work_folder).await;
+
+        assert!(
+            !chunk_dir.exists(),
+            "nothing will ever come back for a parked job's chunks"
+        );
+        assert!(!partial_output.exists());
+    }
+
+    /// The `pts_time,duration_time` of every subtitle event in a file.
+    fn subtitle_timings(path: &Path) -> Vec<(f64, f64)> {
+        let output = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "s",
+                "-show_entries",
+                "packet=pts_time,duration_time",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(path)
+            .output()
+            .unwrap();
+
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.trim().split(',');
+                let pts = fields.next()?.parse().ok()?;
+                let duration = fields.next()?.parse().ok()?;
+                Some((pts, duration))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_long_source_converts_its_subtitles_the_same_way_a_short_one_does() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("film.mkv");
+
+        // An event that outlives the one after it. Without -fix_sub_duration it
+        // keeps its declared length and overlaps its neighbours, which mov_text
+        // handles badly - and the chunked path used to lose that flag, so every
+        // file over the threshold converted differently from one under it.
+        let subtitles = input.with_extension("srt");
+        std::fs::write(
+            &subtitles,
+            "1\n00:00:00,000 --> 00:00:09,000\noverlapping\n\n\
+             2\n00:00:01,000 --> 00:00:02,000\nnext\n\n\
+             3\n00:00:03,000 --> 00:00:04,000\nlater\n",
+        )
+        .unwrap();
+
+        let built = std::process::Command::new("ffmpeg")
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=6:size=160x120:rate=10",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=6",
+            ])
+            .arg("-i")
+            .arg(&subtitles)
+            .args([
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
+                "-map",
+                "2:s",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-c:a",
+                "aac",
+                "-c:s",
+                "srt",
+                "-y",
+            ])
+            .arg(&input)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(built.success());
+
+        let job = chunking_job(&input);
+
+        let one_pass_dir = temp.path().join("one-pass");
+        std::fs::create_dir_all(&one_pass_dir).unwrap();
+        FFmpegProcessor::new(false)
+            .with_chunking(Chunking {
+                chunk_seconds: 2.0,
+                // Above the source length, so this one is encoded in one pass.
+                min_source_seconds: 60.0,
+            })
+            .process_job(&job, None, Some(&one_pass_dir))
+            .await
+            .unwrap();
+
+        let chunked_dir = temp.path().join("chunked");
+        std::fs::create_dir_all(&chunked_dir).unwrap();
+        FFmpegProcessor::new(false)
+            .with_chunking(TEST_CHUNKING)
+            .process_job(&job, None, Some(&chunked_dir))
+            .await
+            .unwrap();
+
+        let one_pass = subtitle_timings(&job.work_folder_output_path(&one_pass_dir));
+        let chunked = subtitle_timings(&job.work_folder_output_path(&chunked_dir));
+
+        assert!(!one_pass.is_empty(), "the fixture should carry subtitles");
+        assert_eq!(
+            subtitle_events(&one_pass),
+            subtitle_events(&chunked),
+            "chunking a source must not change how its subtitles are converted"
+        );
+
+        // And what both produce is non-overlapping, which is the point of the
+        // flag rather than an accident of the two agreeing.
+        for pair in chunked.windows(2) {
+            let ((start, duration), (next_start, _)) = (pair[0], pair[1]);
+            assert!(
+                start + duration <= next_start + f64::EPSILON,
+                "subtitle at {start} runs {duration}s into the one at {next_start}"
+            );
+        }
+    }
+
+    /// Subtitle event start times, in hundredths of a second, with slivers
+    /// dropped.
+    ///
+    /// The one-pass encode carries `-avoid_negative_ts make_zero`, and the audio
+    /// it encodes starts one AAC frame - 1024/44100, about 23ms - before zero,
+    /// so the whole timeline including the subtitles shifts by that much and the
+    /// first event is split around the seam. The join has no negative timestamp
+    /// to correct, because the chunks were muxed with `-muxdelay 0`. That offset
+    /// is not a difference in subtitle handling, and comparing raw packets would
+    /// make this test about it.
+    fn subtitle_events(timings: &[(f64, f64)]) -> Vec<i64> {
+        timings
+            .iter()
+            .filter(|(_, duration)| *duration > 0.05)
+            .map(|(start, _)| (start * 10.0).round() as i64)
+            .collect()
     }
 
     fn ffmpeg_present() -> bool {
