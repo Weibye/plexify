@@ -59,13 +59,18 @@ idempotent and both primitives below have something stable to collide on. Never 
 random again.
 
 Any number of `work` processes on any number of machines can point at the same work root.
-Mutual exclusion comes from two filesystem primitives, both in `src/queue/mod.rs`:
+One job per input file comes from the name: every scanner that sees a file derives the same
+v5 id for it, and `job_exists` consults all four queue directories before a scan writes
+anything. What the two filesystem primitives in `src/queue/mod.rs` add is that each step
+between those directories happens all at once, so no other process ever sees a half-done one:
 
-- **Enqueue** writes the job under a staging name and renames it onto `{uuid}.job`. Rename is
-  atomic and replaces, and the name is the v5 id, so two racing scanners write identical
-  content and one of the two renames wins. Nothing is left behind either way — a scanner that
-  claimed the name with a marker of its own and then died would leave that name taken with no
-  job under it, and every later scan would skip a file that is in no queue directory at all.
+- **Enqueue** publishes a job. It writes the file under a staging name and renames it onto
+  `{uuid}.job`, which replaces whatever is there in one step. It is not a claim on the name —
+  two scanners racing on one file both write, and the second rename wins — but neither can
+  leave a torn file or any debris behind. A marker claiming the name instead is worse than
+  nothing: a scanner that died between taking the name and writing the job would leave the
+  name taken with nothing under it, and every later scan would skip a file that is then in no
+  queue directory at all.
 - **Claim** renames the job file from `_queue/` into `_in_progress/`. Rename is atomic, so
   exactly one worker wins; losers see `NotFound` and move on.
 
@@ -73,6 +78,15 @@ Preserve this property when touching the queue. Any change that reads-then-write
 renaming reintroduces the race that this design exists to avoid. The same goes for rewriting
 a job in place to record an attempt: `write_job_atomically` stages and renames, so a worker
 killed mid-rewrite leaves a job file that still parses.
+
+**What none of this rules out is two workers on one input**, so nothing downstream may assume
+it cannot happen. A scan whose `job_exists` found nothing and whose enqueue lands after a
+worker has claimed the job queues that file again while it is being encoded. The startup sweep
+can arrive at the same place from the other side: it records the attempt before it moves the
+job, and that rewrite ends in a rename that *creates* the file when it is absent, so a second
+sweeper working from a stale read can put a job back into `_in_progress` under the worker that
+has just claimed it (#132). Both windows are why the staging name a finished encode is copied
+under carries the id of the worker that copied it.
 
 **The work root is not the media root.** `JobQueue::new` takes both. `--work-dir`/`-w`
 controls the queue location and **defaults to the current working directory**, not to the
@@ -104,12 +118,21 @@ encodes to `job.work_folder_output_path(work_folder)` and only then calls
 next to the source. Preserve the write-then-move ordering.
 
 The move itself has to be a copy, because the work root and the media root are routinely on
-different volumes — so it copies to `{output}.partial` beside the destination and renames
-that onto the destination, which within one directory is atomic. The destination name is
-therefore only ever taken by a whole file. That matters beyond the media server: `work` and
+different volumes — so it copies to `{output}.{worker}.partial` beside the destination and
+renames that onto the destination, which within one directory is atomic. The destination name
+is therefore only ever taken by a whole file. That matters beyond the media server: `work` and
 `scan` both treat a file at the output path as an encode that is already done, so a copy
 interrupted straight onto the destination would be recorded as a finished job and leave a
 truncated `.mp4` in the library that nothing ever comes back for.
+
+The `{worker}` in that name is the id of the worker doing the copy, and it is what keeps the
+guarantee from depending on the queue never handing one input to two workers — which, as
+above, it cannot promise. Two workers sharing a staging name would copy into one file and each
+rename the splice onto the destination, which is the same corrupt output by another route. The
+id belongs to the worker rather than to the copy so that a worker retrying its own move writes
+over its last part-copy. A `.partial` left by a worker that was killed is nobody's to remove —
+no other worker can tell it from a copy still being made — so it sits in the library until a
+person clears it out. No command reports one.
 
 **A job that a worker stops running comes back, and a job that cannot succeed stops coming
 back.** Both are properties of the same three moves, and both are easy to undo by accident:
