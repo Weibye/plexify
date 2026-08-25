@@ -12,7 +12,7 @@
 //! [`JobQueue::init`]: a work root that has never held a job must read as empty,
 //! not be created by the act of asking about it.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tokio::fs as async_fs;
@@ -38,6 +38,17 @@ pub struct QueueStatus {
     /// looking at an unexpectedly empty queue is usually looking at the wrong
     /// one.
     pub work_root: PathBuf,
+    /// Whether the work root holds any of the four queue directories.
+    ///
+    /// `scan`, `add` and `work` all call [`JobQueue::init`], so a work root any
+    /// of them has touched has the directories whether or not a job was ever put
+    /// in one. Their absence is therefore evidence the counts do not carry, and
+    /// it is the only thing that tells an empty queue apart from a `-w` pointing
+    /// somewhere nothing has ever run. `clean` removes them again, so a drained
+    /// and cleaned work root does read as untouched - the disk keeps no record
+    /// that distinguishes those two, and inventing one would mean a second
+    /// source of truth for the queue to disagree with itself about.
+    pub initialised: bool,
     /// Jobs waiting in `_queue` for a worker.
     pub queued: usize,
     /// Jobs that finished, in `_completed`.
@@ -105,18 +116,34 @@ pub struct UnreadableJob {
 }
 
 impl QueueStatus {
-    /// Whether this work root holds no trace of a job at all.
-    ///
-    /// Distinct from "the queue is empty": a work root that has drained still
-    /// has `_completed` entries. Nothing anywhere is the signature of a work
-    /// root that was never scanned into - almost always a `-w` that does not
-    /// match the one `scan` used.
-    pub fn is_untouched(&self) -> bool {
+    /// Whether the four directories hold no job of any kind.
+    fn holds_nothing(&self) -> bool {
         self.queued == 0
             && self.completed == 0
             && self.in_progress.is_empty()
             && self.failed.is_empty()
             && self.unreadable.is_empty()
+    }
+
+    /// Whether this work root holds no trace of a job *and* no queue at all.
+    ///
+    /// Distinct from "the queue is empty" on both halves. A work root that has
+    /// drained still has `_completed` entries, and one that was initialised and
+    /// never scanned into still has the directories. Nothing anywhere, not even
+    /// a `_queue` to put a job in, is the signature of a work root nothing has
+    /// ever run against - almost always a `-w` that does not match the one
+    /// `scan` used.
+    pub fn is_untouched(&self) -> bool {
+        !self.initialised && self.holds_nothing()
+    }
+
+    /// Whether the queue exists and has nothing in it.
+    ///
+    /// The `-w` advice does not apply here: something initialised this work
+    /// root, so it is the queue the user meant and it is simply empty. Telling
+    /// them to check the flag would send them after a mistake they did not make.
+    pub fn is_empty(&self) -> bool {
+        self.initialised && self.holds_nothing()
     }
 
     /// Claimed jobs whose worker has stopped checking in.
@@ -150,14 +177,27 @@ impl StatusCommand {
 
         let mut unreadable = Vec::new();
 
-        let queued = job_files(&queue.queue_dir).await?.len();
-        let completed = job_files(&queue.completed_dir).await?.len();
+        let queued_files = job_files(&queue.queue_dir).await?;
+        let completed_files = job_files(&queue.completed_dir).await?;
+        let in_progress_files = job_files(&queue.in_progress_dir).await?;
+        let failed_files = job_files(&queue.failed_dir).await?;
+
+        // Whether the four directories are there at all is evidence the counts
+        // do not carry, and it is what separates an empty queue from a work root
+        // nobody has ever pointed `scan` at.
+        let initialised = queued_files.is_some()
+            || completed_files.is_some()
+            || in_progress_files.is_some()
+            || failed_files.is_some();
+
+        let queued = queued_files.unwrap_or_default().len();
+        let completed = completed_files.unwrap_or_default().len();
 
         let mut in_progress = Vec::new();
-        for path in job_files(&queue.in_progress_dir).await? {
+        for path in in_progress_files.unwrap_or_default() {
             let job_name = file_name_of(&path);
             match read_job(&path).await {
-                Ok(job) => {
+                Ok(Some(job)) => {
                     let since_last_seen = last_activity(&path, &heartbeat_path_for(&path))
                         .await
                         .and_then(|seen| SystemTime::now().duration_since(seen).ok());
@@ -169,6 +209,10 @@ impl StatusCommand {
                         since_last_seen,
                     });
                 }
+                // A worker completed it while this report was being built. The
+                // counts are a moment stale, which is the right trade; calling
+                // it unreadable would not be.
+                Ok(None) => {}
                 Err(reason) => unreadable.push(UnreadableJob {
                     job_name,
                     directory: "_in_progress".to_string(),
@@ -178,15 +222,16 @@ impl StatusCommand {
         }
 
         let mut failed = Vec::new();
-        for path in job_files(&queue.failed_dir).await? {
+        for path in failed_files.unwrap_or_default() {
             let job_name = file_name_of(&path);
             match read_job(&path).await {
-                Ok(job) => failed.push(FailedJob {
+                Ok(Some(job)) => failed.push(FailedJob {
                     job_name,
                     input_path: job.input_path,
                     attempts: job.attempts,
                     last_error: job.last_error,
                 }),
+                Ok(None) => {}
                 Err(reason) => unreadable.push(UnreadableJob {
                     job_name,
                     directory: "_failed".to_string(),
@@ -203,6 +248,7 @@ impl StatusCommand {
 
         Ok(QueueStatus {
             work_root: self.work_root.clone(),
+            initialised,
             queued,
             completed,
             in_progress,
@@ -212,36 +258,125 @@ impl StatusCommand {
     }
 }
 
-/// The `.job` files in a queue directory, or none if it does not exist.
+/// The `.job` files in a queue directory, or `None` if the directory is not
+/// there at all.
 ///
 /// Only `.job` files count. `_queue` also holds the `.lock` directories enqueue
 /// uses, and `_in_progress` holds `.heartbeat` files and `.chunks` directories;
 /// none of those is a job and counting one would inflate the answer.
-async fn job_files(directory: &Path) -> Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-
+///
+/// "Not there" is the only absence that reads as an empty directory. Every other
+/// failure is propagated, because they mean different things to a user and only
+/// one of them is a `-w` problem: a directory that does not exist is a work root
+/// nothing has scanned into, while a directory that cannot be *reached* - a
+/// share that is down, a mount that went away - is a work root whose `-w` may be
+/// exactly right. CLAUDE.md designs for many workers on one shared work root, so
+/// the second is not a hypothetical, and answering it with "this work root has
+/// never held a job" sends a user to change the one thing that is not wrong.
+async fn job_files(directory: &Path) -> Result<Option<Vec<PathBuf>>> {
     let mut entries = match async_fs::read_dir(directory).await {
         Ok(entries) => entries,
-        Err(_) => return Ok(paths),
+        Err(e) if is_absent(&e) => return Ok(None),
+        Err(e) => return Err(unreachable_directory(directory, &e)),
     };
 
-    while let Some(entry) = entries.next_entry().await? {
+    let mut paths = Vec::new();
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(e) => return Err(unreachable_directory(directory, &e)),
+        };
+
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("job") && path.is_file() {
             paths.push(path);
         }
     }
 
-    Ok(paths)
+    Ok(Some(paths))
+}
+
+/// Whether a failed read means "there is no such directory" or "we could not
+/// get to it".
+///
+/// The distinction is the whole of the difference between an empty report and
+/// an error, so it cannot rest on the error kind alone. Off Windows it can: a
+/// mount that has gone away reports a connection or IO failure, and never
+/// `NotFound`.
+///
+/// Windows folds the entire network-error family into `NotFound`. A work root on
+/// a host that is not answering fails with `ERROR_BAD_NETPATH`, which
+/// `io::Error` reports as `ErrorKind::NotFound` with raw code 53, and a share
+/// that does not resolve gives `ERROR_BAD_NET_NAME` as `NotFound` with 67 - both
+/// indistinguishable by kind from the `_queue` directory of a work root nothing
+/// has scanned into yet. So on Windows the raw code is the only evidence there
+/// is, and these are the codes that mean the path was never resolved rather than
+/// looked up and found missing.
+///
+/// This is the same split as `FFmpegProcessor::ffmpeg_command`: both worker
+/// platforms matter, and neither branch is the general case.
+#[cfg(windows)]
+fn is_absent(error: &std::io::Error) -> bool {
+    /// Windows errors that arrive as `NotFound` but mean the path could not be
+    /// resolved over the network, not that nothing is there.
+    const UNREACHABLE: &[i32] = &[
+        51,   // ERROR_REM_NOT_LIST: the remote computer is not available
+        53,   // ERROR_BAD_NETPATH: the network path was not found
+        54,   // ERROR_NETWORK_BUSY
+        55,   // ERROR_DEV_NOT_EXIST: the network resource is no longer available
+        64,   // ERROR_NETNAME_DELETED: the share went away
+        67,   // ERROR_BAD_NET_NAME: the network name cannot be found
+        1231, // ERROR_NETWORK_UNREACHABLE
+        1232, // ERROR_HOST_UNREACHABLE
+    ];
+
+    error.kind() == std::io::ErrorKind::NotFound
+        && !error
+            .raw_os_error()
+            .is_some_and(|code| UNREACHABLE.contains(&code))
+}
+
+#[cfg(not(windows))]
+fn is_absent(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+}
+
+/// Why a queue directory could not be listed, said in full.
+///
+/// The whole message is one error rather than an `anyhow` context over the
+/// `io::Error`, because `main` prints a failure with `{}` and that shows only
+/// the outermost context - which would drop the operating system's reason, the
+/// one part of this that says whether the host is down or the path is denied.
+fn unreachable_directory(directory: &Path, error: &std::io::Error) -> anyhow::Error {
+    anyhow!(
+        "could not read the queue directory {}: {error}. \
+         The work root could not be reached, so this says nothing about whether \
+         the queue is empty - -w may well name exactly the right place.",
+        for_display(directory)
+    )
 }
 
 /// Read one job file, describing the failure rather than propagating it.
-async fn read_job(path: &Path) -> std::result::Result<Job, String> {
-    let content = async_fs::read_to_string(path)
-        .await
-        .map_err(|e| format!("could not be read: {e}"))?;
+///
+/// `Ok(None)` means the file is no longer there. A job vanishing between the
+/// listing and the read is the healthiest thing a queue does: `complete()`
+/// renames the file into `_completed`, and on a busy queue that lands inside
+/// this window regularly. Filing it under "could not be read" would report
+/// corruption on a queue where a worker is simply finishing work, so only a file
+/// that is still present and cannot be parsed is worth reporting - which is also
+/// what [`job_files`] already does, dropping an entry that vanished before its
+/// `is_file()` check.
+async fn read_job(path: &Path) -> std::result::Result<Option<Job>, String> {
+    let content = match async_fs::read_to_string(path).await {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("could not be read: {e}")),
+    };
 
-    serde_json::from_str(&content).map_err(|e| format!("is not a readable job file: {e}"))
+    serde_json::from_str(&content)
+        .map(Some)
+        .map_err(|e| format!("is not a readable job file: {e}"))
 }
 
 fn file_name_of(path: &Path) -> String {
@@ -398,6 +533,11 @@ pub fn render(status: &QueueStatus) -> String {
         out.push_str("   -w/--work-dir defaults to the current working directory, not the media\n");
         out.push_str("   directory, so a queue created from a different shell lives elsewhere.\n");
         out.push_str("   Pass -w to name the queue you mean.\n");
+    } else if status.is_empty() {
+        out.push_str("\n💡 This queue is empty.\n");
+        out.push_str("   Its directories are here, so this is the work root something ran\n");
+        out.push_str("   against - there is just nothing waiting, running or parked in it.\n");
+        out.push_str("   `scan` is what puts jobs here.\n");
     }
 
     out.push('\n');
@@ -408,7 +548,7 @@ pub fn render(status: &QueueStatus) -> String {
 mod tests {
     use super::*;
     use crate::job::{MediaFileType, PostProcessingSettings, QualitySettings};
-    use crate::queue::JobQueue;
+    use crate::queue::{JobQueue, HEARTBEAT_INTERVAL};
     use tempfile::TempDir;
 
     fn a_job(input: &str, media_root: &Path) -> Job {
@@ -434,6 +574,34 @@ mod tests {
         }
     }
 
+    /// Claim one job and backdate it, which is exactly what a worker that
+    /// stopped checking in `by` ago leaves behind: the job file sits in
+    /// `_in_progress` and neither it nor its heartbeat has moved since.
+    async fn claim_and_age(queue: &JobQueue, media_root: &Path, input: &str, by: Duration) {
+        queue.enqueue_job(&a_job(input, media_root)).await.unwrap();
+
+        let job_name = {
+            let claimed = queue.claim_job(None).await.unwrap().unwrap();
+            claimed.job_name().to_string()
+        };
+
+        let in_progress = queue.in_progress_dir.join(&job_name);
+        let heartbeat = heartbeat_path_for(&in_progress);
+        age(&[in_progress, heartbeat], by);
+    }
+
+    /// The names of the files a status reports under one of its two verdicts.
+    fn inputs<'a>(jobs: impl Iterator<Item = &'a InProgressJob>) -> Vec<String> {
+        jobs.map(|job| {
+            job.input_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+    }
+
     /// A work root nothing has ever scanned into is the case a user hits when
     /// `-w` does not match the one `scan` used, so it has to answer rather than
     /// fail - and it must not create the directories just by being asked.
@@ -450,7 +618,9 @@ mod tests {
         assert_eq!(status.completed, 0);
         assert!(status.in_progress.is_empty());
         assert!(status.failed.is_empty());
+        assert!(!status.initialised);
         assert!(status.is_untouched());
+        assert!(!status.is_empty());
 
         assert!(
             !temp_dir.path().join("_queue").exists(),
@@ -460,6 +630,7 @@ mod tests {
         let report = render(&status);
         assert!(report.contains("never held a job"));
         assert!(report.contains("-w/--work-dir"));
+        assert!(!report.contains("This queue is empty"), "{report}");
     }
 
     /// An initialised but drained queue is *not* the untouched case, and saying
@@ -561,6 +732,59 @@ mod tests {
         assert!(
             report.contains("returned to the queue by the next worker"),
             "{report}"
+        );
+    }
+
+    /// The threshold has to be the sweep's, not merely near it.
+    ///
+    /// The stranded test above ages a job three times past `STALE_AFTER`, which
+    /// passes under any threshold up to the age it happened to pick, so on its
+    /// own it pins nothing. These two sit either side of `STALE_AFTER` itself:
+    /// raise the rule and the job just past the line stops being reported,
+    /// lower it and the job still well inside the line starts being reported.
+    /// A report naming jobs the next worker start will *not* reclaim - or
+    /// staying quiet about ones it will - is the failure this command exists to
+    /// prevent, so the number is worth pinning rather than approximating.
+    #[tokio::test]
+    async fn stranded_is_judged_on_the_threshold_the_sweep_uses() {
+        let temp_dir = TempDir::new().unwrap();
+        let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        queue.init().await.unwrap();
+
+        // Two seconds past the line, not ten minutes past it.
+        claim_and_age(
+            &queue,
+            temp_dir.path(),
+            "just-past.mkv",
+            STALE_AFTER + Duration::from_secs(2),
+        )
+        .await;
+
+        // Quiet for longer than a heartbeat interval, which is the nearest
+        // other duration in the queue, and still nowhere near stranded.
+        claim_and_age(
+            &queue,
+            temp_dir.path(),
+            "well-inside.mkv",
+            HEARTBEAT_INTERVAL + Duration::from_secs(5),
+        )
+        .await;
+
+        let status = StatusCommand::new(temp_dir.path().to_path_buf())
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(status.in_progress.len(), 2);
+        assert_eq!(
+            inputs(status.stranded()),
+            vec!["just-past.mkv"],
+            "a job quiet for longer than STALE_AFTER is what the sweep reclaims"
+        );
+        assert_eq!(
+            inputs(status.running()),
+            vec!["well-inside.mkv"],
+            "a job quiet for less than STALE_AFTER is one the sweep leaves alone"
         );
     }
 
@@ -700,6 +924,131 @@ mod tests {
         assert!(report.contains("_failed/garbage.job"), "{report}");
     }
 
+    /// A job that finishes while the report is being built is a queue working,
+    /// not a queue breaking.
+    ///
+    /// `job_files` lists `_in_progress`, then each path is read. A worker's
+    /// `complete()` renames a job out of that directory in between, and on a
+    /// busy queue - the exact moment someone runs this command - it lands inside
+    /// that window often. Reporting it under "could not be read" prints a
+    /// corruption signal for the healthiest thing the queue does.
+    ///
+    /// Asserted on `read_job` rather than by racing `execute`, because the
+    /// decision this pins is the one this function makes, and a test that has to
+    /// win a race to fail is a test that will pass on a slow day.
+    #[tokio::test]
+    async fn a_job_that_moved_on_is_not_a_job_that_could_not_be_read() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // What `complete()` leaves for a reader that listed the file a moment
+        // earlier: the path is simply not there any more.
+        let moved_on = temp_dir.path().join("finished-mid-read.job");
+        assert!(
+            matches!(read_job(&moved_on).await, Ok(None)),
+            "a job that completed between the listing and the read is not corruption"
+        );
+
+        // A file that is still there and does not parse is the real thing, and
+        // has to stay reported.
+        let corrupt = temp_dir.path().join("corrupt.job");
+        std::fs::write(&corrupt, b"not json at all").unwrap();
+        assert!(
+            read_job(&corrupt).await.is_err(),
+            "a job file that is present and unparseable is still unreadable"
+        );
+    }
+
+    /// A work root that cannot be reached is not an empty one.
+    ///
+    /// Swallowing every `read_dir` error reports a share that is down as a
+    /// queue that has never held a job, and sends the user to change a `-w`
+    /// that is already correct - the one mistake this command exists to catch,
+    /// made by the command itself.
+    #[tokio::test]
+    async fn a_queue_directory_that_cannot_be_read_is_not_reported_as_an_empty_queue() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // A file where `_queue` should be is a path that exists and cannot be
+        // listed: the portable stand-in for the unreachable share, which is the
+        // case that actually happens against a shared work root.
+        std::fs::write(temp_dir.path().join("_queue"), b"not a directory").unwrap();
+
+        let error = StatusCommand::new(temp_dir.path().to_path_buf())
+            .execute()
+            .await
+            .expect_err("an unlistable queue directory must not read as an empty queue");
+
+        let message = format!("{error}");
+        assert!(message.contains("_queue"), "{message}");
+        assert!(message.contains("could not be reached"), "{message}");
+        assert!(
+            !message.contains("never held a job"),
+            "the -w advice belongs to an absent work root, not an unreadable one: {message}"
+        );
+    }
+
+    /// The unreachable work root that started this, on the platform that hides
+    /// it.
+    ///
+    /// Narrowing to `ErrorKind::NotFound` is the obvious fix and on Windows it
+    /// is not enough: `\\host\share` on a host that is not answering comes back
+    /// as `NotFound` with raw code 53, so the kind alone still reads an
+    /// unreachable share as a work root nothing has scanned into. This asserts
+    /// against the real filesystem rather than a constructed error, so it fails
+    /// if that mapping is ever what the obvious fix assumed it was.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_network_path_that_does_not_resolve_is_unreachable_not_absent() {
+        let unreachable = std::fs::read_dir(r"\\no-such-host-xyz\plexify-queue\_queue")
+            .expect_err("a host that does not exist cannot be listed");
+
+        assert_eq!(
+            unreachable.kind(),
+            std::io::ErrorKind::NotFound,
+            "if Windows ever stops folding network errors into NotFound, the raw \
+             code check below is dead weight and can go"
+        );
+        assert!(
+            !is_absent(&unreachable),
+            "an unreachable share must not read as an uninitialised work root"
+        );
+
+        // A path on a drive that is there, in a directory that is not, is the
+        // uninitialised work root - and still has to read as empty.
+        let absent = std::fs::read_dir(r"C:\definitely\not\here\_queue")
+            .expect_err("a directory that is not there cannot be listed");
+        assert!(is_absent(&absent));
+    }
+
+    /// An initialised work root with nothing in it is an empty queue, not a `-w`
+    /// aimed at the wrong place.
+    ///
+    /// Both print advice, and it must not be the same advice: something created
+    /// these directories, so this *is* the queue the user meant.
+    #[tokio::test]
+    async fn an_initialised_but_empty_work_root_is_not_reported_as_misaddressed() {
+        let temp_dir = TempDir::new().unwrap();
+        let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        queue.init().await.unwrap();
+
+        let status = StatusCommand::new(temp_dir.path().to_path_buf())
+            .execute()
+            .await
+            .unwrap();
+
+        assert!(status.initialised);
+        assert!(status.is_empty());
+        assert!(!status.is_untouched());
+
+        let report = render(&status);
+        assert!(report.contains("This queue is empty"), "{report}");
+        assert!(!report.contains("never held a job"), "{report}");
+        assert!(
+            !report.contains("-w/--work-dir"),
+            "the -w advice is wrong here - the flag names exactly this queue: {report}"
+        );
+    }
+
     /// The work root is the first thing printed, because `-w` defaulting to the
     /// current directory is the most common reason a queue looks wrong.
     #[tokio::test]
@@ -783,6 +1132,7 @@ mod tests {
     fn a_reported_path_uses_one_separator() {
         let status = QueueStatus {
             work_root: PathBuf::from("work"),
+            initialised: true,
             queued: 0,
             completed: 0,
             in_progress: Vec::new(),

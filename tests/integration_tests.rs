@@ -1248,6 +1248,77 @@ fn test_status_explains_a_work_root_that_was_never_scanned_into() {
     );
 }
 
+/// A work root a scan initialised and put nothing in is an empty queue, not the
+/// `-w` mistake above.
+///
+/// Scanning a directory with no media in it is the ordinary way to reach this:
+/// the queue directories get created, no job is enqueued, and the flag names
+/// exactly the right place. Printing the `-w` advice here sends the user to
+/// change the one thing that is correct, which is the same failure the
+/// unreachable work root has.
+#[test]
+#[serial]
+fn test_status_tells_an_empty_queue_apart_from_a_misaddressed_one() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+
+    let scan = Command::new(PLEXIFY_BIN)
+        .args([
+            "scan",
+            temp_path.to_str().unwrap(),
+            "--work-dir",
+            temp_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute scan command");
+    assert!(scan.status.success());
+    assert!(temp_path.join("_queue").is_dir(), "scan must initialise");
+
+    let output = Command::new(PLEXIFY_BIN)
+        .args(["status", "-w", temp_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute status command");
+
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+
+    assert!(text.contains("This queue is empty"), "got: {text}");
+    assert!(!text.contains("never held a job"), "got: {text}");
+    assert!(!text.contains("-w/--work-dir"), "got: {text}");
+}
+
+/// A work root that cannot be listed must fail loudly rather than report an
+/// empty queue, because "empty" here would be a claim about a place we could not
+/// look - and the advice attached to it points at a flag that is not the problem.
+#[test]
+fn test_status_fails_on_a_work_root_it_cannot_read() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // A file where `_queue` should be: a path that exists and cannot be listed,
+    // which is what an unreachable shared work root looks like from here.
+    fs::write(temp_dir.path().join("_queue"), "not a directory").unwrap();
+
+    let output = Command::new(PLEXIFY_BIN)
+        .args(["status", "-w", temp_dir.path().to_str().unwrap()])
+        .output()
+        .expect("Failed to execute status command");
+
+    assert!(
+        !output.status.success(),
+        "a work root that could not be read must not exit 0"
+    );
+
+    // Both streams: the failure is logged through `tracing`, whose fmt layer
+    // writes to stdout, so which one carries it is not this test's business.
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("could not be reached"), "got: {text}");
+    assert!(!text.contains("never held a job"), "got: {text}");
+}
+
 /// `status` counts a real queue and names the work root it counted.
 ///
 /// The work root is asserted because `-w` defaults to the current working

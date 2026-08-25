@@ -135,6 +135,17 @@ and `STALE_AFTER`, the same two things the sweep uses; a report judging that on 
 would tell users about jobs the sweep will not reclaim. `execute` returns `QueueStatus` and
 rendering is separate, so another consumer reads the state rather than parsing the text.
 
+Reading a queue nothing is holding still means racing it, and two of the three absences
+`status` can meet are not errors. A job file that has *vanished* between the listing and the
+read is a worker's `complete()` doing its job, so it is skipped rather than reported as
+unreadable - only a file still present and unparseable is worth a corruption signal. A queue
+directory that is *absent* reads as empty, but one that cannot be *reached* is an error,
+because answering an unreachable share with the `-w` advice sends a user to change the one
+thing that is right. Windows makes that distinction invisible to `ErrorKind` - it reports
+`ERROR_BAD_NETPATH` as `NotFound` - so `is_absent` checks the raw code there, and narrowing
+it back to the kind alone silently restores the wrong answer on the platform where shared
+work roots are most likely.
+
 Whatever an interrupted encode left in the work folder is left alone by the sweep. Deciding
 what of it is still usable belongs to the encoder, not the queue. What must *not* be left
 behind is a live process: `kill_on_drop(true)` on the FFmpeg command is what stops a
