@@ -61,13 +61,18 @@ random again.
 Any number of `work` processes on any number of machines can point at the same work root.
 Mutual exclusion comes from two filesystem primitives, both in `src/queue/mod.rs`:
 
-- **Enqueue** creates `{uuid}.job.lock` as a *directory*. `create_dir` fails if it exists, so
-  the losing racer skips the job rather than double-writing it.
+- **Enqueue** writes the job under a staging name and renames it onto `{uuid}.job`. Rename is
+  atomic and replaces, and the name is the v5 id, so two racing scanners write identical
+  content and one of the two renames wins. Nothing is left behind either way — a scanner that
+  claimed the name with a marker of its own and then died would leave that name taken with no
+  job under it, and every later scan would skip a file that is in no queue directory at all.
 - **Claim** renames the job file from `_queue/` into `_in_progress/`. Rename is atomic, so
   exactly one worker wins; losers see `NotFound` and move on.
 
 Preserve this property when touching the queue. Any change that reads-then-writes instead of
-renaming reintroduces the race that this design exists to avoid.
+renaming reintroduces the race that this design exists to avoid. The same goes for rewriting
+a job in place to record an attempt: `write_job_atomically` stages and renames, so a worker
+killed mid-rewrite leaves a job file that still parses.
 
 **The work root is not the media root.** `JobQueue::new` takes both. `--work-dir`/`-w`
 controls the queue location and **defaults to the current working directory**, not to the
@@ -98,6 +103,14 @@ encodes to `job.work_folder_output_path(work_folder)` and only then calls
 `move_to_destination`. This keeps a media server from indexing a half-written `.mp4` sitting
 next to the source. Preserve the write-then-move ordering.
 
+The move itself has to be a copy, because the work root and the media root are routinely on
+different volumes — so it copies to `{output}.partial` beside the destination and renames
+that onto the destination, which within one directory is atomic. The destination name is
+therefore only ever taken by a whole file. That matters beyond the media server: `work` and
+`scan` both treat a file at the output path as an encode that is already done, so a copy
+interrupted straight onto the destination would be recorded as a finished job and leave a
+truncated `.mp4` in the library that nothing ever comes back for.
+
 **A job that a worker stops running comes back, and a job that cannot succeed stops coming
 back.** Both are properties of the same three moves, and both are easy to undo by accident:
 
@@ -121,6 +134,12 @@ back.** Both are properties of the same three moves, and both are easy to undo b
   what makes the queue addressable. `job_exists` consults `_failed/`, so re-scanning cannot
   walk a parked job back into the queue; moving the file out by hand is what asks for a retry,
   and `clean` empties it along with everything else.
+- **A file in `_in_progress` that is not a job goes to `_failed` too.** Contents that will not
+  parse will not start parsing, and since `job_exists` goes by filename, a job file left there
+  keeps its media file out of the queue for as long as it sits. The sweep renames it into
+  `_failed` and writes the parse error beside it as `{job}.error`. A read that *fails* is left
+  alone: a work root on a network share drops out now and then, and that is worth another
+  sweep rather than a decision.
 
 Whatever an interrupted encode left in the work folder is left alone by the sweep. Deciding
 what of it is still usable belongs to the encoder, not the queue. What must *not* be left
