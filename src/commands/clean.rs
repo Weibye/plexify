@@ -668,6 +668,34 @@ mod tests {
         }
     }
 
+    /// Says yes, and a worker claims a job while the question is on screen.
+    ///
+    /// This is what a person reading the report looks like from the queue's
+    /// point of view: the plan has already been read, and the disk moves on
+    /// before the answer is acted on. The claim is written synchronously inside
+    /// `ask` so the window is deterministic rather than a sleep.
+    struct ClaimsWhileAsking {
+        work_root: PathBuf,
+        claimed: PathBuf,
+    }
+
+    impl Confirmation for ClaimsWhileAsking {
+        fn is_interactive(&self) -> bool {
+            true
+        }
+        fn ask(&mut self, _question: &str) -> Result<bool> {
+            let job = job_for("/media/ClaimedLate.mkv");
+            let path = self
+                .work_root
+                .join(QueueDirectory::InProgress.on_disk_name())
+                .join(job.job_filename());
+            std::fs::write(&path, serde_json::to_string_pretty(&job).unwrap()).unwrap();
+            std::fs::write(heartbeat_path_for(&path), b"" as &[u8]).unwrap();
+            self.claimed = path;
+            Ok(true)
+        }
+    }
+
     /// A run with nobody to ask. Being asked at all is the failure this stands
     /// in for: on a real pipe `read_line` would block forever, and a test that
     /// blocked forever would be a hung suite rather than a failing one.
@@ -985,6 +1013,217 @@ mod tests {
         assert!(temp.path().join("_failed").exists());
         // A narrowed run is not a full clean, so the worker log stays.
         assert!(temp.path().join(WORKER_LOG).exists());
+    }
+
+    /// An empty work root with one job waiting, so there is something to clean
+    /// and no claim in the way of the first refusal.
+    async fn work_root_with_one_queued_job() -> TempDir {
+        let temp = TempDir::new().unwrap();
+        let queue = JobQueue::new(temp.path().to_path_buf(), temp.path().to_path_buf());
+        queue.init().await.unwrap();
+
+        let job = job_for("/media/Waiting.mkv");
+        async_fs::write(
+            queue.queue_dir.join(job.job_filename()),
+            serde_json::to_string_pretty(&job).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        temp
+    }
+
+    /// Write a `.job` file that nothing can parse, and return its path.
+    async fn write_unreadable_job(queue: &JobQueue, directory: QueueDirectory) -> PathBuf {
+        // A plausible v5 job id: the filename is what the report has to fall
+        // back to when the contents are unusable.
+        let path = queue
+            .path_of(directory)
+            .join("0f1e2d3c-4b5a-5968-8776-655443332211.job");
+        async_fs::write(&path, b"{ not json" as &[u8])
+            .await
+            .unwrap();
+        path
+    }
+
+    /// Finding 1: the plan is read before the user is asked, so a worker that
+    /// claims a job while the report is on screen is not in it. Acting on that
+    /// plan deletes a live claim that nobody was shown and nobody consented to.
+    #[tokio::test]
+    async fn a_claim_taken_while_the_user_reads_the_report_is_refused() {
+        let temp = work_root_with_one_queued_job().await;
+        let command = command_for(&temp);
+
+        // The report shows no claims at all, so the refusal before the prompt
+        // passes; the claim appears between that check and the deletion.
+        let mut confirm = ClaimsWhileAsking {
+            work_root: temp.path().to_path_buf(),
+            claimed: PathBuf::new(),
+        };
+        let error = command.run(&mut confirm).await.unwrap_err().to_string();
+
+        assert!(error.contains("live claim"), "{error}");
+        assert!(error.contains("while the report was on screen"), "{error}");
+        assert!(error.contains("--force"), "{error}");
+        assert!(
+            confirm.claimed.exists(),
+            "a claim taken after the report was printed was deleted"
+        );
+        assert!(
+            queue_dirs_exist(&temp),
+            "the deletion went ahead on a stale plan"
+        );
+    }
+
+    /// The same drift, with `--force`: the user has said this is what they want,
+    /// so the recheck must not become a second thing to argue with.
+    #[tokio::test]
+    async fn the_recheck_is_not_a_second_refusal_to_argue_with() {
+        let temp = work_root_with_one_queued_job().await;
+        let command = command_for(&temp).force(true);
+
+        let mut confirm = ClaimsWhileAsking {
+            work_root: temp.path().to_path_buf(),
+            claimed: PathBuf::new(),
+        };
+
+        assert_eq!(
+            command.run(&mut confirm).await.unwrap(),
+            CleanOutcome::Removed(QueueDirectory::ALL.to_vec())
+        );
+    }
+
+    /// Finding 2: liveness comes off timestamps, which needs no parse. A claim
+    /// whose job file is corrupt but whose heartbeat is fresh is a live worker,
+    /// and skipping it kept it out of `live_claims()` entirely - so the refusal
+    /// that exists for exactly this case never fired.
+    #[tokio::test]
+    async fn an_unreadable_claim_with_a_fresh_heartbeat_is_still_live() {
+        let temp = TempDir::new().unwrap();
+        let queue = JobQueue::new(temp.path().to_path_buf(), temp.path().to_path_buf());
+        queue.init().await.unwrap();
+
+        let job_file = write_unreadable_job(&queue, QueueDirectory::InProgress).await;
+        async_fs::write(heartbeat_path_for(&job_file), b"" as &[u8])
+            .await
+            .unwrap();
+
+        let command = command_for(&temp);
+        let plan = command.plan(&queue).await.unwrap();
+
+        assert_eq!(
+            plan.live_claims().count(),
+            1,
+            "an unreadable claim did not count as live"
+        );
+
+        // It is in the report too, named by its own filename - the v5 UUID of
+        // the input path, which is the only stable thing left about it.
+        let report = command.render(&plan);
+        assert!(
+            report.contains("0f1e2d3c-4b5a-5968-8776-655443332211.job"),
+            "{report}"
+        );
+        assert!(report.contains("unreadable"), "{report}");
+        assert!(report.contains("[live]"), "{report}");
+
+        // And `--yes` does not get past it, exactly as for a readable claim.
+        let error = command_for(&temp)
+            .assume_yes(true)
+            .run(&mut Accepts { asked: false })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("live claim"), "{error}");
+        assert!(job_file.exists(), "a live claim was deleted");
+    }
+
+    /// The other half of finding 2: a corrupt parked job is exactly the one
+    /// somebody needs to see before emptying `_failed`, and it was the one the
+    /// report dropped. #129's `quarantine_unreadable` makes this a documented
+    /// state rather than an anomaly.
+    #[tokio::test]
+    async fn an_unreadable_parked_job_is_itemised_rather_than_dropped() {
+        let temp = TempDir::new().unwrap();
+        let queue = JobQueue::new(temp.path().to_path_buf(), temp.path().to_path_buf());
+        queue.init().await.unwrap();
+
+        write_unreadable_job(&queue, QueueDirectory::Failed).await;
+        // A readable one beside it, so this is about the report being complete
+        // rather than about it being empty.
+        let readable = job_for("/media/Broken.mkv");
+        async_fs::write(
+            queue.failed_dir.join(readable.job_filename()),
+            serde_json::to_string_pretty(&readable).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let command = command_for(&temp);
+        let plan = command.plan(&queue).await.unwrap();
+        let report = command.render(&plan);
+
+        let failed = plan
+            .directories
+            .iter()
+            .find(|d| d.directory == QueueDirectory::Failed)
+            .unwrap();
+        assert_eq!(failed.jobs, 2);
+        assert_eq!(
+            failed.parked.len(),
+            2,
+            "the report counted a job it declined to name:\n{report}"
+        );
+        assert!(
+            report.contains("0f1e2d3c-4b5a-5968-8776-655443332211.job"),
+            "{report}"
+        );
+        assert!(report.contains("unreadable"), "{report}");
+        // Nothing is invented for a job whose attempt count could not be read.
+        assert!(report.contains("? attempts"), "{report}");
+        assert!(report.contains("Broken.mkv"), "{report}");
+    }
+
+    /// Finding 3: every other test injects a double, so this is the only test of
+    /// the parser that actually stands between the report and `remove_dir_all`.
+    /// Its property is that anything which is not an explicit yes is a no.
+    #[test]
+    fn only_an_explicit_yes_is_a_yes() {
+        for (answer, expected) in [
+            ("y\n", true),
+            ("Y\n", true),
+            ("yes\n", true),
+            ("YES\n", true),
+            ("  y  \n", true),
+            ("n\n", false),
+            ("N\n", false),
+            ("no\n", false),
+            // An empty line: the user pressed return at a `[y/N]` prompt.
+            ("\n", false),
+            ("   \n", false),
+            // End of input with nothing typed. `is_interactive` normally refuses
+            // long before this, but the parser has to be right on its own.
+            ("", false),
+            ("ye\n", false),
+            ("yep\n", false),
+            ("yes please\n", false),
+        ] {
+            let mut reader = std::io::Cursor::new(answer.as_bytes());
+            let mut written: Vec<u8> = Vec::new();
+            let got = TerminalConfirmation::ask_on(
+                &mut reader,
+                &mut written,
+                "Delete all of this? [y/N] ",
+            )
+            .unwrap();
+
+            assert_eq!(got, expected, "answering {answer:?} was read as {got}");
+            assert_eq!(
+                String::from_utf8(written).unwrap(),
+                "Delete all of this? [y/N] ",
+                "the question was not asked before the answer was read"
+            );
+        }
     }
 
     #[tokio::test]
