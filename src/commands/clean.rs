@@ -31,7 +31,8 @@
 //! missing.
 
 use anyhow::{anyhow, Context, Result};
-use std::io::{IsTerminal, Write};
+use std::fmt;
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use tokio::fs as async_fs;
 
@@ -76,6 +77,15 @@ pub enum CleanOutcome {
 /// data rather than text, so the decision to refuse a live claim is made on the
 /// same reading the user is shown rather than on a second look at the disk.
 ///
+/// **The counts are a floor, not the truth.** They are read before the user is
+/// asked, and `scan` or a worker may add to any of the four directories while
+/// the report is on screen; `remove_dir_all` then takes those too. That is
+/// tolerable for three of them - `_queue` is rebuilt by `scan`, and a job that
+/// reaches `_completed` or `_failed` in the window lands in a directory the user
+/// consented to losing. It is not tolerable for a *live claim*, which is why
+/// that one case is re-read from the disk immediately before the deletion rather
+/// than trusted from here. See [`CleanCommand::run`].
+///
 /// **This overlaps with `QueueStatus` in #144 (`feat/queue-status`), which reads
 /// the same four directories and is explicitly structured for other callers.**
 /// It is duplicated here only because that branch is unmerged and this one is
@@ -106,22 +116,56 @@ pub struct DirectoryPlan {
     pub parked: Vec<Parked>,
 }
 
+/// How the report names one job file.
+///
+/// A job file that cannot be parsed is still a file that is about to be deleted,
+/// and in `_in_progress` it is still a claim. Dropping it from the report would
+/// hide the one entry a person most needs to see before emptying the directory,
+/// so the fallback names it by its own filename - which is the v5 UUID of the
+/// input path (`Job::id_for_input`) and so is stable and worth printing. #129
+/// makes an unreadable job in `_failed` a documented state rather than an
+/// anomaly, by quarantining one there with an `.error` file beside it; this is
+/// what keeps such a job visible in the report once that lands.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum JobIdentity {
+    /// The input path the job transcodes, read out of the job file.
+    Input(PathBuf),
+    /// The job file's own name, when nothing could be read out of it.
+    Unreadable(String),
+}
+
+impl fmt::Display for JobIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            JobIdentity::Input(path) => write!(f, "{}", path.display()),
+            JobIdentity::Unreadable(name) => write!(f, "{name} (unreadable job file)"),
+        }
+    }
+}
+
 /// A job some worker has claimed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Claim {
-    pub input_path: PathBuf,
+    pub job: JobIdentity,
     /// Whether the claiming worker has checked in within [`STALE_AFTER`].
     ///
     /// Judged by [`is_stale`], the same rule the startup sweep uses. A claim
     /// that is not stale is one a worker is still running.
+    ///
+    /// Read from the job file's and the heartbeat's timestamps, neither of which
+    /// needs the job to parse. A heartbeat is evidence of a live worker whether
+    /// or not the job beside it can be read, so a [`JobIdentity::Unreadable`]
+    /// claim is judged by exactly the same rule as any other.
     pub live: bool,
 }
 
 /// A job parked in `_failed`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Parked {
-    pub input_path: PathBuf,
-    pub attempts: u32,
+    pub job: JobIdentity,
+    /// The attempt count that parked it, or `None` when the job file could not
+    /// be read. Nothing is invented for an unreadable job.
+    pub attempts: Option<u32>,
 }
 
 impl CleanPlan {
@@ -156,27 +200,54 @@ pub trait Confirmation {
 /// Reads the answer from the terminal.
 pub struct TerminalConfirmation;
 
+impl TerminalConfirmation {
+    /// Ask on the given streams, and return whether the answer was yes.
+    ///
+    /// The streams are parameters rather than `stdin`/`stderr` so that this -
+    /// the only answer parser on the destructive path - can be exercised
+    /// directly. Every other `Confirmation` in the tests is a double, so nothing
+    /// but a test of this function tests this function.
+    ///
+    /// Its one property: **anything that is not an explicit yes is a no.** This
+    /// is the destructive direction, so the default has to be the one that keeps
+    /// the files.
+    pub fn ask_on<R: BufRead, W: Write>(
+        reader: &mut R,
+        writer: &mut W,
+        question: &str,
+    ) -> Result<bool> {
+        write!(writer, "{question}").context("Could not print the confirmation prompt")?;
+        writer
+            .flush()
+            .context("Could not print the confirmation prompt")?;
+
+        let mut answer = String::new();
+        let read = reader
+            .read_line(&mut answer)
+            .context("Could not read the confirmation answer")?;
+
+        // End of input: the stream closed without anyone answering, so there is
+        // no yes to act on. `is_interactive` normally refuses before it gets
+        // here, but this function is the last thing between the report and
+        // `remove_dir_all` and has to be right on its own rather than because
+        // something upstream happened to check first.
+        if read == 0 {
+            return Ok(false);
+        }
+
+        let answer = answer.trim().to_ascii_lowercase();
+        Ok(answer == "y" || answer == "yes")
+    }
+}
+
 impl Confirmation for TerminalConfirmation {
     fn is_interactive(&self) -> bool {
         std::io::stdin().is_terminal()
     }
 
     fn ask(&mut self, question: &str) -> Result<bool> {
-        let mut stderr = std::io::stderr();
-        write!(stderr, "{question}").context("Could not print the confirmation prompt")?;
-        stderr
-            .flush()
-            .context("Could not print the confirmation prompt")?;
-
-        let mut answer = String::new();
-        std::io::stdin()
-            .read_line(&mut answer)
-            .context("Could not read the confirmation answer")?;
-
-        // Anything that is not an explicit yes is a no. This is the destructive
-        // direction, so the default has to be the one that keeps the files.
-        let answer = answer.trim().to_ascii_lowercase();
-        Ok(answer == "y" || answer == "yes")
+        let stdin = std::io::stdin();
+        Self::ask_on(&mut stdin.lock(), &mut std::io::stderr(), question)
     }
 }
 
@@ -242,6 +313,22 @@ impl CleanCommand {
     /// question a user can answer wrongly is not a safeguard; and the
     /// no-terminal refusal comes last, so a scripted run that would have been
     /// refused anyway is refused for the right reason.
+    ///
+    /// **The live-claim refusal then runs a second time, against the disk, after
+    /// the answer and before the deletion.** `src/fix.rs` rechecks every
+    /// proposal immediately before applying it because the report was computed
+    /// earlier and the library may have moved on, and the same is true here: the
+    /// gap between the plan and the deletion is however long a person spends
+    /// reading a report, so on a busy work root a worker claiming a job inside
+    /// it is routine rather than a microsecond race. A user's yes only covers
+    /// what they were shown.
+    ///
+    /// Only the live claim is re-read, because only the live claim is
+    /// catastrophic; see [`CleanPlan`] for why the other counts being a floor is
+    /// tolerable. The reverse drift - a claim finishing between the report and
+    /// the answer, so a refusal names something no longer there - needs no
+    /// machinery: the first refusal runs before the prompt, so the window it
+    /// sees is a render and nothing else.
     pub async fn run<C: Confirmation>(&self, confirm: &mut C) -> Result<CleanOutcome> {
         if !self.media_root.exists() {
             return Err(anyhow!(
@@ -272,16 +359,7 @@ impl CleanCommand {
             return Ok(CleanOutcome::Reported);
         }
 
-        let live = plan.live_claims().count();
-        if live > 0 && !self.force {
-            return Err(anyhow!(
-                "Refusing to delete a live claim: {live} job(s) in _in_progress have a worker \
-                 that checked in less than {}s ago. Deleting the claim leaves that worker \
-                 encoding with nothing to reconcile the result against. Stop the worker, or \
-                 pass --force to delete it anyway.",
-                STALE_AFTER.as_secs()
-            ));
-        }
+        self.refuse_live_claims(plan.live_claims().count(), false)?;
 
         if !self.assume_yes {
             if !confirm.is_interactive() {
@@ -298,6 +376,14 @@ impl CleanCommand {
             }
         }
 
+        // The disk again, immediately before `remove_dir_all`. Re-planning
+        // rather than asking a second, separate question keeps one rule for what
+        // "live" means: a recheck with its own walk could disagree with the one
+        // the user was shown, and a safeguard two implementations can disagree
+        // about is not one.
+        let now = self.plan(&queue).await?;
+        self.refuse_live_claims(now.live_claims().count(), true)?;
+
         queue.clean(&self.targets).await?;
 
         if let Some(worker_log) = &plan.worker_log {
@@ -309,6 +395,39 @@ impl CleanCommand {
         let removed: Vec<QueueDirectory> = plan.directories.iter().map(|d| d.directory).collect();
         eprintln!("Deleted.");
         Ok(CleanOutcome::Removed(removed))
+    }
+
+    /// Refuse if any claim in the plan has a worker still checking in.
+    ///
+    /// Called twice from [`Self::run`] - once on the report the user is shown,
+    /// once on the disk immediately before the deletion - so that both refusals
+    /// are the same refusal and cannot drift apart. `--force` is the only way
+    /// past either.
+    ///
+    /// `after_the_answer` only changes the wording. It is worth changing:
+    /// a refusal that names claims the report did not mention reads like the
+    /// report lied, unless it says why.
+    fn refuse_live_claims(&self, live: usize, after_the_answer: bool) -> Result<()> {
+        if live == 0 || self.force {
+            return Ok(());
+        }
+
+        // Reaching here after the answer means the first check passed, so the
+        // report the user said yes to showed no live claims at all.
+        let drift = if after_the_answer {
+            " These were claimed while the report was on screen, so they are not in it, and \
+             your answer did not cover them."
+        } else {
+            ""
+        };
+
+        Err(anyhow!(
+            "Refusing to delete a live claim: {live} job(s) in _in_progress have a worker that \
+             checked in less than {}s ago.{drift} Deleting the claim leaves that worker encoding \
+             with nothing to reconcile the result against. Stop the worker, or pass --force to \
+             delete it anyway.",
+            STALE_AFTER.as_secs()
+        ))
     }
 
     /// Read what is on disk, without changing any of it.
@@ -335,29 +454,30 @@ impl CleanCommand {
             match directory {
                 QueueDirectory::InProgress => {
                     for job_file in &job_files {
-                        let Some(job) = read_job(job_file).await else {
-                            continue;
-                        };
+                        // Liveness is read off the job file's and the
+                        // heartbeat's timestamps, which needs no parse. A job
+                        // that cannot be read therefore still gets the same
+                        // answer as any other - which matters, because skipping
+                        // it here would leave it out of `live_claims()` and walk
+                        // a live worker's claim straight past the refusal.
                         let live =
                             !is_stale(job_file, &heartbeat_path_for(job_file), STALE_AFTER).await;
                         plan.claims.push(Claim {
-                            input_path: job.input_path,
+                            job: identify(job_file, read_job(job_file).await.as_ref()),
                             live,
                         });
                     }
-                    plan.claims.sort_by(|a, b| a.input_path.cmp(&b.input_path));
+                    plan.claims.sort_by(|a, b| a.job.cmp(&b.job));
                 }
                 QueueDirectory::Failed => {
                     for job_file in &job_files {
-                        let Some(job) = read_job(job_file).await else {
-                            continue;
-                        };
+                        let job = read_job(job_file).await;
                         plan.parked.push(Parked {
-                            input_path: job.input_path,
-                            attempts: job.attempts,
+                            job: identify(job_file, job.as_ref()),
+                            attempts: job.map(|job| job.attempts),
                         });
                     }
-                    plan.parked.sort_by(|a, b| a.input_path.cmp(&b.input_path));
+                    plan.parked.sort_by(|a, b| a.job.cmp(&b.job));
                 }
                 _ => {}
             }
@@ -413,7 +533,7 @@ impl CleanCommand {
                     out.push_str(&format!(
                         "  {:<10} {}\n",
                         if claim.live { "[live]" } else { "[stranded]" },
-                        claim.input_path.display()
+                        claim.job
                     ));
                 }
             }
@@ -421,12 +541,16 @@ impl CleanCommand {
             if !directory.parked.is_empty() {
                 out.push_str("\nParked jobs in _failed:\n");
                 for parked in &directory.parked {
-                    out.push_str(&format!(
-                        "  {} {:<5} {}\n",
-                        parked.attempts,
-                        plural(parked.attempts as usize, "attempt", "attempts"),
-                        parked.input_path.display()
-                    ));
+                    // An unreadable job file has no attempt count, and inventing
+                    // one would be worse than saying so.
+                    let (count, unit) = match parked.attempts {
+                        Some(attempts) => (
+                            attempts.to_string(),
+                            plural(attempts as usize, "attempt", "attempts"),
+                        ),
+                        None => ("?".to_string(), "attempts"),
+                    };
+                    out.push_str(&format!("  {} {:<5} {}\n", count, unit, parked.job));
                 }
             }
         }
@@ -486,11 +610,26 @@ async fn job_files(directory: &Path) -> Result<Option<Vec<PathBuf>>> {
 ///
 /// A job that vanished between the listing and the read is a worker's
 /// `complete()` doing its job, and a job file nothing can parse is still a file
-/// that will be deleted - it is counted either way. Neither is a reason to
-/// refuse to report; both only cost a line of detail in the report.
+/// that will be deleted. Neither is a reason to refuse to report, and neither is
+/// a reason to drop the entry: what `None` costs is the input path and the
+/// attempt count, not the line. See [`identify`].
 async fn read_job(path: &Path) -> Option<Job> {
     let content = async_fs::read_to_string(path).await.ok()?;
     serde_json::from_str(&content).ok()
+}
+
+/// Name a job file for the report: by what it transcodes, or by itself.
+fn identify(job_file: &Path, job: Option<&Job>) -> JobIdentity {
+    match job {
+        Some(job) => JobIdentity::Input(job.input_path.clone()),
+        None => JobIdentity::Unreadable(
+            job_file
+                .file_name()
+                .unwrap_or(job_file.as_os_str())
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    }
 }
 
 #[cfg(test)]
