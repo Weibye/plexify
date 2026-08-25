@@ -27,7 +27,9 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Manages the job queue with atomic operations for distributed processing
 pub struct JobQueue {
-    #[allow(dead_code)]
+    /// The directory a scan walked. Held so a job's absolute input path can be
+    /// cut back to the library-relative form prioritisation reads, and to
+    /// resolve the relative paths in legacy job files.
     pub media_root: PathBuf,
     pub queue_dir: PathBuf,
     pub in_progress_dir: PathBuf,
@@ -144,7 +146,7 @@ impl JobQueue {
             // Try to read the job file
             if let Ok(content) = async_fs::read_to_string(&job_path).await {
                 if let Ok(job) = serde_json::from_str::<Job>(&content) {
-                    let metadata = job.extract_episode_metadata();
+                    let metadata = job.extract_episode_metadata(&self.media_root);
                     jobs_with_metadata.push((job_path, job, metadata));
                 }
             }

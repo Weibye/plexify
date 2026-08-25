@@ -237,11 +237,13 @@ impl Job {
     /// a three-digit episode number order here exactly as they render there.
     ///
     /// The path is absolute and carries native separators, so it is normalised
-    /// and cut down to the library-relative form `naming::parse` reads.
-    pub fn extract_episode_metadata(&self) -> Option<EpisodeMetadata> {
-        let path = to_forward_slashes(&self.input_path);
+    /// and cut down to the library-relative form `naming::parse` reads. That cut
+    /// needs the media root, which the job does not carry; the queue holds it and
+    /// passes it in.
+    pub fn extract_episode_metadata(&self, media_root: &Path) -> Option<EpisodeMetadata> {
+        let relative = Self::library_relative_path(&self.input_path, media_root)?;
 
-        match naming::parse(Self::below_library_root(&path)?) {
+        match naming::parse(&relative) {
             Ok(MediaName::Episode(episode)) => Some(EpisodeMetadata {
                 series_name: episode.series,
                 season_number: episode.season,
@@ -251,11 +253,51 @@ impl Job {
         }
     }
 
-    /// Cut a forward-slash path down to the part at and below the library root.
+    /// Cut an absolute input path down to the library-relative form
+    /// `naming::parse` reads.
     ///
-    /// The **outermost** root component is taken, the same choice
-    /// `naming::scope_for` makes, so a tree nested into itself is described here
-    /// the way validation describes it rather than a second way.
+    /// **The media root is removed before anything looks for a library root.** A
+    /// media root is an ordinary directory and is routinely called `Movies` or
+    /// `Anime`, or sits below something that is - `/home/bob/Movies`, `/srv/Anime`,
+    /// `D:\Media\Series`. Searching the whole absolute path takes that component
+    /// as the library root, and then every real root below it reads as a tree
+    /// nested into itself: `DuplicatedRoot` for every file in the library at once,
+    /// so `--priority episode` degrades in silence to first-available. The failure
+    /// is all-or-nothing per library, which is why it is worth a parameter.
+    ///
+    /// Two roots the media root can name, and both are ordinary:
+    ///
+    /// - **The media root holds the library.** `/home/bob/Movies` containing
+    ///   `Series/`, `Anime/` and `Movies/`. Stripping it leaves the real root
+    ///   first, and that is the one taken.
+    /// - **The media root *is* a library root.** `/srv/Anime` containing
+    ///   `Naruto/Season 01/...`. Stripping it leaves nothing library-shaped, so
+    ///   the whole path is searched instead and `Anime` is found where it is.
+    ///
+    /// The path itself decides which, rather than a guess about the root's name,
+    /// and the fallback can only be reached when nothing below the media root is
+    /// library-shaped. It also covers a legacy job whose path was resolved
+    /// against some other root and so does not sit below this one at all.
+    ///
+    /// Whichever branch answers, the **outermost** root component below the cut
+    /// is taken, the same choice `naming::scope_for` makes, so a tree genuinely
+    /// nested into itself is described here the way validation describes it
+    /// rather than a second way.
+    fn library_relative_path(input_path: &Path, media_root: &Path) -> Option<String> {
+        if let Ok(below_media_root) = input_path.strip_prefix(media_root) {
+            let below_media_root = to_forward_slashes(below_media_root);
+
+            if let Some(relative) = Self::below_library_root(&below_media_root) {
+                return Some(relative.to_string());
+            }
+        }
+
+        let whole_path = to_forward_slashes(input_path);
+        Self::below_library_root(&whole_path).map(str::to_string)
+    }
+
+    /// Cut a forward-slash path down to the part at and below the outermost
+    /// library root component, if it holds one.
     fn below_library_root(forward_slash_path: &str) -> Option<&str> {
         let mut offset = 0;
 
@@ -702,7 +744,7 @@ mod tests {
             &media_root,
         );
 
-        let metadata = job.extract_episode_metadata().unwrap();
+        let metadata = job.extract_episode_metadata(&media_root).unwrap();
         assert_eq!(metadata.series_name, "Breaking Bad");
         assert_eq!(metadata.season_number, 1);
         assert_eq!(metadata.episode_number, 3);
@@ -725,7 +767,7 @@ mod tests {
             &media_root,
         );
 
-        let metadata = job.extract_episode_metadata().unwrap();
+        let metadata = job.extract_episode_metadata(&media_root).unwrap();
         assert_eq!(metadata.series_name, "Breaking Bad");
         assert_eq!(metadata.season_number, 1);
         assert_eq!(metadata.episode_number, 1);
@@ -748,7 +790,7 @@ mod tests {
             &media_root,
         );
 
-        let metadata = job.extract_episode_metadata().unwrap();
+        let metadata = job.extract_episode_metadata(&media_root).unwrap();
         assert_eq!(metadata.series_name, "Attack on Titan");
         assert_eq!(metadata.season_number, 1);
         assert_eq!(metadata.episode_number, 5);
@@ -769,7 +811,7 @@ mod tests {
             &media_root,
         );
 
-        let metadata = job.extract_episode_metadata().unwrap();
+        let metadata = job.extract_episode_metadata(&media_root).unwrap();
         assert_eq!(metadata.series_name, "Critical Role");
         assert_eq!(metadata.season_number, 1);
         assert_eq!(metadata.episode_number, 12);
@@ -790,20 +832,29 @@ mod tests {
             &media_root,
         );
 
-        let metadata = job.extract_episode_metadata();
+        let metadata = job.extract_episode_metadata(&media_root);
         assert!(metadata.is_none());
     }
 
     /// Metadata for a library-relative path, as a scan would queue it.
     fn metadata_for(relative_path: PathBuf) -> Option<EpisodeMetadata> {
+        metadata_under(Path::new("/media"), relative_path)
+    }
+
+    /// Metadata for a path queued by a scan of `media_root`.
+    ///
+    /// The two arguments are the two a scan supplies, and keeping them apart is
+    /// the point: `Job::new` joins them into one absolute path, and what the
+    /// prioritiser has to do is take the join back apart.
+    fn metadata_under(media_root: &Path, relative_path: PathBuf) -> Option<EpisodeMetadata> {
         Job::new(
             relative_path,
             MediaFileType::Mkv,
             QualitySettings::default(),
             PostProcessingSettings::default(),
-            Path::new("/media"),
+            media_root,
         )
-        .extract_episode_metadata()
+        .extract_episode_metadata(media_root)
     }
 
     #[test]
@@ -864,6 +915,56 @@ mod tests {
     }
 
     #[test]
+    fn a_media_root_named_after_a_library_root_does_not_hide_the_library() {
+        // `/home/bob/Movies` holding `Series/`, `Anime/` and `Movies/` is an
+        // ordinary layout, and so is an anime-only mount at `/srv/Anime`. The
+        // component that names a root is part of the *media root* here, not of
+        // the library, and a search of the whole absolute path takes it anyway -
+        // which makes every real root below it read as a tree nested into itself
+        // and costs the metadata for the entire library at once.
+        let expected = EpisodeMetadata {
+            series_name: "Elementary".to_string(),
+            season_number: 1,
+            episode_number: 1,
+        };
+
+        let episode = PathBuf::from("Series")
+            .join("Elementary")
+            .join("Season 01")
+            .join("Elementary - S01E01 - Pilot.mkv");
+
+        for media_root in ["/home/bob/Movies", "/srv/Anime", r"D:\Media\Series"] {
+            assert_eq!(
+                metadata_under(Path::new(media_root), episode.clone()),
+                Some(expected.clone()),
+                "a library under a media root at '{media_root}'"
+            );
+        }
+    }
+
+    #[test]
+    fn a_media_root_that_is_itself_a_library_root_still_reads() {
+        // The other thing `/srv/Anime` can mean: the root itself, with series
+        // directories directly inside it. Nothing below the media root is
+        // library-shaped, so the root is found where it actually is.
+        let episode = metadata_under(
+            Path::new("/srv/Anime"),
+            PathBuf::from("Naruto")
+                .join("Season 01")
+                .join("Naruto - S01E01 - Enter Naruto.mkv"),
+        );
+
+        assert_eq!(
+            episode,
+            Some(EpisodeMetadata {
+                series_name: "Naruto".to_string(),
+                season_number: 1,
+                episode_number: 1,
+            })
+        );
+    }
+
+    #[test]
     fn a_three_digit_episode_number_is_read_whole() {
         let long_running = metadata_for(
             PathBuf::from("Anime")
@@ -908,6 +1009,12 @@ mod tests {
             "Anime/Attack on Titan/Season 01/Attack on Titan S01E05 First Battle.mkv",
             "Movies/The Dark Knight (2008)/The Dark Knight (2008).mkv",
             "Random/Path/file.mkv",
+            // Carries an episode marker and is still not a canonical episode.
+            // `naming` refuses both of these today, so both take the `_` arm and
+            // are asserted to have no metadata - see the seam test below for what
+            // that costs.
+            "Series/Elementary/Season 01/Elementary - S01E13.5 - Recap.mkv",
+            "Series/Veronica Mars/Series/Season 01/Veronica Mars - S01E01 - Pilot.mkv",
         ];
 
         for path in paths {
@@ -937,6 +1044,37 @@ mod tests {
         }
     }
 
+    /// A file `naming` will not name is demoted, not ordered.
+    ///
+    /// This is the seam #133 is about, pinned as it currently stands so that
+    /// changing it has to be deliberate. A path carrying a perfectly legible
+    /// `S01E13` still yields no metadata when anything else about it is
+    /// unresolvable, and `claim_prioritized_job` sorts `None` behind `Some`
+    /// rather than filtering it - so the file is still transcoded, just at the
+    /// back of the queue in `read_dir` order, with nothing logged.
+    ///
+    /// Both shapes below are refused on `main` today, so this records existing
+    /// behaviour rather than introducing it. Giving the prioritiser a sort key
+    /// that can fall back where a *destination* may not is #133's decision to
+    /// make, not this test's.
+    #[test]
+    fn a_marker_naming_refuses_is_demoted_rather_than_ordered() {
+        let fractional = "Series/Elementary/Season 01/Elementary - S01E13.5 - Recap.mkv";
+        let nested = "Series/Veronica Mars/Series/Season 01/Veronica Mars - S01E01 - Pilot.mkv";
+
+        for path in [fractional, nested] {
+            assert!(
+                crate::naming::parse(path).is_err(),
+                "'{path}' is meant to be a path naming refuses"
+            );
+            assert_eq!(
+                metadata_for(PathBuf::from(path)),
+                None,
+                "'{path}' carries a marker but is demoted, not ordered"
+            );
+        }
+    }
+
     #[test]
     fn test_episode_metadata_extraction_invalid_format_returns_none() {
         let quality = QualitySettings::default();
@@ -952,7 +1090,7 @@ mod tests {
             &media_root,
         );
 
-        let metadata = job.extract_episode_metadata();
+        let metadata = job.extract_episode_metadata(&media_root);
         assert!(metadata.is_none());
     }
 
