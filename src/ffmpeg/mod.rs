@@ -883,8 +883,27 @@ impl FFmpegProcessor {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        // Move the file from work folder to final location
-        tokio::fs::copy(&work_output_path, &final_output_path).await?;
+        // Copy into the destination directory under a staging name and rename
+        // onto the final path. The copy is what crosses the volume boundary
+        // between the work root and the media root; the rename is what makes
+        // the destination appear all at once. Copying onto the final path
+        // directly would expose it as it grew, and an interrupted copy would
+        // leave a truncated `.mp4` that `output_exists` reads as finished work.
+        let staged_output_path = job.staged_output_path(media_root);
+        if let Err(e) = tokio::fs::copy(&work_output_path, &staged_output_path).await {
+            // Whatever was copied is wreckage. Leaving it would put a stray
+            // file in the library for a job that may never come back.
+            let _ = tokio::fs::remove_file(&staged_output_path).await;
+            return Err(anyhow!(
+                "failed to copy output to {staged_output_path:?}: {e}"
+            ));
+        }
+        if let Err(e) = tokio::fs::rename(&staged_output_path, &final_output_path).await {
+            let _ = tokio::fs::remove_file(&staged_output_path).await;
+            return Err(anyhow!(
+                "failed to rename {staged_output_path:?} onto {final_output_path:?}: {e}"
+            ));
+        }
         tokio::fs::remove_file(&work_output_path).await?;
 
         info!(
@@ -2145,5 +2164,116 @@ mod tests {
 
         let content = tokio::fs::read_to_string(&final_path).await.unwrap();
         assert_eq!(content, "test content");
+
+        // Nothing of the staging name is left beside the finished file.
+        assert!(!job.staged_output_path(None).exists());
+    }
+
+    /// Builds a job whose output lands in `media_folder`, with a finished
+    /// encode already sitting in `work_folder`.
+    fn job_awaiting_its_move(media_folder: &Path, work_folder: &Path, contents: &str) -> Job {
+        let job = Job::new(
+            PathBuf::from("test.mkv"),
+            MediaFileType::Mkv,
+            QualitySettings::default(),
+            PostProcessingSettings {
+                disable_source_files: false,
+            },
+            media_folder,
+        );
+        std::fs::write(job.work_folder_output_path(work_folder), contents).unwrap();
+        job
+    }
+
+    #[tokio::test]
+    async fn a_move_that_fails_partway_leaves_nothing_at_the_destination() {
+        let temp_dir = TempDir::new().unwrap();
+        let work_folder = temp_dir.path().join("work");
+        let media_folder = temp_dir.path().join("media");
+        tokio::fs::create_dir_all(&work_folder).await.unwrap();
+        tokio::fs::create_dir_all(&media_folder).await.unwrap();
+
+        let job = job_awaiting_its_move(&media_folder, &work_folder, "the whole film");
+
+        // A directory in the way of the staging name is a copy that cannot
+        // finish - which is what a full disk or a dropped share amounts to.
+        tokio::fs::create_dir_all(job.staged_output_path(None))
+            .await
+            .unwrap();
+
+        let processor = FFmpegProcessor::new(false);
+        let result = processor
+            .move_to_destination(&job, None, &work_folder)
+            .await;
+
+        assert!(result.is_err(), "the move should report that it failed");
+
+        // The point of the staging name: a failed move puts nothing at the
+        // final path, so the next attempt does not read the debris as work
+        // already done and complete the job on the strength of it.
+        assert!(!job.full_output_path(None).exists());
+        assert!(!job.output_exists(None));
+
+        // And the finished encode is still where it was, not half-consumed.
+        assert_eq!(
+            tokio::fs::read_to_string(job.work_folder_output_path(&work_folder))
+                .await
+                .unwrap(),
+            "the whole film"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_move_overwrites_what_an_interrupted_one_left_staged() {
+        let temp_dir = TempDir::new().unwrap();
+        let work_folder = temp_dir.path().join("work");
+        let media_folder = temp_dir.path().join("media");
+        tokio::fs::create_dir_all(&work_folder).await.unwrap();
+        tokio::fs::create_dir_all(&media_folder).await.unwrap();
+
+        let job = job_awaiting_its_move(&media_folder, &work_folder, "the whole film");
+
+        // What an earlier attempt got through before it was killed.
+        tokio::fs::write(job.staged_output_path(None), "half a fi")
+            .await
+            .unwrap();
+
+        let processor = FFmpegProcessor::new(false);
+        processor
+            .move_to_destination(&job, None, &work_folder)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(job.full_output_path(None))
+                .await
+                .unwrap(),
+            "the whole film"
+        );
+        assert!(!job.staged_output_path(None).exists());
+    }
+
+    #[test]
+    fn a_staged_output_is_not_mistaken_for_a_finished_one() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_folder = temp_dir.path().join("media");
+        std::fs::create_dir_all(&media_folder).unwrap();
+
+        let job = Job::new(
+            PathBuf::from("test.mkv"),
+            MediaFileType::Mkv,
+            QualitySettings::default(),
+            PostProcessingSettings {
+                disable_source_files: false,
+            },
+            &media_folder,
+        );
+
+        let staged = job.staged_output_path(None);
+        assert_ne!(staged, job.full_output_path(None));
+        std::fs::write(&staged, "half a film").unwrap();
+
+        // A worker claiming this job next has to re-encode it, not skip it.
+        assert!(!job.output_exists(None));
     }
 }

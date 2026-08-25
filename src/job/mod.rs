@@ -204,6 +204,23 @@ impl Job {
         }
     }
 
+    /// Where the finished output is staged inside the destination directory
+    /// before it is given its final name.
+    ///
+    /// The move out of the work folder is a copy, because the work root is
+    /// routinely on a different volume from the media root, and a copy is not
+    /// atomic. Copying straight onto the final path would leave a truncated
+    /// `.mp4` behind if it were interrupted, and `output_exists` cannot tell
+    /// that from a finished file - so the job would be recorded as complete
+    /// and the library would keep the wreckage. Copying here and renaming
+    /// within the one directory is atomic, so the destination holds either
+    /// nothing or the whole file.
+    pub fn staged_output_path(&self, media_root: Option<&Path>) -> PathBuf {
+        let mut staged = self.full_output_path(media_root).into_os_string();
+        staged.push(".part");
+        PathBuf::from(staged)
+    }
+
     /// Get the work folder output path (where the file is written during transcoding)
     pub fn work_folder_output_path(&self, work_folder: &Path) -> PathBuf {
         // Create a unique filename for the work folder based on job ID and original filename

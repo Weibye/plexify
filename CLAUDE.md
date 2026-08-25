@@ -98,6 +98,16 @@ encodes to `job.work_folder_output_path(work_folder)` and only then calls
 `move_to_destination`. This keeps a media server from indexing a half-written `.mp4` sitting
 next to the source. Preserve the write-then-move ordering.
 
+**The move lands the output all at once, and that takes two steps.** The work root is
+routinely on a different volume from the media root, so the move is a copy and a copy is not
+atomic. `move_to_destination` copies to `job.staged_output_path`, a `.part` name in the
+*destination* directory, and renames from there onto the final path - a rename within one
+directory, so the destination holds either nothing or the whole file. Copying onto the final
+path directly costs more than a visibly-growing file: `output_exists` is a bare `.exists()`,
+so a copy interrupted partway leaves a truncated `.mp4` that the next attempt reads as work
+already done and completes the job on, and a re-scan skips the file for the same reason. The
+library would keep the corrupt output permanently, with the queue recording a success.
+
 **A job that a worker stops running comes back, and a job that cannot succeed stops coming
 back.** Both are properties of the same three moves, and both are easy to undo by accident:
 
