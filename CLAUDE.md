@@ -142,6 +142,25 @@ Two of those refusals are not questions, and must not become questions:
   `--force` is separate for exactly this reason: deleting a claim mid-encode leaves a worker
   writing an output nothing will reconcile, which is a corruption rather than a cleanup.
 
+**The live-claim refusal runs again, against the disk, immediately before the deletion**, for
+the same reason `src/fix.rs` rechecks every proposal before applying it: the report was read
+before the user was asked, and the gap is however long a person spends reading it, so a worker
+claiming a job inside that window is routine rather than a race. The other counts in the report
+are a floor - whatever arrives in the window is deleted too - and that is accepted, because
+`_queue` is rebuilt by `scan` and the other two are what the user consented to losing. Only the
+live claim is catastrophic, so only the live claim is re-read. The recheck must stay a re-plan
+rather than a second walk of its own: two implementations of "live" that can disagree are not a
+safeguard.
+
+**A job file that will not parse is still a job file that is about to be deleted.** In
+`_failed` that is a parked job somebody needs to see before emptying the directory - a
+documented state once `quarantine_unreadable` puts one there deliberately - and in
+`_in_progress` it is a claim, because liveness comes off the job file's and the heartbeat's
+timestamps and needs no parse. Skipping unreadable jobs is how a live worker's claim walked
+past the refusal: it never became a claim, so there was nothing to refuse. They are reported by
+their own filename, which is the v5 id and so is stable, and nothing is invented for the fields
+that could not be read.
+
 The report and the prompt are `eprintln!` to stderr, not `tracing`. `clean` has no
 machine-readable stdout to protect, the report exists to be read next to the question it is
 asking, and a confirmation prompt that `RUST_LOG` can filter out is a prompt that can go
