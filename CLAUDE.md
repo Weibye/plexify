@@ -148,6 +148,25 @@ fifteen-minute episode crossing two boundaries showed nothing at all. Any test s
 to be comfortable will therefore pass whether or not this is right - `concat_list_entry` is
 the only thing keeping it right.
 
+**The plan divides up the container's duration, and a chunk has to produce video to be
+joinable.** A container's duration is the longest of its streams, so it outlives the last
+video frame by the audio encoder's padding - and `plan_chunks` rounds up, so the final chunk
+can begin after the picture has ended. That chunk encodes happily and comes out carrying
+audio alone. The concat demuxer needs every file in its list to declare the same streams;
+given one that does not, the joined MP4's video track is left running a whole frame interval
+past its own last picture. `encode_chunks` therefore treats a chunk that produced no video as
+the end of the file, which subsumes the case of one that produced nothing at all. What is
+dropped with it is audio past the final frame, which is padding.
+
+**Nothing shifts the output timeline to keep it off zero.** An AAC encoder emits a priming
+frame before the content begins, so the first audio packet carries a negative timestamp, and
+MP4 has an edit list - the field built to say playback starts one frame in. `-avoid_negative_ts
+make_zero` answers the same question by moving *every* stream forward by that frame instead,
+which puts the picture and the subtitles one AAC frame late and leaves a sliver of an event
+where the first subtitle used to be. It does nothing at all on the other two outputs: MPEG-TS
+cannot carry a negative timestamp and FFmpeg shifts it there by default, and the join's input
+is already non-negative. So it belongs on none of the three.
+
 Two things follow from the directory being named after the job id, which is the v5 UUID of
 the input path and so stable forever. A parked job's chunks would be found again by any later
 job for the same file, so the chunk directory records the `QualitySettings` it was filled
