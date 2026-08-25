@@ -21,6 +21,9 @@
 //! # Process jobs from the queue
 //! plexify work /path/to/media
 //!
+//! # Ask the queue what state it is in
+//! plexify status
+//!
 //! # Clean up temporary files
 //! plexify clean /path/to/media
 //!
@@ -41,8 +44,8 @@ use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use plexify::commands::{
-    add::AddCommand, clean::CleanCommand, scan::ScanCommand, validate::ValidateCommand,
-    work::WorkCommand,
+    add::AddCommand, clean::CleanCommand, scan::ScanCommand, status::StatusCommand,
+    validate::ValidateCommand, work::WorkCommand,
 };
 use plexify::JobPriority;
 
@@ -97,6 +100,12 @@ enum Commands {
         /// Job prioritization method
         #[arg(long, default_value = "none", value_enum)]
         priority: JobPriority,
+    },
+    /// Report what is in the queue, and why anything in it is not moving
+    Status {
+        /// Path to the work directory (defaults to current working directory)
+        #[arg(long, short = 'w')]
+        work_dir: Option<PathBuf>,
     },
     /// Remove all temporary files and directories
     Clean {
@@ -176,6 +185,22 @@ async fn main() -> Result<()> {
             WorkCommand::new(path, work_root, background, priority)
                 .execute()
                 .await
+        }
+        Commands::Status { work_dir } => {
+            let work_root = work_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
+            info!("Starting status command for work: {:?}", work_root);
+
+            // No media path is asked for. Nothing this command reports is
+            // resolved against the media root, and requiring a directory that
+            // does not affect the answer would be a wart on the one command
+            // whose whole purpose is to be easy to reach for.
+            match StatusCommand::new(work_root).execute().await {
+                Ok(status) => {
+                    print!("{}", plexify::commands::status::render(&status));
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
         }
         Commands::Clean { path, work_dir } => {
             let work_root = work_dir.unwrap_or_else(|| std::env::current_dir().unwrap());

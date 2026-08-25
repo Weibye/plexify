@@ -1215,3 +1215,89 @@ fn test_undo_rejects_a_file_that_is_not_a_plan() {
         "undo should refuse a file it did not write"
     );
 }
+
+/// `status` answers for a work root nothing has ever scanned into, and does not
+/// create one by being asked.
+///
+/// This is the shape of the `-w` mistake: `scan` ran in one shell and `work` in
+/// another, so the queue the user is asking about is empty because it is not the
+/// queue they made. Erroring here - or quietly initialising the directories and
+/// reporting four zeroes with no explanation - both fail the user at the one
+/// moment the answer is worth anything.
+#[test]
+fn test_status_explains_a_work_root_that_was_never_scanned_into() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let output = Command::new(PLEXIFY_BIN)
+        .args(["status", "--work-dir", temp_dir.path().to_str().unwrap()])
+        .output()
+        .expect("Failed to execute status command");
+
+    assert!(
+        output.status.success(),
+        "status must answer for an uninitialised work root, not fail on it"
+    );
+
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(text.contains("never held a job"), "got: {text}");
+    assert!(text.contains("-w/--work-dir"), "got: {text}");
+
+    assert!(
+        !temp_dir.path().join("_queue").exists(),
+        "asking about a queue must not create one"
+    );
+}
+
+/// `status` counts a real queue and names the work root it counted.
+///
+/// The work root is asserted because `-w` defaults to the current working
+/// directory: a report that does not say which queue it read is unusable for the
+/// one mistake it most needs to catch.
+#[test]
+#[serial]
+fn test_status_reports_a_scanned_queue_without_changing_it() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+
+    fs::write(temp_path.join("one.mkv"), "").unwrap();
+    fs::write(temp_path.join("two.mkv"), "").unwrap();
+
+    let scan = Command::new(PLEXIFY_BIN)
+        .args([
+            "scan",
+            temp_path.to_str().unwrap(),
+            "--work-dir",
+            temp_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute scan command");
+    assert!(scan.status.success());
+
+    let mut before: Vec<_> = fs::read_dir(temp_path.join("_queue"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    before.sort();
+    assert_eq!(before.len(), 2);
+
+    let output = Command::new(PLEXIFY_BIN)
+        .args(["status", "-w", temp_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute status command");
+
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+
+    assert!(text.contains("Queued:      2"), "got: {text}");
+    assert!(text.contains("Work root:"), "got: {text}");
+    assert!(!text.contains("never held a job"), "got: {text}");
+
+    // Read-only is the whole contract. Asking must leave the queue exactly as it
+    // was, or `status` is not safe to point at a work root a worker is using.
+    let mut after: Vec<_> = fs::read_dir(temp_path.join("_queue"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    after.sort();
+    assert_eq!(before, after, "status must not move or rewrite anything");
+}
