@@ -25,6 +25,42 @@ pub const STALE_AFTER: Duration = Duration::from_secs(300);
 /// How often a worker refreshes the heartbeat of the job it is running.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
+/// One of the four directories a job moves between.
+///
+/// Named so that a caller can talk about a queue directory without holding a
+/// path, and so that `clean --only` has something to parse into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, clap::ValueEnum)]
+pub enum QueueDirectory {
+    /// `_queue`: jobs waiting for a worker.
+    Queue,
+    /// `_in_progress`: jobs a worker has claimed.
+    InProgress,
+    /// `_completed`: jobs that finished.
+    Completed,
+    /// `_failed`: jobs parked after `MAX_ATTEMPTS`.
+    Failed,
+}
+
+impl QueueDirectory {
+    /// All four, in the order a job passes through them.
+    pub const ALL: [QueueDirectory; 4] = [
+        QueueDirectory::Queue,
+        QueueDirectory::InProgress,
+        QueueDirectory::Completed,
+        QueueDirectory::Failed,
+    ];
+
+    /// The directory's name on disk.
+    pub fn on_disk_name(self) -> &'static str {
+        match self {
+            QueueDirectory::Queue => "_queue",
+            QueueDirectory::InProgress => "_in_progress",
+            QueueDirectory::Completed => "_completed",
+            QueueDirectory::Failed => "_failed",
+        }
+    }
+}
+
 /// Manages the job queue with atomic operations for distributed processing
 pub struct JobQueue {
     #[allow(dead_code)]
@@ -377,19 +413,32 @@ impl JobQueue {
         }
     }
 
-    /// Clean up all queue directories
-    pub async fn clean(&self) -> Result<()> {
-        if self.queue_dir.exists() {
-            async_fs::remove_dir_all(&self.queue_dir).await?;
+    /// The path of one of the four directories a job moves between.
+    pub fn path_of(&self, directory: QueueDirectory) -> &std::path::Path {
+        match directory {
+            QueueDirectory::Queue => &self.queue_dir,
+            QueueDirectory::InProgress => &self.in_progress_dir,
+            QueueDirectory::Completed => &self.completed_dir,
+            QueueDirectory::Failed => &self.failed_dir,
         }
-        if self.in_progress_dir.exists() {
-            async_fs::remove_dir_all(&self.in_progress_dir).await?;
-        }
-        if self.completed_dir.exists() {
-            async_fs::remove_dir_all(&self.completed_dir).await?;
-        }
-        if self.failed_dir.exists() {
-            async_fs::remove_dir_all(&self.failed_dir).await?;
+    }
+
+    /// Remove the named queue directories, and nothing else.
+    ///
+    /// The queue knows how to carry this out; it does not decide whether it is a
+    /// good idea. *Which* directories, and whether the user has agreed to lose
+    /// what is in them, belongs to [`crate::commands::clean::CleanCommand`],
+    /// because the four are not equally reconstructible and only the caller
+    /// knows which ones were asked for.
+    ///
+    /// A directory that is not there is not an error: a work root nothing has
+    /// scanned into is already in the state this leaves one in.
+    pub async fn clean(&self, directories: &[QueueDirectory]) -> Result<()> {
+        for directory in directories {
+            let path = self.path_of(*directory);
+            if path.exists() {
+                async_fs::remove_dir_all(path).await?;
+            }
         }
         Ok(())
     }
@@ -456,7 +505,7 @@ fn spawn_heartbeat(path: PathBuf) -> tokio::task::JoinHandle<()> {
 ///
 /// It is a separate file rather than a touch of the job file itself so that a
 /// worker killed mid-heartbeat cannot leave a half-written job behind.
-fn heartbeat_path_for(in_progress_path: &std::path::Path) -> PathBuf {
+pub(crate) fn heartbeat_path_for(in_progress_path: &std::path::Path) -> PathBuf {
     let mut name = in_progress_path.as_os_str().to_os_string();
     name.push(".heartbeat");
     PathBuf::from(name)
@@ -468,7 +517,13 @@ fn heartbeat_path_for(in_progress_path: &std::path::Path) -> PathBuf {
 /// that has not yet written its first heartbeat is judged by its own mtime.
 /// A timestamp that cannot be read at all is treated as not stale: refusing to
 /// reclaim is always the safe answer.
-async fn is_stale(
+///
+/// `clean` asks the same question for the opposite reason - a job that is *not*
+/// stale is one a worker is still running, and deleting its claim would leave
+/// that worker encoding into a directory that no longer exists. Both callers
+/// must use this one rule: a `clean` that judged liveness on its own threshold
+/// would refuse jobs the sweep will reclaim, or delete jobs it will not.
+pub(crate) async fn is_stale(
     job_path: &std::path::Path,
     heartbeat_path: &std::path::Path,
     stale_after: Duration,
