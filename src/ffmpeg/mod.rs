@@ -345,8 +345,24 @@ fn concat_list_entry(chunk: &Chunk, chunk_dir: &Path, declared_duration: Option<
 /// to judge: the worst that costs is the failure this list exists to avoid,
 /// where dropping an unrecognised codec would silently discard a text track
 /// that would have converted perfectly well.
-const BITMAP_SUBTITLE_CODECS: [&str; 4] =
-    ["dvb_subtitle", "dvd_subtitle", "hdmv_pgs_subtitle", "xsub"];
+///
+/// `dvb_teletext` is on the list for a different reason from the other four,
+/// and it is the reason enumerating the obviously-bitmap formats misses it:
+/// teletext is not inherently a picture, but the only decoder for it
+/// (`libzvbi_teletextdec`) emits one unless `-txt_format` says otherwise, and
+/// its default is `bitmap`. Nothing here sets that option, so a teletext stream
+/// reaching `-c:s mov_text` fails at encoder open with nothing written, exactly
+/// like a PGS one. Setting `-txt_format text` would keep the track instead, but
+/// it is a private option of a decoder that a default FFmpeg build does not
+/// compile in, and choosing to reconfigure a decoder is a wider decision than
+/// this list makes.
+const BITMAP_SUBTITLE_CODECS: [&str; 5] = [
+    "dvb_subtitle",
+    "dvb_teletext",
+    "dvd_subtitle",
+    "hdmv_pgs_subtitle",
+    "xsub",
+];
 
 /// One subtitle stream, as FFprobe describes it.
 #[derive(Debug, Clone, PartialEq)]
@@ -355,6 +371,15 @@ pub struct SubtitleStream {
     pub codec: String,
     /// The stream's language tag, where it carries one.
     pub language: Option<String>,
+    /// Whether the stream carries the `forced` disposition.
+    ///
+    /// A forced track holds what a scene cannot be understood without: the
+    /// translated signs and the dialogue in another language, rather than a
+    /// full transcript a viewer chose to turn on. Losing one is the difference
+    /// between a file that plays without subtitles and a file whose
+    /// foreign-language scenes are untranslated, so the two are worth telling
+    /// apart even where nothing yet acts on the difference.
+    pub forced: bool,
 }
 
 /// Which of a source's subtitle streams the output can carry.
@@ -415,6 +440,69 @@ pub fn select_subtitle_streams(streams: &[SubtitleStream]) -> SubtitleSelection 
     }
 
     SubtitleSelection::Probed { kept, dropped }
+}
+
+/// One line of the subtitle probe's CSV output.
+///
+/// The shape is `codec,forced` or `codec,forced,language` - FFprobe writes the
+/// disposition flag as `0` or `1` and simply omits the tag where a stream
+/// carries no language.
+///
+/// The language is taken as everything after the second comma rather than as a
+/// third field, and that is the part worth keeping right: FFprobe CSV-quotes a
+/// tag that itself contains a comma (`subrip,0,"en,US"`), so splitting on every
+/// comma would read the tail of that tag as a field of its own. Nothing after
+/// the language needs parsing, so stopping the split at three is enough to make
+/// the codec and the flag immovable no matter what the tag holds.
+fn parse_probed_subtitle_line(line: &str) -> SubtitleStream {
+    let mut fields = line.splitn(3, ',');
+    let codec = fields.next().unwrap_or_default().trim();
+    let forced = fields.next().unwrap_or_default().trim() == "1";
+    let language = fields
+        .next()
+        .map(|language| language.trim().to_string())
+        .filter(|language| !language.is_empty());
+
+    SubtitleStream {
+        codec: codec.to_string(),
+        language,
+        forced,
+    }
+}
+
+/// What a run says about a subtitle stream it could not carry.
+///
+/// A forced stream gets a different message rather than a louder one, because
+/// what was lost is different in kind: a decorative track is a transcript a
+/// viewer would have chosen to turn on, while a forced track is what makes a
+/// foreign-language scene followable at all. The file still transcodes either
+/// way - naming the loss is the whole of what this does - but a person reading
+/// a log needs to be able to pick out the files that now play a scene
+/// untranslated from the ones that merely lost a track nobody asked for.
+fn dropped_stream_warning(stream: &SubtitleStream, input_path: &Path) -> String {
+    let language = stream
+        .language
+        .as_deref()
+        .map(|language| format!(" ({language})"))
+        .unwrap_or_default();
+
+    let cannot_be_converted =
+        "it holds pictures, and MP4 carries subtitles as text, so it cannot be converted. \
+         The source file is not deleted, so the track can still be taken from it.";
+
+    if stream.forced {
+        format!(
+            "⚠️ FORCED SUBTITLES LOST: leaving a forced {}{} subtitle stream out of {:?}: {} \
+             A forced track carries the translated signs and foreign-language dialogue a scene \
+             cannot be followed without, so those scenes will now play untranslated.",
+            stream.codec, language, input_path, cannot_be_converted
+        )
+    } else {
+        format!(
+            "⚠️ Leaving a {}{} subtitle stream out of {:?}: {}",
+            stream.codec, language, input_path, cannot_be_converted
+        )
+    }
 }
 
 /// Where a job's subtitles come from.
@@ -619,15 +707,7 @@ impl FFmpegProcessor {
         let selection = select_subtitle_streams(&streams);
 
         for stream in selection.dropped() {
-            let language = stream
-                .language
-                .as_deref()
-                .map(|language| format!(" ({language})"))
-                .unwrap_or_default();
-            warn!(
-                "⚠️ Leaving a {}{} subtitle stream out of {:?}: it holds pictures, and MP4 carries subtitles as text, so it cannot be converted. The source file is not deleted, so the track can still be taken from it.",
-                stream.codec, language, input_path
-            );
+            warn!("{}", dropped_stream_warning(stream, input_path));
         }
 
         selection
@@ -934,7 +1014,7 @@ impl FFmpegProcessor {
                 "-select_streams",
                 "s",
                 "-show_entries",
-                "stream=codec_name:stream_tags=language",
+                "stream=codec_name:stream_disposition=forced:stream_tags=language",
                 "-of",
                 "csv=p=0",
             ])
@@ -949,23 +1029,12 @@ impl FFmpegProcessor {
             return None;
         }
 
-        // One line per stream, `codec` or `codec,language`; a stream with no
-        // language tag simply has nothing after the codec.
         Some(
             String::from_utf8_lossy(&output.stdout)
                 .lines()
                 .map(str::trim)
                 .filter(|line| !line.is_empty())
-                .map(|line| {
-                    let (codec, language) = match line.split_once(',') {
-                        Some((codec, language)) => (codec, Some(language.trim().to_string())),
-                        None => (line, None),
-                    };
-                    SubtitleStream {
-                        codec: codec.to_string(),
-                        language: language.filter(|language| !language.is_empty()),
-                    }
-                })
+                .map(parse_probed_subtitle_line)
                 .collect(),
         )
     }
@@ -2118,6 +2187,7 @@ mod tests {
         build_overlapping_subtitle_source(&input, 6);
 
         let job = chunking_job(&input);
+        let mut by_path = Vec::new();
 
         for (name, chunking) in [
             (
@@ -2146,7 +2216,20 @@ mod tests {
                     "the {name} encode lost the subtitle event {event:?}: {texts:?}"
                 );
             }
+
+            by_path.push(texts);
         }
+
+        // Naming the three events one by one says each of them arrived, but
+        // `any` is blind to order and to duplication, so on its own it would
+        // let one path reorder or repeat an event the other did not. The
+        // companion test compares the two paths' event *timings*; comparing
+        // the text as a whole sequence is the other half of the same property,
+        // and together they say the two paths produce one subtitle track.
+        assert_eq!(
+            by_path[0], by_path[1],
+            "the two encode paths produced different subtitle text"
+        );
     }
 
     /// Write a short PGS subtitle stream - the bitmap subtitle format a
@@ -2204,7 +2287,12 @@ mod tests {
     }
 
     /// A source carrying a text subtitle track and a bitmap one.
-    fn build_mixed_subtitle_source(input: &Path, seconds: u32) {
+    ///
+    /// `forced_bitmap` puts the `forced` disposition on the bitmap track, which
+    /// is the realistic shape of the case worth telling apart: a Blu-ray rip
+    /// whose PGS track holds only the translated signs and the foreign-language
+    /// dialogue, alongside a full text track a viewer can choose.
+    fn build_mixed_subtitle_source(input: &Path, seconds: u32, forced_bitmap: bool) {
         let text = input.with_extension("srt");
         std::fs::write(
             &text,
@@ -2254,6 +2342,8 @@ mod tests {
                 "copy",
                 "-metadata:s:s:1",
                 "language=eng",
+                "-disposition:s:1",
+                if forced_bitmap { "forced" } else { "0" },
                 "-y",
             ])
             .arg(input)
@@ -2285,7 +2375,7 @@ mod tests {
 
         let temp = TempDir::new().unwrap();
         let input = temp.path().join("film.mkv");
-        build_mixed_subtitle_source(&input, 6);
+        build_mixed_subtitle_source(&input, 6, false);
 
         let job = chunking_job(&input);
 
@@ -2322,7 +2412,14 @@ mod tests {
         }
     }
 
-    /// A source whose only subtitles are bitmaps still transcodes.
+    /// A source whose only subtitles are bitmaps still transcodes, by either
+    /// encode path.
+    ///
+    /// The chunked path is the one worth stating: with every subtitle stream
+    /// dropped, the join still declares the source as input 1 and then maps
+    /// nothing at all from it. An input nobody reads is a shape FFmpeg has to
+    /// tolerate rather than one it is asked for anywhere else here, so the
+    /// join is the half of this that could break on its own.
     #[tokio::test]
     async fn a_source_whose_only_subtitles_are_bitmaps_still_transcodes() {
         if !ffmpeg_present() {
@@ -2371,24 +2468,33 @@ mod tests {
             .unwrap();
         assert!(built.success(), "could not build the test source");
 
-        let work_folder = temp.path().join("work");
-        std::fs::create_dir_all(&work_folder).unwrap();
-
         let job = chunking_job(&input);
-        FFmpegProcessor::new(false)
-            .with_chunking(Chunking {
-                chunk_seconds: 2.0,
-                min_source_seconds: 60.0,
-            })
-            .process_job(&job, None, Some(&work_folder))
-            .await
-            .unwrap();
 
-        assert_eq!(
-            stream_codecs(&job.work_folder_output_path(&work_folder)),
-            vec!["h264", "aac"],
-            "with no subtitle stream left to carry, the picture and sound still go through"
-        );
+        for (name, chunking) in [
+            (
+                "one-pass",
+                Chunking {
+                    chunk_seconds: 2.0,
+                    min_source_seconds: 60.0,
+                },
+            ),
+            ("chunked", TEST_CHUNKING),
+        ] {
+            let work_folder = temp.path().join(name);
+            std::fs::create_dir_all(&work_folder).unwrap();
+
+            FFmpegProcessor::new(false)
+                .with_chunking(chunking)
+                .process_job(&job, None, Some(&work_folder))
+                .await
+                .unwrap_or_else(|error| panic!("the {name} encode failed: {error:#}"));
+
+            assert_eq!(
+                stream_codecs(&job.work_folder_output_path(&work_folder)),
+                vec!["h264", "aac"],
+                "with no subtitle stream left to carry, the {name} encode should still put the picture and sound through"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2399,7 +2505,7 @@ mod tests {
 
         let temp = TempDir::new().unwrap();
         let input = temp.path().join("film.mkv");
-        build_mixed_subtitle_source(&input, 4);
+        build_mixed_subtitle_source(&input, 4, false);
 
         let streams = FFmpegProcessor::new(false)
             .probe_subtitle_streams(&input)
@@ -2412,11 +2518,13 @@ mod tests {
                 SubtitleStream {
                     codec: "subrip".to_string(),
                     language: None,
+                    forced: false,
                 },
                 SubtitleStream {
                     codec: "hdmv_pgs_subtitle".to_string(),
                     // Named in the warning, so it says which track was left.
                     language: Some("eng".to_string()),
+                    forced: false,
                 },
             ]
         );
@@ -2429,6 +2537,159 @@ mod tests {
         );
     }
 
+    /// A dropped bitmap track that a scene actually needs is reported as such.
+    ///
+    /// A forced track holds the translated signs and the foreign-language
+    /// dialogue, so losing one costs something a decorative track does not.
+    /// Nothing about the transcode changes - the track is dropped either way
+    /// and the job still succeeds - but the run has to be able to say which of
+    /// the two happened, because a person reading a log otherwise cannot tell a
+    /// file that now plays a scene untranslated from one that lost a transcript
+    /// nobody asked for.
+    #[tokio::test]
+    async fn a_dropped_bitmap_track_that_is_forced_is_reported_as_forced() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("film.mkv");
+        build_mixed_subtitle_source(&input, 4, true);
+
+        let processor = FFmpegProcessor::new(false);
+        let streams = processor
+            .probe_subtitle_streams(&input)
+            .await
+            .expect("ffprobe should read the source");
+
+        // The disposition comes out of the probe the encode already makes, so
+        // the two kinds of track are distinguishable without a second process.
+        assert_eq!(
+            streams,
+            vec![
+                SubtitleStream {
+                    codec: "subrip".to_string(),
+                    language: None,
+                    forced: false,
+                },
+                SubtitleStream {
+                    codec: "hdmv_pgs_subtitle".to_string(),
+                    language: Some("eng".to_string()),
+                    forced: true,
+                },
+            ]
+        );
+
+        let selection = select_subtitle_streams(&streams);
+
+        // What happens to the track is exactly what happened before: it is
+        // dropped, and the text track is still carried. Only the report differs.
+        assert_eq!(selection.mappings(0), vec!["0:s:0"]);
+        let dropped = selection.dropped();
+        assert_eq!(dropped.len(), 1);
+        assert!(dropped[0].forced);
+
+        let warning = dropped_stream_warning(&dropped[0], &input);
+        assert!(
+            warning.contains("FORCED SUBTITLES LOST"),
+            "a forced track has to be distinguishable at a glance: {warning}"
+        );
+        assert!(
+            warning.contains("play untranslated"),
+            "the warning has to say what it costs, not just that it happened: {warning}"
+        );
+
+        // And the job still succeeds. The detection is a report, not a policy.
+        let work_folder = temp.path().join("work");
+        std::fs::create_dir_all(&work_folder).unwrap();
+        let job = chunking_job(&input);
+        FFmpegProcessor::new(false)
+            .with_chunking(Chunking {
+                chunk_seconds: 2.0,
+                min_source_seconds: 60.0,
+            })
+            .process_job(&job, None, Some(&work_folder))
+            .await
+            .expect("a forced bitmap track is still only a dropped track");
+
+        assert_eq!(
+            stream_codecs(&job.work_folder_output_path(&work_folder)),
+            vec!["h264", "aac", "mov_text"]
+        );
+    }
+
+    #[test]
+    fn the_probe_line_keeps_the_codec_and_the_forced_flag_whatever_the_tag_holds() {
+        let parse = parse_probed_subtitle_line;
+
+        // No language tag: the line stops after the disposition flag.
+        assert_eq!(
+            parse("subrip,0"),
+            SubtitleStream {
+                codec: "subrip".to_string(),
+                language: None,
+                forced: false,
+            }
+        );
+
+        assert_eq!(
+            parse("hdmv_pgs_subtitle,1,eng"),
+            SubtitleStream {
+                codec: "hdmv_pgs_subtitle".to_string(),
+                language: Some("eng".to_string()),
+                forced: true,
+            }
+        );
+
+        // A tag holding a comma is CSV-quoted by FFprobe. The quotes are
+        // cosmetic in a warning, but the split must not treat the tail of the
+        // tag as a field - the codec and the flag stay where they are.
+        let quoted = parse(r#"subrip,1,"en,US""#);
+        assert_eq!(quoted.codec, "subrip");
+        assert!(quoted.forced);
+        assert_eq!(quoted.language.as_deref(), Some(r#""en,US""#));
+    }
+
+    #[test]
+    fn a_decorative_dropped_track_and_a_forced_one_do_not_read_alike() {
+        let path = Path::new("/media/film.mkv");
+
+        let decorative = dropped_stream_warning(
+            &SubtitleStream {
+                codec: "hdmv_pgs_subtitle".to_string(),
+                language: Some("eng".to_string()),
+                forced: false,
+            },
+            path,
+        );
+        let forced = dropped_stream_warning(
+            &SubtitleStream {
+                codec: "hdmv_pgs_subtitle".to_string(),
+                language: Some("eng".to_string()),
+                forced: true,
+            },
+            path,
+        );
+
+        // Both name the codec, the language and the file, because both are a
+        // track that went missing from a specific file.
+        for warning in [&decorative, &forced] {
+            assert!(warning.contains("hdmv_pgs_subtitle"), "{warning}");
+            assert!(warning.contains("(eng)"), "{warning}");
+            assert!(warning.contains("film.mkv"), "{warning}");
+            assert!(
+                warning.contains("The source file is not deleted"),
+                "the way back to the track is the same in both cases: {warning}"
+            );
+        }
+
+        // Only the forced one is escalated, and it says what was lost rather
+        // than only that something was.
+        assert!(!decorative.contains("FORCED"), "{decorative}");
+        assert!(forced.contains("FORCED SUBTITLES LOST"), "{forced}");
+        assert!(forced.contains("play untranslated"), "{forced}");
+    }
+
     #[test]
     fn only_the_subtitle_codecs_that_cannot_be_converted_are_left_out() {
         let streams = |codecs: &[&str]| {
@@ -2437,12 +2698,18 @@ mod tests {
                 .map(|codec| SubtitleStream {
                     codec: codec.to_string(),
                     language: None,
+                    forced: false,
                 })
                 .collect::<Vec<_>>()
         };
 
         // Every bitmap format goes, and the text around it stays - identified
         // by position, because that is what FFmpeg's `0:s:n` counts.
+        //
+        // `dvb_teletext` is in here because it is the one entry whose output
+        // format is a decoder option rather than a codec property: the only
+        // decoder for it emits a bitmap unless `-txt_format` says otherwise,
+        // and nothing here sets that option.
         let mixed = streams(&[
             "hdmv_pgs_subtitle",
             "subrip",
@@ -2451,17 +2718,39 @@ mod tests {
             "dvb_subtitle",
             "xsub",
             "mov_text",
+            "dvb_teletext",
+            "webvtt",
         ]);
         let selection = select_subtitle_streams(&mixed);
-        assert_eq!(selection.mappings(0), vec!["0:s:1", "0:s:3", "0:s:6"]);
+        assert_eq!(
+            selection.mappings(0),
+            vec!["0:s:1", "0:s:3", "0:s:6", "0:s:8"]
+        );
         assert_eq!(
             selection
                 .dropped()
                 .iter()
                 .map(|stream| stream.codec.as_str())
                 .collect::<Vec<_>>(),
-            vec!["hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "xsub"]
+            vec![
+                "hdmv_pgs_subtitle",
+                "dvd_subtitle",
+                "dvb_subtitle",
+                "xsub",
+                "dvb_teletext"
+            ]
         );
+
+        // The formats that decode to text stay on, and they are the reason the
+        // list cannot simply be "anything a broadcast carries": `arib_caption`
+        // and `eia_608` come off the same kind of capture as teletext and both
+        // convert perfectly well.
+        let broadcast = streams(&["arib_caption", "eia_608"]);
+        assert_eq!(
+            select_subtitle_streams(&broadcast).mappings(0),
+            vec!["0:s:0", "0:s:1"]
+        );
+        assert!(select_subtitle_streams(&broadcast).dropped().is_empty());
 
         // A codec nobody here has heard of is carried, not discarded. Being
         // wrong that way costs a job that fails and can be run again; being
