@@ -126,13 +126,17 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
+    // Logs are diagnostics and go to stderr; stdout carries only what a command
+    // deliberately prints, so a report can be piped or redirected on its own.
+    // `fmt::layer()` defaults to stdout, so the writer has to be said out loud -
+    // without it `RUST_LOG`, a documented variable, corrupts the output stream
+    // it is turned up to investigate.
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "plexify=info".into()),
         )
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
 
     let cli = Cli::parse();
@@ -248,7 +252,13 @@ async fn main() -> Result<()> {
     };
 
     if let Err(e) = result {
-        error!("Command failed: {}", e);
+        // `{:#}` prints the whole context chain on one line. The `{}` form shows
+        // only the outermost layer, which threw away every `.with_context(...)`
+        // in the project at the one point a user reads: `fix` and `undo` attach
+        // the source and destination of a move to the operating system's reason,
+        // and only the summary arrived. Code below may therefore say what it was
+        // doing with `.context(...)` and leave the cause attached.
+        error!("Command failed: {:#}", e);
         std::process::exit(1);
     }
 

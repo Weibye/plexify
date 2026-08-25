@@ -248,6 +248,15 @@ Recognised variables: `FFMPEG_PRESET`, `FFMPEG_CRF`, `FFMPEG_AUDIO_BITRATE`, `SL
 **Async is tokio throughout**; errors are `anyhow::Result<T>`; logging is `tracing`, initialised
 in `main.rs` with the `plexify=info` default filter.
 
+**The two streams carry different things, and `main.rs` is where that is decided.** Logs are
+diagnostics and go to **stderr**; **stdout** carries only what a command deliberately prints,
+so a report survives being piped. `fmt::layer()` defaults to stdout, so the writer is stated
+explicitly and must stay stated - dropping it puts every log line back in with the report, and
+`RUST_LOG` then corrupts the output it was turned up to investigate. The exit point prints a
+failure with `{:#}`, which renders an `anyhow` context chain in full; a command may therefore
+attach `.context(...)` and trust that the cause underneath still reaches the user, which the
+`{}` form silently discarded.
+
 ## Conventions
 
 - Every command is a struct in `src/commands/` with `new(...)` and an `async execute()`, wired
