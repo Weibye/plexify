@@ -399,13 +399,10 @@ impl CleanCommand {
             ));
         }
 
-        if let Some(worker_log) = &plan.worker_log {
+        if plan.worker_log.is_some() {
             out.push_str(&format!(
                 "  {:<14} {:>4} {:<5} - {}\n",
-                WORKER_LOG,
-                1,
-                "file",
-                worker_log.display()
+                WORKER_LOG, 1, "file", "the log `work` writes beside the media root",
             ));
         }
 

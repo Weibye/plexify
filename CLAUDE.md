@@ -120,7 +120,32 @@ back.** Both are properties of the same three moves, and both are easy to undo b
   The count lives in the job file rather than the name, because the name is the v5 id and is
   what makes the queue addressable. `job_exists` consults `_failed/`, so re-scanning cannot
   walk a parked job back into the queue; moving the file out by hand is what asks for a retry,
-  and `clean` empties it along with everything else.
+  and `clean` empties it along with everything else - after saying so.
+
+**`clean` still empties all four directories, and that is why it has to ask first.** The four
+are not equally reconstructible: `_queue/` is rebuilt by re-running `scan`, but `_completed/`
+is the only record that a file was transcoded, `_failed/` holds every parked job's attempt
+count and error *and* is what keeps `job_exists` from re-queueing it, and `_in_progress/`
+holds live claims. Narrowing the default set would silently change what the command has always
+meant, so instead `src/commands/clean.rs` reports what is in each directory, itemising the two
+whose contents nothing can rebuild, and removes nothing until the user says yes. `--only`
+narrows a run, `--dry-run` prints the report and stops, `--yes` answers in advance.
+
+Two of those refusals are not questions, and must not become questions:
+
+- **A run with nobody to answer refuses rather than blocks.** `Confirmation::is_interactive`
+  is checked before the prompt, so `plexify clean` in a script or a CI job exits with the
+  reason instead of waiting on a `read_line` that will never return.
+- **A live claim takes more than a `yes`.** A claim whose worker is still checking in - judged
+  by `queue::is_stale` and `STALE_AFTER`, the same rule the sweep uses, so the two can never
+  disagree about which claims are held - is refused outright, and `--yes` does not cover it.
+  `--force` is separate for exactly this reason: deleting a claim mid-encode leaves a worker
+  writing an output nothing will reconcile, which is a corruption rather than a cleanup.
+
+The report and the prompt are `eprintln!` to stderr, not `tracing`. `clean` has no
+machine-readable stdout to protect, the report exists to be read next to the question it is
+asking, and a confirmation prompt that `RUST_LOG` can filter out is a prompt that can go
+missing.
 
 Whatever an interrupted encode left in the work folder is left alone by the sweep. Deciding
 what of it is still usable belongs to the encoder, not the queue. What must *not* be left
