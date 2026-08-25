@@ -7,7 +7,7 @@ use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::ffmpeg::FFmpegProcessor;
-use crate::queue::JobQueue;
+use crate::queue::{FailureDisposition, JobQueue, STALE_AFTER};
 use crate::JobPriority;
 
 /// Command to process jobs from the queue
@@ -57,6 +57,23 @@ impl WorkCommand {
 
         let queue = JobQueue::new(self.media_root.clone(), self.work_root.clone());
         queue.init().await?;
+
+        // A worker that was interrupted left its job sitting in _in_progress,
+        // where nothing looks for it. Bring back anything that has gone quiet
+        // long enough to be certain no worker is still on it.
+        let swept = queue.reclaim_stranded_jobs(STALE_AFTER).await?;
+        if !swept.reclaimed.is_empty() {
+            info!(
+                "♻️ Returned {} abandoned job(s) to the queue.",
+                swept.reclaimed.len()
+            );
+        }
+        if !swept.parked.is_empty() {
+            error!(
+                "🚫 Moved {} job(s) to _failed after they repeatedly took their worker down.",
+                swept.parked.len()
+            );
+        }
 
         let processor = FFmpegProcessor::new(self.background_mode);
 
@@ -185,7 +202,9 @@ impl WorkCommand {
                     {
                         error!("Failed to move file from work folder: {}", e);
                         job_pb.finish_and_clear();
-                        claimed_job.return_to_queue().await?;
+                        claimed_job
+                            .fail(&format!("failed to move output: {e}"))
+                            .await?;
                         return Ok(true);
                     }
 
@@ -204,10 +223,21 @@ impl WorkCommand {
                 Err(e) => {
                     job_pb.finish_with_message(format!("❌ Failed: {}", job_name));
                     error!("❌ Conversion FAILED: {}", e);
-                    claimed_job.return_to_queue().await?;
 
-                    // Sleep a bit to avoid rapid retries of problematic jobs
-                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    match claimed_job.fail(&e.to_string()).await? {
+                        FailureDisposition::Parked { attempts } => {
+                            error!(
+                                "🚫 {job_name} failed {attempts} times and was moved to _failed; \
+                                 fix the cause and move the job file back to _queue to retry it."
+                            );
+                        }
+                        FailureDisposition::Requeued { attempts } => {
+                            warn!("Job {job_name} will be retried (attempt {attempts} failed).");
+
+                            // Sleep a bit to avoid rapid retries of problematic jobs
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                        }
+                    }
                 }
             }
 

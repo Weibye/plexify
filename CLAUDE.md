@@ -49,6 +49,7 @@ a JSON file, and the queue is three directories that jobs move between:
 
 ```
 {work_root}/_queue/{uuid}.job  →  _in_progress/  →  _completed/
+                                              ↘  _failed/
 ```
 
 **A job is named after the file it transcodes.** The `{uuid}` is a v5 UUID derived from the
@@ -90,6 +91,36 @@ before the stream mappings and every `-map` was thrown away.
 encodes to `job.work_folder_output_path(work_folder)` and only then calls
 `move_to_destination`. This keeps a media server from indexing a half-written `.mp4` sitting
 next to the source. Preserve the write-then-move ordering.
+
+**A job that a worker stops running comes back, and a job that cannot succeed stops coming
+back.** Both are properties of the same three moves, and both are easy to undo by accident:
+
+- **A claim protects the job, and `ClaimedJob` is the claim.** `try_claim_job_file` writes a
+  `{uuid}.job.heartbeat` before it returns, and the returned `ClaimedJob` owns the task that
+  refreshes it every `HEARTBEAT_INTERVAL` and aborts it on drop. Both halves have to stay in
+  the queue rather than in a caller. Claiming is a rename and rename keeps the mtime, so a job
+  that waited out a backlog is *already* older than `STALE_AFTER` when it is claimed; if the
+  first heartbeat were the caller's job, the gap before it landed would be a window in which
+  two workers could hold one file. The heartbeat is a *separate* file because touching the job
+  file itself risks a half-written job.
+- **`JobQueue::reclaim_stranded_jobs` runs at worker startup** and renames back to `_queue/`
+  any job quiet for `STALE_AFTER`. Nothing else ever looks in `_in_progress/`, so this is the
+  only thing that recovers a job from a worker that was killed. It must stay a rename, or two
+  workers can both take one job.
+- **Every way a job can stop counts as an attempt.** `ClaimedJob::fail` counts one, and so
+  does the sweep - a job that takes its worker down (an OOM on a large encode, a panic) never
+  reaches `fail`, and without counting there it would cycle forever at the cost of a worker
+  each time round. Past `MAX_ATTEMPTS` both paths rename into `_failed/` instead of `_queue/`.
+  The count lives in the job file rather than the name, because the name is the v5 id and is
+  what makes the queue addressable. `job_exists` consults `_failed/`, so re-scanning cannot
+  walk a parked job back into the queue; moving the file out by hand is what asks for a retry,
+  and `clean` empties it along with everything else.
+
+Whatever an interrupted encode left in the work folder is left alone by the sweep. Deciding
+what of it is still usable belongs to the encoder, not the queue. What must *not* be left
+behind is a live process: `kill_on_drop(true)` on the FFmpeg command is what stops a
+cancelled encode from running on and writing the same work-folder path as the worker that
+later reclaims the job.
 
 ### 2. Library validation (`validate`)
 

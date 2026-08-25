@@ -226,6 +226,14 @@ impl FFmpegProcessor {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
+        // Tokio leaves a child running when the future holding it is dropped.
+        // Ctrl-C cancels this future mid-encode, and the job it belonged to is
+        // swept back to the queue a few minutes later - so without this, the
+        // worker that picks the job up starts a second FFmpeg writing the same
+        // work-folder path as the first one, which is still going. What an
+        // interrupted encode leaves behind has to be bytes, not a live process.
+        cmd.kill_on_drop(true);
+
         debug!("Executing FFmpeg command: {:?}", cmd);
 
         // Execute FFmpeg
