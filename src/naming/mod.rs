@@ -525,8 +525,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reports_a_directory_named_after_an_episode_instead_of_growing_the_name() {
+        assert_eq!(
+            assess(Path::new("Series/S01E01/Season 01/S01E01 - x.mkv")),
+            Assessment::Unresolvable(Unresolvable::NoSeriesName),
+            "neither the file nor its directory names the series, and a marker is not a name"
+        );
+    }
+
     /// The property the whole module rests on: whatever we propose must itself
     /// be canonical, or `--fix` would move a file twice.
+    ///
+    /// The corpus below is a list of tidy paths, all of which name their series
+    /// in the filename. That is the shape the property is *least* likely to fail
+    /// on, so [`no_path_is_renamed_twice`] widens it to paths whose series name
+    /// has to come from somewhere else.
     #[test]
     fn every_proposed_destination_is_itself_canonical() {
         let messy = [
@@ -556,6 +570,74 @@ mod tests {
                 "proposed destination is not canonical: {path} -> {destination}"
             );
         }
+    }
+
+    /// The same property over a generated corpus rather than a hand-written one.
+    ///
+    /// Every combination of a series directory, a season directory and a
+    /// filename below is assessed, and a proposal for any of them has to be
+    /// canonical in its own right. Refusing a path is an acceptable answer here
+    /// and a rename to a path that would be renamed again is not, which is what
+    /// separates a heuristic that gives up from one that grows a filename.
+    #[test]
+    fn no_path_is_renamed_twice() {
+        let series_directories = [
+            "Elementary",
+            "Elementary (2012)",
+            "Breaking Bad (2008) {tvdb-81189}",
+            "Super Best Friends Play - FFX",
+            "S.W.A.T",
+            "S01E01",
+            "Veronica Mars S02E04",
+            "Show.S01",
+        ];
+        let season_directories = [
+            "",
+            "Season 1/",
+            "Season 01/",
+            "Season 01 - The Arc/",
+            "Season 00/",
+            "Specials/",
+            "Season 3/Extras/",
+        ];
+        let filenames = [
+            "S01E01.mkv",
+            "S01E01 - Pilot.mkv",
+            "Elementary - S01E01 - Pilot.mkv",
+            "Elementary.S01E01.Pilot.1080p.BluRay.x264.mkv",
+            "s01e01 - pilot.mkv",
+            "Elementary - S01E01 (1080p60).webm",
+            "S00E01 - [1080p][HorribleSubs].mkv",
+        ];
+
+        let mut proposals = 0;
+        for series_directory in series_directories {
+            for season_directory in season_directories {
+                for filename in filenames {
+                    let path = format!("Series/{series_directory}/{season_directory}{filename}");
+
+                    let destination = match assess(Path::new(&path)) {
+                        Assessment::Rename { destination } => destination,
+                        // Canonical is the property holding trivially, and a
+                        // refusal puts the path in front of a person, which is
+                        // the honest answer when nothing names the series.
+                        Assessment::Canonical | Assessment::Unresolvable(_) => continue,
+                    };
+                    proposals += 1;
+
+                    assert_eq!(
+                        assess(Path::new(&destination)),
+                        Assessment::Canonical,
+                        "a second run would move this again: {path} -> {destination}"
+                    );
+                }
+            }
+        }
+
+        assert!(
+            proposals > 0,
+            "the corpus proposed nothing, so it proved nothing"
+        );
     }
 
     #[test]
