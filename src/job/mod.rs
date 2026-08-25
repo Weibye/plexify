@@ -1,9 +1,9 @@
 use anyhow::{anyhow, Result};
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+use crate::naming::{self, LibraryRoot, MediaName};
 use crate::paths::to_forward_slashes;
 
 /// Represents a media file that needs to be transcoded
@@ -229,50 +229,44 @@ impl Job {
         })
     }
 
-    /// Extract episode metadata from the job's input path for prioritization
+    /// Extract episode metadata from the job's input path for prioritization.
+    ///
+    /// What counts as a season directory or an episode marker is asked of
+    /// `naming`, which owns that question for the whole project. One description
+    /// serves both callers, so an unpadded `Season 6`, a `Specials` directory and
+    /// a three-digit episode number order here exactly as they render there.
+    ///
+    /// The path is absolute and carries native separators, so it is normalised
+    /// and cut down to the library-relative form `naming::parse` reads.
     pub fn extract_episode_metadata(&self) -> Option<EpisodeMetadata> {
-        let path_str = self.input_path.to_str()?;
+        let path = to_forward_slashes(&self.input_path);
 
-        // Try to match different episode patterns
-        if let Some(metadata) = Self::try_parse_series_pattern(path_str, "Series") {
-            return Some(metadata);
+        match naming::parse(Self::below_library_root(&path)?) {
+            Ok(MediaName::Episode(episode)) => Some(EpisodeMetadata {
+                series_name: episode.series,
+                season_number: episode.season,
+                episode_number: episode.number,
+            }),
+            _ => None,
         }
-        if let Some(metadata) = Self::try_parse_series_pattern(path_str, "Anime") {
-            return Some(metadata);
+    }
+
+    /// Cut a forward-slash path down to the part at and below the library root.
+    ///
+    /// The **outermost** root component is taken, the same choice
+    /// `naming::scope_for` makes, so a tree nested into itself is described here
+    /// the way validation describes it rather than a second way.
+    fn below_library_root(forward_slash_path: &str) -> Option<&str> {
+        let mut offset = 0;
+
+        for component in forward_slash_path.split('/') {
+            if LibraryRoot::from_component(component).is_some() {
+                return Some(&forward_slash_path[offset..]);
+            }
+            offset += component.len() + 1;
         }
 
         None
-    }
-
-    /// Try to parse series pattern from path string
-    fn try_parse_series_pattern(path_str: &str, content_prefix: &str) -> Option<EpisodeMetadata> {
-        // Pattern to match series episodes with different formats
-        // Matches: /path/Series/Show Name/Season XX/... SxxExx ...
-        // Matches: /path/Series/Show Name {tvdb-123}/Season XX/... SxxExx ...
-        // Matches: /path/Series/Show Name/Season XX - Extra/... SxxExx ...
-        let pattern = format!(
-            r"{}/([^/]+?)(?:\s*\{{tvdb-\d+\}})?/Season\s+(\d{{2}})(?:\s*-[^/]*)?/.*?[Ss](\d{{2}})[Ee](\d{{2}})",
-            regex::escape(content_prefix)
-        );
-
-        let re = Regex::new(&pattern).ok()?;
-        let captures = re.captures(path_str)?;
-
-        let series_name = captures.get(1)?.as_str().trim().to_string();
-        let season_number: u32 = captures.get(2)?.as_str().parse().ok()?;
-        let episode_season: u32 = captures.get(3)?.as_str().parse().ok()?;
-        let episode_number: u32 = captures.get(4)?.as_str().parse().ok()?;
-
-        // Validate that season numbers match
-        if season_number != episode_season {
-            return None;
-        }
-
-        Some(EpisodeMetadata {
-            series_name,
-            season_number,
-            episode_number,
-        })
     }
 }
 
@@ -732,7 +726,7 @@ mod tests {
         );
 
         let metadata = job.extract_episode_metadata().unwrap();
-        assert_eq!(metadata.series_name, "Breaking Bad (2008)");
+        assert_eq!(metadata.series_name, "Breaking Bad");
         assert_eq!(metadata.season_number, 1);
         assert_eq!(metadata.episode_number, 1);
     }
@@ -776,7 +770,7 @@ mod tests {
         );
 
         let metadata = job.extract_episode_metadata().unwrap();
-        assert_eq!(metadata.series_name, "Critical Role (2015)");
+        assert_eq!(metadata.series_name, "Critical Role");
         assert_eq!(metadata.season_number, 1);
         assert_eq!(metadata.episode_number, 12);
     }
@@ -798,6 +792,149 @@ mod tests {
 
         let metadata = job.extract_episode_metadata();
         assert!(metadata.is_none());
+    }
+
+    /// Metadata for a library-relative path, as a scan would queue it.
+    fn metadata_for(relative_path: PathBuf) -> Option<EpisodeMetadata> {
+        Job::new(
+            relative_path,
+            MediaFileType::Mkv,
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            Path::new("/media"),
+        )
+        .extract_episode_metadata()
+    }
+
+    #[test]
+    fn episode_metadata_reads_a_path_with_native_separators() {
+        let expected = EpisodeMetadata {
+            series_name: "Elementary".to_string(),
+            season_number: 6,
+            episode_number: 8,
+        };
+
+        // Built component-wise, which is what a scan hands over: `WalkDir` and
+        // `strip_prefix` yield the platform's own separator throughout, and a
+        // path written as a `/` literal is a shape the scanner never produces.
+        let joined = PathBuf::from("Series")
+            .join("Elementary")
+            .join("Season 06")
+            .join("Elementary - S06E08 - Sand Trap.mkv");
+        assert_eq!(metadata_for(joined), Some(expected.clone()));
+
+        // Spelled out as well, so the normalisation is asserted on every
+        // platform rather than only on the one that produces backslashes.
+        let backslashes =
+            PathBuf::from(r"Series\Elementary\Season 06\Elementary - S06E08 - Sand Trap.mkv");
+        assert_eq!(metadata_for(backslashes), Some(expected));
+    }
+
+    #[test]
+    fn episode_metadata_covers_the_season_directories_a_library_holds() {
+        let unpadded = metadata_for(
+            PathBuf::from("Series")
+                .join("Elementary")
+                .join("Season 6")
+                .join("Elementary - S06E08 - Sand Trap.mkv"),
+        );
+        assert_eq!(
+            unpadded,
+            Some(EpisodeMetadata {
+                series_name: "Elementary".to_string(),
+                season_number: 6,
+                episode_number: 8,
+            })
+        );
+
+        let specials = metadata_for(
+            PathBuf::from("Series")
+                .join("Firefly")
+                .join("Specials")
+                .join("Firefly - S00E01 - Here's How It Was.mkv"),
+        );
+        assert_eq!(
+            specials,
+            Some(EpisodeMetadata {
+                series_name: "Firefly".to_string(),
+                season_number: 0,
+                episode_number: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn a_three_digit_episode_number_is_read_whole() {
+        let long_running = metadata_for(
+            PathBuf::from("Anime")
+                .join("One Piece")
+                .join("Season 01")
+                .join("One Piece - S01E108 - Dashing Onto The Scene.mkv"),
+        );
+        assert_eq!(long_running.unwrap().episode_number, 108);
+    }
+
+    #[test]
+    fn a_three_digit_episode_sorts_after_the_two_digit_ones() {
+        let episode = |number: &str| {
+            metadata_for(
+                PathBuf::from("Anime")
+                    .join("One Piece")
+                    .join("Season 01")
+                    .join(format!("One Piece - S01E{number} - Episode.mkv")),
+            )
+            .unwrap()
+        };
+
+        assert!(episode("09") < episode("11"));
+        assert!(episode("107") < episode("108"));
+        assert!(episode("11") < episode("107"));
+    }
+
+    #[test]
+    fn every_episode_naming_parses_yields_prioritization_metadata() {
+        // Both answer the same question about the same file, so a path one of
+        // them calls an episode cannot be a path the other passes over.
+        let paths = [
+            "Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap.mkv",
+            "Series/Elementary/Season 6/Elementary - S06E08 - Sand Trap.mkv",
+            "Series/Firefly/Specials/Firefly - S00E01 - Here's How It Was.mkv",
+            "Series/Breaking Bad (2008) {tvdb-296861}/Season 01/Breaking Bad S01E01 Pilot.mkv",
+            "Series/Critical Role/Season 01 - Vox Machina/Critical Role S01E12 Kraghammer.mkv",
+            "Series/The Wire/Season 02/the.wire.s02e05.1080p.mkv",
+            "Series/Charmed/Charmed - S06E12 - Prince Charmed.mkv",
+            "Series/Elementary/Season 01/Elementary - S01E02 - Extras/S01E02 clip.mkv",
+            "Anime/One Piece/Season 01/One Piece - S01E108 - Dashing Onto The Scene.mkv",
+            "Anime/Attack on Titan/Season 01/Attack on Titan S01E05 First Battle.mkv",
+            "Movies/The Dark Knight (2008)/The Dark Knight (2008).mkv",
+            "Random/Path/file.mkv",
+        ];
+
+        for path in paths {
+            let parsed = crate::naming::parse(path);
+            let metadata = metadata_for(PathBuf::from(path));
+
+            match parsed {
+                Ok(MediaName::Episode(episode)) => {
+                    let metadata = metadata.unwrap_or_else(|| {
+                        panic!("'{path}' parses as an episode but has no metadata")
+                    });
+                    assert_eq!(
+                        metadata.season_number, episode.season,
+                        "season for '{path}'"
+                    );
+                    assert_eq!(
+                        metadata.episode_number, episode.number,
+                        "episode for '{path}'"
+                    );
+                    assert_eq!(metadata.series_name, episode.series, "series for '{path}'");
+                }
+                _ => assert!(
+                    metadata.is_none(),
+                    "'{path}' is not an episode but yielded {metadata:?}"
+                ),
+            }
+        }
     }
 
     #[test]

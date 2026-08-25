@@ -618,6 +618,15 @@ mod tests {
     use tempfile::TempDir;
     use tokio::test;
 
+    /// A library-relative episode path, assembled the way a scan assembles one.
+    ///
+    /// Component-wise rather than as a `/` literal, so the separators are the
+    /// platform's own - which is what `WalkDir` and `strip_prefix` hand to
+    /// `Job::new`, and the only shape that exercises a path a worker really sees.
+    fn episode_path(root: &str, series: &str, season: &str, file: &str) -> PathBuf {
+        PathBuf::from(root).join(series).join(season).join(file)
+    }
+
     /// Build a queue with one job already claimed, ready to be aged.
     ///
     /// Dropping the claim is what an interrupted worker does: the job file
@@ -1040,14 +1049,24 @@ mod tests {
         let jobs = vec![
             // Breaking Bad Season 1 (older series)
             Job::new(
-                PathBuf::from("Series/Breaking Bad/Season 01/Breaking Bad S01E03 Gray Matter.mkv"),
+                episode_path(
+                    "Series",
+                    "Breaking Bad",
+                    "Season 01",
+                    "Breaking Bad S01E03 Gray Matter.mkv",
+                ),
                 MediaFileType::Mkv,
                 quality.clone(),
                 post_processing.clone(),
                 media_root,
             ),
             Job::new(
-                PathBuf::from("Series/Breaking Bad/Season 01/Breaking Bad S01E01 Pilot.mkv"),
+                episode_path(
+                    "Series",
+                    "Breaking Bad",
+                    "Season 01",
+                    "Breaking Bad S01E01 Pilot.mkv",
+                ),
                 MediaFileType::Mkv,
                 quality.clone(),
                 post_processing.clone(),
@@ -1055,14 +1074,24 @@ mod tests {
             ),
             // Better Call Saul Season 1 (newer series)
             Job::new(
-                PathBuf::from("Series/Better Call Saul/Season 01/Better Call Saul S01E02 Mijo.mkv"),
+                episode_path(
+                    "Series",
+                    "Better Call Saul",
+                    "Season 01",
+                    "Better Call Saul S01E02 Mijo.mkv",
+                ),
                 MediaFileType::Mkv,
                 quality.clone(),
                 post_processing.clone(),
                 media_root,
             ),
             Job::new(
-                PathBuf::from("Series/Better Call Saul/Season 01/Better Call Saul S01E01 Uno.mkv"),
+                episode_path(
+                    "Series",
+                    "Better Call Saul",
+                    "Season 01",
+                    "Better Call Saul S01E01 Uno.mkv",
+                ),
                 MediaFileType::Mkv,
                 quality.clone(),
                 post_processing.clone(),
@@ -1070,7 +1099,9 @@ mod tests {
             ),
             // Non-episode job (movie)
             Job::new(
-                PathBuf::from("Movies/The Matrix (1999)/The Matrix (1999).mkv"),
+                PathBuf::from("Movies")
+                    .join("The Matrix (1999)")
+                    .join("The Matrix (1999).mkv"),
                 MediaFileType::Mkv,
                 quality.clone(),
                 post_processing.clone(),
@@ -1121,14 +1152,24 @@ mod tests {
         // Create a few jobs
         let jobs = vec![
             Job::new(
-                PathBuf::from("Series/Breaking Bad/Season 01/Breaking Bad S01E03 Gray Matter.mkv"),
+                episode_path(
+                    "Series",
+                    "Breaking Bad",
+                    "Season 01",
+                    "Breaking Bad S01E03 Gray Matter.mkv",
+                ),
                 MediaFileType::Mkv,
                 quality.clone(),
                 post_processing.clone(),
                 media_root,
             ),
             Job::new(
-                PathBuf::from("Series/Breaking Bad/Season 01/Breaking Bad S01E01 Pilot.mkv"),
+                episode_path(
+                    "Series",
+                    "Breaking Bad",
+                    "Season 01",
+                    "Breaking Bad S01E01 Pilot.mkv",
+                ),
                 MediaFileType::Mkv,
                 quality.clone(),
                 post_processing.clone(),
