@@ -73,13 +73,21 @@ impl Scope {
 /// Work out which library a path belongs to, and how much of it to walk.
 ///
 /// The library root is the parent of the **outermost** component named after a
-/// root. Outermost rather than nearest matters for a tree that was nested into
-/// itself: pointing into `Series/Veronica Mars/Series/...` finds the outer
-/// `Series`, so the duplication is still reported rather than being read as a
-/// library in its own right.
+/// root *that is actually one*. Outermost rather than nearest matters for a tree
+/// that was nested into itself: pointing into `Series/Veronica Mars/Series/...`
+/// finds the outer `Series`, so the duplication is still reported rather than
+/// being read as a library in its own right.
 ///
-/// A path containing no library root at all is taken to be the library root, so
-/// a whole-library run works exactly as before.
+/// The qualification is the whole difficulty, because a name alone cannot settle
+/// it. `/srv/Anime` may *hold* `Series/`, `Anime/` and `Movies/`, or it may
+/// itself *be* the Anime root with series directories directly inside; both are
+/// ordinary, and reading the first as the second refuses the entire library at
+/// once, since every file below then looks like a tree nested into itself. Only
+/// the directory decides, so [`holds_library_roots`] asks it: a candidate that
+/// has roots beneath it is the media root, and the search moves further in.
+/// Where nothing is left, the whole path is the library root - which is also
+/// what happens for a path that names no root at all, so a whole-library run
+/// works exactly as before.
 ///
 /// Give this an absolute path. A relative one that *starts* at a root - plain
 /// `Series/Elementary` - has nothing before that component to be the library
@@ -88,10 +96,18 @@ impl Scope {
 pub fn scope_for(path: &Path) -> Scope {
     let components: Vec<Component> = path.components().collect();
 
-    let root_position = components.iter().position(|component| match component {
-        Component::Normal(name) => LibraryRoot::from_component(&name.to_string_lossy()).is_some(),
-        _ => false,
-    });
+    let root_position = components
+        .iter()
+        .enumerate()
+        .find_map(|(position, component)| match component {
+            Component::Normal(name)
+                if LibraryRoot::from_component(&name.to_string_lossy()).is_some() =>
+            {
+                let candidate: PathBuf = components[..=position].iter().collect();
+                (!holds_library_roots(&candidate)).then_some(position)
+            }
+            _ => None,
+        });
 
     match root_position {
         Some(position) => {
@@ -111,6 +127,25 @@ pub fn scope_for(path: &Path) -> Scope {
             scan_path: path.to_path_buf(),
         },
     }
+}
+
+/// Whether a directory has library roots directly beneath it, and so is the
+/// media root rather than a root itself.
+///
+/// This is the one place the naming module looks at a disk, and it looks at
+/// exactly one directory. A path that cannot be read - it does not exist, or the
+/// caller cannot list it - yields no evidence, and no evidence leaves the name
+/// standing: the candidate is taken to be a real root, which is what a library
+/// root normally is.
+fn holds_library_roots(directory: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return false;
+    };
+
+    entries.flatten().any(|entry| {
+        LibraryRoot::from_component(&entry.file_name().to_string_lossy()).is_some()
+            && entry.path().is_dir()
+    })
 }
 
 /// The top-level directories a library is organised into.
@@ -234,8 +269,19 @@ pub enum MediaName {
 /// could work harder at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unresolvable {
-    /// A library root name appears again below the root.
-    DuplicatedRoot { root: LibraryRoot },
+    /// A library root sits below another one - the same name twice, or one root
+    /// nested inside a different one.
+    ///
+    /// Both names are carried because the reason has to be true of the path it
+    /// is printed against: `Movies/Series/...` duplicates a root without
+    /// repeating a name, and reporting only the inner one sends the reader
+    /// looking for a nesting that is not there.
+    DuplicatedRoot {
+        /// The root the path starts at.
+        outer: LibraryRoot,
+        /// The root found below it.
+        inner: LibraryRoot,
+    },
     /// The path does not start at a known library root.
     OutsideLibrary,
     /// An episode file with no recognisable season/episode marker.
@@ -258,9 +304,14 @@ impl Unresolvable {
     /// A one-line explanation, for the validation report.
     pub fn reason(&self) -> String {
         match self {
-            Unresolvable::DuplicatedRoot { root } => format!(
+            Unresolvable::DuplicatedRoot { outer, inner } if outer == inner => format!(
                 "'{}' appears twice in this path; the correct location is ambiguous",
-                root.as_str()
+                outer.as_str()
+            ),
+            Unresolvable::DuplicatedRoot { outer, inner } => format!(
+                "'{}' sits inside the '{}' root; the correct location is ambiguous",
+                inner.as_str(),
+                outer.as_str()
             ),
             Unresolvable::OutsideLibrary => format!(
                 "not under a known library root ({})",
@@ -328,6 +379,22 @@ pub fn assess(relative_path: &Path) -> Assessment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    /// A media root that happens to be *called* after a library root, holding
+    /// the three real roots beneath it. An ordinary layout for someone whose
+    /// media partition is named `Movies`.
+    fn media_root_named(name: &str) -> (TempDir, PathBuf) {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path().join("home").join("bob").join(name);
+
+        for root in LibraryRoot::all() {
+            fs::create_dir_all(media_root.join(root.as_str())).unwrap();
+        }
+
+        (temp_dir, media_root)
+    }
 
     /// The acceptance cases from issue #51, asserted end to end.
     ///
@@ -455,8 +522,30 @@ mod tests {
                 "Series/Veronica Mars/Series/Veronica Mars S02E04/Season 01/Veronica Mars S02E04.mp4"
             )),
             Assessment::Unresolvable(Unresolvable::DuplicatedRoot {
-                root: LibraryRoot::Series
+                outer: LibraryRoot::Series,
+                inner: LibraryRoot::Series
             })
+        );
+    }
+
+    /// Issue #137: the reason has to be true of the path it is printed against.
+    /// A `Series` directory inside a `Movies` root is a duplicated root, but
+    /// neither name appears twice, so saying so sends the reader hunting for a
+    /// nesting that is not there.
+    #[test]
+    fn a_root_inside_a_different_root_names_both_in_its_reason() {
+        let assessment = assess(Path::new(
+            "Movies/Series/Elementary/Season 01/Elementary - S01E01 - Pilot.mkv",
+        ));
+
+        let Assessment::Unresolvable(unresolvable) = assessment else {
+            panic!("a root inside another root has no unambiguous destination");
+        };
+
+        let reason = unresolvable.reason();
+        assert!(
+            reason.contains("Series") && reason.contains("Movies"),
+            "the reason names one root and claims it appears twice: {reason}"
         );
     }
 
@@ -603,6 +692,87 @@ mod tests {
         assert_eq!(
             scope.library_root,
             PathBuf::from("/media/library"),
+            "the inner Series is the duplication we report, not a library of its own"
+        );
+    }
+
+    /// Issue #137: a media root named after a library root made `validate`
+    /// refuse every file in the library at once.
+    #[test]
+    fn a_media_root_named_after_a_library_root_is_still_the_library_root() {
+        for name in ["Movies", "Anime", "Series"] {
+            let (_temp_dir, media_root) = media_root_named(name);
+
+            let scope = scope_for(&media_root);
+
+            assert_eq!(
+                scope.library_root, media_root,
+                "a {name} directory holding the three roots is the media root, not one of them"
+            );
+            assert!(scope.is_whole_library());
+        }
+    }
+
+    #[test]
+    fn scoping_inside_a_media_root_named_after_a_library_root_measures_from_it() {
+        let (_temp_dir, media_root) = media_root_named("Movies");
+        let series = media_root.join("Series").join("Elementary");
+        fs::create_dir_all(&series).unwrap();
+
+        let scope = scope_for(&series);
+
+        assert_eq!(
+            scope.library_root, media_root,
+            "the outer Movies is the media root; the real root is the Series below it"
+        );
+        assert_eq!(scope.scan_path, series);
+    }
+
+    /// The other reading of the same name, which must keep working: `/srv/Anime`
+    /// holding series directories directly *is* the Anime root.
+    #[test]
+    fn a_root_directory_holding_series_directly_is_a_root() {
+        let temp_dir = TempDir::new().unwrap();
+        let anime = temp_dir.path().join("srv").join("Anime");
+        fs::create_dir_all(anime.join("Cowboy Bebop").join("Season 01")).unwrap();
+
+        let scope = scope_for(&anime);
+
+        assert_eq!(scope.library_root, temp_dir.path().join("srv"));
+        assert_eq!(scope.scan_path, anime);
+    }
+
+    /// A resolved Windows path carries a `Prefix` component and, canonicalised,
+    /// the verbatim `\\?\C:\…` form. Neither may throw the root search off.
+    #[test]
+    fn a_windows_shaped_media_root_named_after_a_library_root_is_the_library_root() {
+        let (_temp_dir, media_root) = media_root_named("Movies");
+        let resolved = fs::canonicalize(&media_root).unwrap();
+
+        let scope = scope_for(&resolved);
+
+        assert_eq!(scope.library_root, resolved);
+        assert!(scope.is_whole_library());
+    }
+
+    /// The tree that really is nested into itself, this time on disk, so the
+    /// evidence below the path is real rather than absent.
+    #[test]
+    fn a_tree_nested_into_itself_on_disk_resolves_to_the_outer_root() {
+        let temp_dir = TempDir::new().unwrap();
+        let nested = temp_dir
+            .path()
+            .join("Series")
+            .join("Veronica Mars")
+            .join("Series")
+            .join("Season 01");
+        fs::create_dir_all(&nested).unwrap();
+
+        let scope = scope_for(&nested);
+
+        assert_eq!(
+            scope.library_root,
+            temp_dir.path(),
             "the inner Series is the duplication we report, not a library of its own"
         );
     }

@@ -192,7 +192,18 @@ Consequences to preserve when changing it:
 the path a user gave into a `library_root` (the parent of the outermost `Series`/`Anime`/
 `Movies` component) and a `scan_path` (what to walk). Validation walks the scan path and
 judges every file against the root, because a path starting `Season 06/` names no series and
-would be unresolvable. Two consequences that are easy to break:
+would be unresolvable.
+
+**A component's name does not establish that it is a library root, and the directory has to
+be asked.** `/srv/Anime` can equally be a media root that *holds* `Series/`, `Anime/`,
+`Movies/`, or the Anime root itself with series directories directly inside it. Taking the
+name at face value reads the first as the second, and then every file below looks like a tree
+nested into itself and the whole library becomes unresolvable at once - `validate --fix`
+inert on all of it. `scope_for` therefore lists each candidate directory and skips it when it
+has roots beneath it (`holds_library_roots`), falling through to the whole path when no
+candidate survives. This is the only place `naming` touches a disk, and an unreadable
+directory yields no evidence, so the name stands. Two further consequences that are easy to
+break:
 
 - `fix` resolves destinations from `library_root`, never `scan_path`. A destination routinely
   falls outside the scanned subtree — correcting `Season 6` to `Season 06` moves a file into

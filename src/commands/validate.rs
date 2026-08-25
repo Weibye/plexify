@@ -911,6 +911,38 @@ mod tests {
         assert_eq!(report.needing_decision().count(), 1);
     }
 
+    /// Issue #137, end to end: a canonical library whose media root is named
+    /// after a library root was refused in its entirety, leaving `--fix` inert.
+    #[tokio::test]
+    async fn a_media_root_named_after_a_library_root_does_not_refuse_the_library() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path().join("home").join("bob").join("Movies");
+
+        let season = media_root.join("Series/Elementary/Season 01");
+        fs::create_dir_all(&season).unwrap();
+        fs::write(season.join("Elementary - S01E01 - Pilot.mkv"), "").unwrap();
+
+        let film = media_root.join("Movies/Batman Begins (2005)");
+        fs::create_dir_all(&film).unwrap();
+        fs::write(film.join("Batman Begins (2005).mkv"), "").unwrap();
+
+        fs::create_dir_all(media_root.join("Anime")).unwrap();
+
+        let report = ValidateCommand::new(media_root.clone())
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(report.library_root, media_root);
+        assert_eq!(report.scanned_files, 2);
+        assert_eq!(
+            report.needing_decision().count(),
+            0,
+            "both files are canonical; nothing here needs a person"
+        );
+        assert_eq!(report.renames().count(), 0);
+    }
+
     #[tokio::test]
     async fn reported_issues_are_ordered_by_path() {
         let temp_dir = TempDir::new().unwrap();
