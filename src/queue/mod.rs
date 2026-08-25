@@ -393,23 +393,6 @@ impl JobQueue {
         }
         Ok(())
     }
-
-    /// Get count of pending jobs
-    #[allow(dead_code)]
-    pub async fn pending_count(&self) -> Result<usize> {
-        let mut count = 0;
-        let mut entries = async_fs::read_dir(&self.queue_dir).await?;
-
-        while let Some(entry) = entries.next_entry().await? {
-            if let Some(extension) = entry.path().extension() {
-                if extension == "job" {
-                    count += 1;
-                }
-            }
-        }
-
-        Ok(count)
-    }
 }
 
 /// The last `limit` characters of a message, marked as truncated if anything
