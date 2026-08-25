@@ -442,6 +442,7 @@ mod tests {
         ValidationReport {
             scanned_files: issues.len(),
             issues,
+            notes: Vec::new(),
             library_root: root.to_path_buf(),
             scan_path: root.to_path_buf(),
             validation_time: Duration::from_secs(0),
@@ -817,6 +818,7 @@ mod tests {
                 "Series/Elementary/Season 6/Elementary - S06E08 Sand Trap.mkv",
                 "Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap.mkv",
             )],
+            notes: Vec::new(),
             library_root: root.to_path_buf(),
             scan_path: root.join("Series/Elementary/Season 6"),
             validation_time: Duration::from_secs(0),

@@ -10,7 +10,9 @@ use walkdir::WalkDir;
 
 use crate::fix::FixOutcome;
 use crate::ignore::IgnoreFilter;
-use crate::naming::{assess, scope_for, Assessment, LibraryRoot, Scope};
+use crate::naming::{
+    assess, scope_for, series_directory_disagreement, Assessment, LibraryRoot, Scope,
+};
 use crate::paths::to_forward_slashes;
 
 /// Media file extensions that should be validated
@@ -36,11 +38,44 @@ pub enum IssueKind {
     NeedsDecision { reason: String },
 }
 
+/// Something worth knowing about a file that is not a verdict on it.
+///
+/// A note proposes nothing and nothing acts on one. It exists because the
+/// report is read by a person who can see what the tool cannot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ValidationNote {
+    /// The file as it exists, relative to the media root, with `/` separators.
+    pub path: String,
+    pub kind: NoteKind,
+}
+
+/// What a note has to say.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum NoteKind {
+    /// The series directory holding this file names a different series than
+    /// the file does. Neither name is assumed correct, so nothing is proposed.
+    SeriesDirectoryDisagrees { directory: String, series: String },
+}
+
+impl NoteKind {
+    /// A one-line explanation, for the validation report.
+    pub fn explain(&self) -> String {
+        match self {
+            NoteKind::SeriesDirectoryDisagrees { directory, series } => format!(
+                "the directory says '{directory}' and the file says '{series}'; nothing is proposed, because the path does not say which is right"
+            ),
+        }
+    }
+}
+
 /// Validation report containing all issues found
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidationReport {
     pub scanned_files: usize,
     pub issues: Vec<ValidationIssue>,
+    /// Observations that are not proposals. Nothing in `fix` reads these.
+    #[serde(default)]
+    pub notes: Vec<ValidationNote>,
     /// The directory every path in `issues` is relative to.
     pub library_root: PathBuf,
     /// The subtree that was actually walked. Differs from the root when a run
@@ -248,7 +283,7 @@ impl ValidateCommand {
         let pb = Arc::new(validate_pb);
 
         // Process files in parallel using rayon
-        let mut issues: Vec<ValidationIssue> = media_files
+        let assessed: Vec<(Option<ValidationIssue>, Option<ValidationNote>)> = media_files
             .par_iter()
             .filter_map(|path| {
                 let relative_path = match path.strip_prefix(library_root.as_ref()) {
@@ -256,15 +291,26 @@ impl ValidateCommand {
                     Err(_) => return None,
                 };
 
-                let result = self.assess_file(relative_path);
+                let result = (
+                    self.assess_file(relative_path),
+                    self.note_for(relative_path),
+                );
                 pb.inc(1);
-                result
+                Some(result)
             })
             .collect();
+
+        let mut issues: Vec<ValidationIssue> = Vec::new();
+        let mut notes: Vec<ValidationNote> = Vec::new();
+        for (issue, note) in assessed {
+            issues.extend(issue);
+            notes.extend(note);
+        }
 
         // Rayon returns work in whatever order it finished; a report is read
         // top to bottom, so order it the way the library is laid out.
         issues.sort_by(|left, right| left.path.cmp(&right.path));
+        notes.sort_by(|left, right| left.path.cmp(&right.path));
 
         pb.finish_and_clear();
 
@@ -273,6 +319,7 @@ impl ValidateCommand {
         let report = ValidationReport {
             scanned_files: media_files.len(),
             issues,
+            notes,
             library_root: self.scope.library_root.clone(),
             scan_path: self.scope.scan_path.clone(),
             validation_time,
@@ -305,6 +352,23 @@ impl ValidateCommand {
                 },
             }),
         }
+    }
+
+    /// Note anything about a file that is worth reading but is not a verdict.
+    ///
+    /// Deliberately separate from `assess_file`: a file can be canonical and
+    /// still carry a note, and a file can need a rename *and* carry one, so a
+    /// note is never one of the outcomes an assessment chooses between.
+    fn note_for(&self, relative_path: &std::path::Path) -> Option<ValidationNote> {
+        let disagreement = series_directory_disagreement(relative_path)?;
+
+        Some(ValidationNote {
+            path: to_forward_slashes(relative_path),
+            kind: NoteKind::SeriesDirectoryDisagrees {
+                directory: disagreement.directory,
+                series: disagreement.series,
+            },
+        })
     }
 
     /// Print what a fix run did to stdout
@@ -423,6 +487,9 @@ impl ValidateCommand {
         let _ = writeln!(out, "📁 Files scanned: {}", report.scanned_files);
         let _ = writeln!(out, "✏️  Renames proposed: {}", renames.len());
         let _ = writeln!(out, "🤔 Needing a decision: {}", decisions.len());
+        if !report.notes.is_empty() {
+            let _ = writeln!(out, "📝 Noted, nothing proposed: {}", report.notes.len());
+        }
         let _ = writeln!(
             out,
             "⏱️  Validation time: {:.2}s",
@@ -431,7 +498,11 @@ impl ValidateCommand {
 
         if report.issues.is_empty() {
             let _ = writeln!(out, "\n✅ Every file is already in canonical form.");
-            return out;
+
+            // A note is not an issue, so it survives a library that has none.
+            if report.notes.is_empty() {
+                return out;
+            }
         }
 
         if !renames.is_empty() {
@@ -454,6 +525,19 @@ impl ValidateCommand {
                     let _ = writeln!(out, "  {reason}");
                 }
             }
+        }
+
+        if !report.notes.is_empty() {
+            let _ = writeln!(out, "\n📝 Noted, and nothing proposed:");
+            let _ = writeln!(out, "───────────────────────────────");
+            for note in &report.notes {
+                let _ = writeln!(out, "\n  {}", note.path);
+                let _ = writeln!(out, "  {}", note.kind.explain());
+            }
+        }
+
+        if report.issues.is_empty() {
+            return out;
         }
 
         let _ = writeln!(out, "\n💡 Canonical form:");
@@ -830,6 +914,7 @@ mod tests {
                     },
                 },
             ],
+            notes: Vec::new(),
             library_root: root.clone(),
             scan_path: root,
             validation_time: Duration::from_secs(0),
@@ -859,6 +944,7 @@ mod tests {
         let report = ValidationReport {
             scanned_files: 12,
             issues: Vec::new(),
+            notes: Vec::new(),
             library_root: root.clone(),
             scan_path: root,
             validation_time: Duration::from_secs(0),
@@ -867,6 +953,104 @@ mod tests {
         assert!(command
             .render_report(&report)
             .contains("Every file is already in canonical form."));
+    }
+
+    /// The filename is what `naming` parses and what Plex reads, so a series
+    /// directory naming something else is worth saying. It is only ever said:
+    /// renaming the directory would move every file in it, and nothing in the
+    /// path says which of the two names is right.
+    #[tokio::test]
+    async fn notes_a_series_directory_that_disagrees_without_proposing_anything() {
+        let temp = TempDir::new().unwrap();
+        let media_root = temp.path();
+
+        let season = media_root.join("Series/Super Best Friends Play - FFX/Season 01");
+        fs::create_dir_all(&season).unwrap();
+        fs::write(
+            season.join("Super Best Friends Play - Final Fantasy X - S01E13.webm"),
+            "",
+        )
+        .unwrap();
+
+        let report = ValidateCommand::new(media_root.to_path_buf())
+            .execute()
+            .await
+            .unwrap();
+
+        assert!(
+            report.issues.is_empty(),
+            "the file is already canonical and must not be touched: {:?}",
+            report.issues
+        );
+        assert_eq!(
+            report.notes,
+            vec![ValidationNote {
+                path: "Series/Super Best Friends Play - FFX/Season 01/Super Best Friends Play - Final Fantasy X - S01E13.webm".to_string(),
+                kind: NoteKind::SeriesDirectoryDisagrees {
+                    directory: "Super Best Friends Play - FFX".to_string(),
+                    series: "Super Best Friends Play - Final Fantasy X".to_string(),
+                },
+            }]
+        );
+
+        let rendered = ValidateCommand::new(media_root.to_path_buf()).render_report(&report);
+        assert!(
+            rendered.contains("Noted, and nothing proposed"),
+            "a library with nothing to rename must still show its notes: {rendered}"
+        );
+        assert!(rendered.contains("'Super Best Friends Play - FFX'"));
+        assert!(
+            !rendered.contains("Re-run with --fix"),
+            "a note is not something --fix carries out: {rendered}"
+        );
+    }
+
+    /// A note is an observation, not a proposal, so nothing in `fix` reads it.
+    #[tokio::test]
+    async fn a_note_never_becomes_a_rename() {
+        let temp = TempDir::new().unwrap();
+        let media_root = temp.path();
+
+        let season = media_root.join("Series/FFX/Season 01");
+        fs::create_dir_all(&season).unwrap();
+        fs::write(season.join("Final Fantasy X - S01E13 - Zanarkand.webm"), "").unwrap();
+
+        let report = ValidateCommand::new(media_root.to_path_buf())
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(report.notes.len(), 1);
+
+        let plan = crate::fix::plan(&report);
+
+        assert!(
+            plan.moves.is_empty() && plan.refusals.is_empty(),
+            "a disagreeing directory is reported, never acted on: {plan:?}"
+        );
+        assert!(season
+            .join("Final Fantasy X - S01E13 - Zanarkand.webm")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn says_nothing_about_a_directory_the_files_agree_with() {
+        let temp = TempDir::new().unwrap();
+        let media_root = temp.path();
+
+        let season = media_root.join("Series/Breaking Bad (2008) {tvdb-81189}/Season 01");
+        fs::create_dir_all(&season).unwrap();
+        fs::write(season.join("Breaking Bad - S01E01 - Pilot.mkv"), "").unwrap();
+
+        let report = ValidateCommand::new(media_root.to_path_buf())
+            .execute()
+            .await
+            .unwrap();
+
+        assert!(
+            report.notes.is_empty(),
+            "an annotation on the directory is not a different name: {:?}",
+            report.notes
+        );
     }
 
     #[tokio::test]
