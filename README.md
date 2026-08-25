@@ -531,7 +531,7 @@ directory. See [The work directory](#the-work-directory) for how to choose it.
 ```
 /path/to/work/           # --work-dir, defaults to the current working directory
 ├── _queue/              # Pending jobs
-├── _in_progress/        # Currently processing
+├── _in_progress/        # Currently processing, plus each job's part-encoded chunks
 ├── _completed/          # Finished jobs
 └── _failed/             # Jobs that failed too many times to keep retrying
 
@@ -552,6 +552,10 @@ A worker that is interrupted — Ctrl-C, a kill, a machine losing power — leav
 the next worker to start can tell an abandoned job from one that is still being encoded, and
 moves the abandoned ones back to `_queue/`. That sweep runs at startup, and a job has to have
 been quiet for five minutes before it is taken back.
+
+Anything the interrupted encode finished is kept. A source longer than fifteen minutes is
+encoded in five-minute chunks, and the worker that picks the job up carries on from the last
+completed chunk rather than starting the file again.
 
 ### When a job cannot succeed
 
@@ -596,6 +600,65 @@ ffmpeg -fflags +genpts -avoid_negative_ts make_zero -fix_sub_duration \
   -c:s mov_text \
   -y output.mp4
 ```
+
+### For long sources
+
+A source longer than fifteen minutes is encoded a chunk at a time, so that an interrupted
+worker leaves something the next one can carry on from. Each chunk is encoded from a seek
+into the source and written as a transport stream, which is the container built to be
+joined; the chunks are then concatenated into the MP4 without being re-encoded, and the
+subtitles are added in that same pass so that no subtitle is cut at a chunk boundary.
+
+```bash
+# once per chunk, into {work}/_in_progress/{job-id}.chunks/
+ffmpeg -hide_banner -y -fflags +genpts -ss 300 -i input.mkv \
+  -avoid_negative_ts make_zero -t 300 \
+  -map 0:v -map 0:a \
+  -c:v libx264 -preset veryfast -crf 23 \
+  -c:a aac -b:a 128k \
+  -muxdelay 0 -muxpreload 0 -f mpegts 00001.ts
+
+# chunks.txt pins each chunk to the length it was cut to, so the joined
+# timeline matches the source rather than drifting a few ms per boundary:
+#   file '/work/.../00000.ts'
+#   duration 300.000
+
+# then, once, to join them
+ffmpeg -hide_banner -y -avoid_negative_ts make_zero \
+  -f concat -safe 0 -i chunks.txt \
+  -fix_sub_duration -i input.mkv \
+  -map 0:v -map 0:a -map 1:s? \
+  -c:v copy -c:a copy -c:s mov_text output.mp4
+```
+
+Note where `-fix_sub_duration` sits: it describes the source the subtitles are read from,
+not the list of chunks, so a long source converts its subtitles exactly as a short one
+does.
+
+And note the `duration` lines in the list. A chunk never ends exactly where it was asked
+to - `-t` cuts video on a frame boundary and audio on a 1024-sample AAC frame boundary, so
+each one runs a few milliseconds long. Left to itself the demuxer would start each chunk
+where the last actually ended, and because that error is per boundary it accumulates: a
+three-hour film crosses thirty-five of them. Declaring the length each chunk was cut to
+pins it to the position it came from.
+
+The chunk directory is removed once the join succeeds, and also if the job is given up on
+and parked in `_failed/`. It records the quality settings its chunks were encoded with, and
+chunks made with different settings are discarded rather than mixed into one output.
+
+While the join runs, the work directory holds both the full set of chunks and the assembled
+MP4, so **peak usage is roughly twice the size of the output**. Size the work directory for
+that, not for one copy.
+
+### Background workers
+
+`--background` runs FFmpeg at the lowest priority the platform offers: `nice -n 19` on Linux
+and macOS, and `IDLE_PRIORITY_CLASS` on Windows.
+
+These are not quite equivalent. A `nice -n 19` process still gets scheduled under Linux's
+CFS, while an idle-priority process on Windows can be starved almost completely by ordinary
+desktop activity - which is what you want on a dedicated worker, and may be more than you
+want on a machine you are also using.
 
 ## Distributed Processing
 

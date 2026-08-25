@@ -87,6 +87,12 @@ joins them in FFmpeg's order at `build` time, so a caller cannot break the comma
 chaining in a different order — which is exactly what happened when `with_output` was called
 before the stream mappings and every `-map` was thrown away.
 
+Input options are the exception to "order does not matter", and deliberately: they attach
+to the **next input declared**, so `.with_subtitle_duration_fix().with_input(source)` puts
+the flag on that input alone. Holding them in one bucket ahead of every input, as an earlier
+version did, silently put every option on input 0 — which is how the chunked join came to
+read its subtitles without `-fix_sub_duration` while the one-pass encode used it.
+
 **Transcoded output is written to the work folder, then moved.** `FFmpegProcessor::process_job`
 encodes to `job.work_folder_output_path(work_folder)` and only then calls
 `move_to_destination`. This keeps a media server from indexing a half-written `.mp4` sitting
@@ -121,6 +127,41 @@ what of it is still usable belongs to the encoder, not the queue. What must *not
 behind is a live process: `kill_on_drop(true)` on the FFmpeg command is what stops a
 cancelled encode from running on and writing the same work-folder path as the worker that
 later reclaims the job.
+
+**A long encode is resumable, and that is what the chunk directory in `_in_progress/` is.**
+A source over `MIN_CHUNKED_SECONDS` is encoded in `CHUNK_SECONDS` pieces into
+`{job-id}.chunks/`, each written as `{n}.ts.part` and renamed to `{n}.ts` only after FFmpeg
+exits successfully. A chunk file existing is therefore the whole record of progress —
+`encode_chunks` skips what is already there — so nothing may create one by any other route.
+The pieces are transport streams because that is the container built to be concatenated;
+separately encoded MP4s each carry their own encoder delay and the audio walks further out of
+sync at every join. Subtitles are held out of the chunks and muxed in during the join, from
+the source, so that no subtitle event is cut in half at a boundary. `reclaim_stranded_jobs`
+leaves the chunk directory alone for exactly this reason.
+
+**The concat list declares each chunk's length, and that is load-bearing.** A chunk never
+ends exactly where `-t` asked it to, because video cuts on a frame boundary and audio on a
+1024-sample AAC frame boundary. Without a `duration` line the demuxer starts each chunk
+where the previous one actually ended, and since the error is *per boundary* it compounds:
+measured on a three-hour source, the picture ended 350ms behind where it belonged, while a
+fifteen-minute episode crossing two boundaries showed nothing at all. Any test short enough
+to be comfortable will therefore pass whether or not this is right - `concat_list_entry` is
+the only thing keeping it right.
+
+Two things follow from the directory being named after the job id, which is the v5 UUID of
+the input path and so stable forever. A parked job's chunks would be found again by any later
+job for the same file, so the chunk directory records the `QualitySettings` it was filled
+with and `prepare_chunk_dir` discards anything that does not match — half an output at one
+CRF and half at another, with nothing recording it, is worse than redoing the work. And
+because `job_exists` consults `_failed/`, nothing will ever come back for a parked job at
+all, so `discard_work` removes its chunks when it is parked rather than leaving them to
+occupy the size of the finished output indefinitely.
+
+**De-prioritising a background worker has no portable spelling.** `nice` is a POSIX utility
+and is not on a Windows PATH, so wrapping the command in it there does not lower FFmpeg's
+priority — it fails to spawn, and the job fails on every retry. `FFmpegProcessor::ffmpeg_command`
+keeps the two behind `cfg`: `nice -n 19` off Windows, `IDLE_PRIORITY_CLASS` as a creation flag
+on it. Both worker nodes matter; do not collapse this back to one branch.
 
 ### 2. Library validation (`validate`)
 

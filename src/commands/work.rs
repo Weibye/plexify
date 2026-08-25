@@ -58,6 +58,8 @@ impl WorkCommand {
         let queue = JobQueue::new(self.media_root.clone(), self.work_root.clone());
         queue.init().await?;
 
+        let processor = FFmpegProcessor::new(self.background_mode);
+
         // A worker that was interrupted left its job sitting in _in_progress,
         // where nothing looks for it. Bring back anything that has gone quiet
         // long enough to be certain no worker is still on it.
@@ -73,9 +75,16 @@ impl WorkCommand {
                 "🚫 Moved {} job(s) to _failed after they repeatedly took their worker down.",
                 swept.parked.len()
             );
-        }
 
-        let processor = FFmpegProcessor::new(self.background_mode);
+            // Nothing will come back for a parked job, so whatever it left
+            // half-encoded has nothing pointing at it any more.
+            for job_name in &swept.parked {
+                let job_id = job_name.trim_end_matches(".job");
+                processor
+                    .discard_work_for_id(job_id, &queue.in_progress_dir)
+                    .await;
+            }
+        }
 
         // Set up signal handling for graceful shutdown
         tokio::pin! {
@@ -224,12 +233,20 @@ impl WorkCommand {
                     job_pb.finish_with_message(format!("❌ Failed: {}", job_name));
                     error!("❌ Conversion FAILED: {}", e);
 
+                    // `fail` consumes the claim, and `job` is borrowed from it.
+                    let job = job.clone();
+
                     match claimed_job.fail(&e.to_string()).await? {
                         FailureDisposition::Parked { attempts } => {
                             error!(
                                 "🚫 {job_name} failed {attempts} times and was moved to _failed; \
                                  fix the cause and move the job file back to _queue to retry it."
                             );
+
+                            // Nothing will come back for a parked job, so the
+                            // part-encoded chunks it left have nothing pointing
+                            // at them - and they are the size of the output.
+                            processor.discard_work(&job, work_folder).await;
                         }
                         FailureDisposition::Requeued { attempts } => {
                             warn!("Job {job_name} will be retried (attempt {attempts} failed).");
