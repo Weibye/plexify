@@ -943,6 +943,101 @@ mod tests {
         assert_eq!(report.renames().count(), 0);
     }
 
+    /// A film directory named `Series` inside a real `Movies` root, with the run
+    /// narrowed to that root.
+    ///
+    /// Nothing here may be proposed for renaming. A `library_root` one level too
+    /// deep reads the film directory as a `Series` library, and the episode
+    /// inside it gets a well-formed destination that `fix.rs` has no way to
+    /// question - `--fix` would build `Season 01/` inside a film folder and move
+    /// a file into it. Refusing is the only safe answer, and it is what a
+    /// whole-library run over the same tree already does.
+    #[tokio::test]
+    async fn a_film_directory_named_after_a_root_is_refused_rather_than_renamed() {
+        let temp_dir = TempDir::new().unwrap();
+        let movies = temp_dir.path().join("lib").join("Movies");
+
+        let film_named_series = movies.join("Series");
+        fs::create_dir_all(&film_named_series).unwrap();
+        fs::write(film_named_series.join("Series (2019).mkv"), "").unwrap();
+        fs::write(
+            film_named_series.join("Elementary - S01E01 - Pilot.mkv"),
+            "",
+        )
+        .unwrap();
+
+        let film = movies.join("Batman Begins (2005)");
+        fs::create_dir_all(&film).unwrap();
+        fs::write(film.join("Batman Begins (2005).mkv"), "").unwrap();
+
+        fs::create_dir_all(temp_dir.path().join("lib").join("Series")).unwrap();
+
+        let report = ValidateCommand::new(movies.clone())
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(report.library_root, temp_dir.path().join("lib"));
+        assert_eq!(
+            report.renames().count(),
+            0,
+            "no file in a film directory may earn a destination from a root that is not one"
+        );
+        assert!(
+            report
+                .needing_decision()
+                .any(|issue| issue.path.ends_with("Elementary - S01E01 - Pilot.mkv")),
+            "the episode in the film directory is a duplicated root for a person to resolve"
+        );
+        assert!(
+            !report
+                .issues
+                .iter()
+                .any(|issue| issue.path.contains("Batman Begins")),
+            "a film sitting in the Movies root is canonical and must not be reported at all"
+        );
+    }
+
+    /// A tree rsynced into itself directly under the root, with the run narrowed
+    /// to that root: the duplication is reported, and the real content beside it
+    /// is still assessed against the root it actually belongs to.
+    #[tokio::test]
+    async fn a_tree_nested_directly_into_itself_still_reports_the_duplication() {
+        let temp_dir = TempDir::new().unwrap();
+        let series = temp_dir.path().join("lib").join("Series");
+
+        let nested = series
+            .join("Series")
+            .join("Veronica Mars")
+            .join("Season 01");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("Veronica Mars - S01E01 - Pilot.mkv"), "").unwrap();
+
+        let real = series.join("Elementary").join("Season 1");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("Elementary - S01E01 - Pilot.mkv"), "").unwrap();
+
+        let report = ValidateCommand::new(series.clone())
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(report.library_root, temp_dir.path().join("lib"));
+        assert_eq!(
+            report.renames().next().map(|issue| issue.path.as_str()),
+            Some("Series/Elementary/Season 1/Elementary - S01E01 - Pilot.mkv"),
+            "the real content beside the duplication is still padded"
+        );
+        assert!(
+            report.needing_decision().any(|issue| {
+                issue.path.contains("Series/Series/")
+                    && matches!(&issue.kind,
+                    IssueKind::NeedsDecision { reason } if reason.contains("appears twice"))
+            }),
+            "the self-nested copy is a duplication, not a canonical library"
+        );
+    }
+
     #[tokio::test]
     async fn reported_issues_are_ordered_by_path() {
         let temp_dir = TempDir::new().unwrap();

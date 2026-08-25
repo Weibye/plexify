@@ -83,11 +83,11 @@ impl Scope {
 /// itself *be* the Anime root with series directories directly inside; both are
 /// ordinary, and reading the first as the second refuses the entire library at
 /// once, since every file below then looks like a tree nested into itself. Only
-/// the directory decides, so [`holds_library_roots`] asks it: a candidate that
-/// has roots beneath it is the media root, and the search moves further in.
-/// Where nothing is left, the whole path is the library root - which is also
-/// what happens for a path that names no root at all, so a whole-library run
-/// works exactly as before.
+/// the directory decides, so **this function reads that one directory from
+/// disk** - see [`holds_library_roots`] for what it counts and why. Where no
+/// candidate survives, the whole path is the library root, which is also what
+/// happens for a path that names no root at all, so a whole-library run works
+/// exactly as before.
 ///
 /// Give this an absolute path. A relative one that *starts* at a root - plain
 /// `Series/Elementary` - has nothing before that component to be the library
@@ -129,23 +129,67 @@ pub fn scope_for(path: &Path) -> Scope {
     }
 }
 
-/// Whether a directory has library roots directly beneath it, and so is the
-/// media root rather than a root itself.
+/// Whether a directory holds **more than one** library root directly beneath it,
+/// and so is the media root rather than a root itself.
 ///
-/// This is the one place the naming module looks at a disk, and it looks at
-/// exactly one directory. A path that cannot be read - it does not exist, or the
-/// caller cannot list it - yields no evidence, and no evidence leaves the name
-/// standing: the candidate is taken to be a real root, which is what a library
-/// root normally is.
+/// **This is the one place the naming module reads a disk**, and it reads
+/// exactly one directory. Nothing else here touches a filesystem; keep it that
+/// way, and keep this out of the parse/render core.
+///
+/// More than one is the whole rule, and the count is doing real work. A single
+/// root-named child is character-for-character the observation
+/// [`Unresolvable::DuplicatedRoot`] exists to report, and the two readings of it
+/// cannot be told apart from the disk:
+///
+/// ```text
+/// lib/Movies/Series/…   a media root holding one library, or a film called Series
+/// lib/Series/Series/…   a media root holding one library, or a tree rsynced into itself
+/// ```
+///
+/// Reading either as a media root moves the library root a level in, and the
+/// consequence is not a worse message but a worse *action*: the film directory
+/// then reads as a `Series` library, so an episode inside it earns a
+/// well-formed destination and `validate --fix` builds a season directory inside
+/// a film folder. `fix.rs` cannot catch that - the destination came out of
+/// `render` and is canonical; it is the root underneath it that is wrong. So one
+/// root-named child belongs to `parse`, which refuses it and says why.
+///
+/// Two or more distinct roots is not ambiguous in the same way. No single
+/// library contains two others, so a directory holding `Series/` and `Movies/`
+/// is a media root and nothing else, whatever it is called.
+///
+/// The cost of that is one shape left unfixed: a media root named after a
+/// library root that holds exactly *one* root - `/srv/Movies` containing only
+/// `Movies/`. It is refused rather than descended into, which is what happened
+/// before this probe existed. Refusing a library is recoverable by hand; a file
+/// moved to the wrong place is not.
+///
+/// Directories are counted, not names: a stray *file* called `Series` is not a
+/// library root. A path that cannot be read - it does not exist, or the caller
+/// cannot list it - yields no evidence, and no evidence leaves the name
+/// standing, which again lands on refusal rather than on a bad destination.
 fn holds_library_roots(directory: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return false;
     };
 
-    entries.flatten().any(|entry| {
-        LibraryRoot::from_component(&entry.file_name().to_string_lossy()).is_some()
-            && entry.path().is_dir()
-    })
+    let mut found: Vec<LibraryRoot> = Vec::new();
+
+    for entry in entries.flatten() {
+        let Some(root) = LibraryRoot::from_component(&entry.file_name().to_string_lossy()) else {
+            continue;
+        };
+
+        if entry.path().is_dir() && !found.contains(&root) {
+            found.push(root);
+
+            if found.len() > 1 {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// The top-level directories a library is organised into.
@@ -774,6 +818,78 @@ mod tests {
             scope.library_root,
             temp_dir.path(),
             "the inner Series is the duplication we report, not a library of its own"
+        );
+    }
+
+    /// A film directory that happens to be named `Series`, sitting in a real
+    /// `Movies` root, and the run narrowed to that root.
+    ///
+    /// One root-named child is the duplication case and nothing else: the
+    /// candidate is a real root, and the child below it is for `parse` to
+    /// report. Reading it as evidence of a media root moves `library_root` a
+    /// level in, after which the film directory reads as a `Series` library and
+    /// the episode inside it earns a *destination* - `validate --fix` then
+    /// builds a season directory inside a film folder.
+    ///
+    /// A rule of "roots the candidate is not named after" does not save this:
+    /// the candidate is `Movies` and the child is `Series`, so the names differ
+    /// and the search would descend anyway. The count is what separates them.
+    #[test]
+    fn a_film_directory_named_after_a_root_does_not_move_the_root_inwards() {
+        let temp_dir = TempDir::new().unwrap();
+        let movies = temp_dir.path().join("lib").join("Movies");
+        fs::create_dir_all(movies.join("Series")).unwrap();
+        fs::create_dir_all(movies.join("Batman Begins (2005)")).unwrap();
+        fs::create_dir_all(temp_dir.path().join("lib").join("Series")).unwrap();
+
+        let scope = scope_for(&movies);
+
+        assert_eq!(
+            scope.library_root,
+            temp_dir.path().join("lib"),
+            "one root-named child is a duplication to report, not a media root to descend into"
+        );
+        assert_eq!(scope.scan_path, movies);
+    }
+
+    /// A tree rsynced into itself *directly* under the root, and the run
+    /// narrowed to that root.
+    ///
+    /// The nesting the earlier guard covers sits a level down, so the outer
+    /// `Series` holds no root and the probe never speaks. Adjacent duplication
+    /// is the shape that puts a root-named child right where the probe looks.
+    #[test]
+    fn a_tree_nested_directly_into_itself_resolves_to_the_outer_root() {
+        let temp_dir = TempDir::new().unwrap();
+        let series = temp_dir.path().join("lib").join("Series");
+        fs::create_dir_all(series.join("Series").join("Veronica Mars")).unwrap();
+        fs::create_dir_all(series.join("Elementary")).unwrap();
+
+        let scope = scope_for(&series);
+
+        assert_eq!(
+            scope.library_root,
+            temp_dir.path().join("lib"),
+            "the inner Series is the duplication we report, not a library of its own"
+        );
+        assert_eq!(scope.scan_path, series);
+    }
+
+    /// The probe counts directories, because a stray *file* named `Series` is
+    /// not a library root and must not be counted toward one.
+    #[test]
+    fn a_file_named_after_a_root_is_not_evidence_of_a_media_root() {
+        let temp_dir = TempDir::new().unwrap();
+        let anime = temp_dir.path().join("srv").join("Anime");
+        fs::create_dir_all(anime.join("Series")).unwrap();
+        fs::write(anime.join("Movies"), "").unwrap();
+
+        let scope = scope_for(&anime);
+
+        assert_eq!(
+            scope.library_root,
+            temp_dir.path().join("srv"),
+            "one root directory and one root-named file is still one root directory"
         );
     }
 
