@@ -154,18 +154,36 @@ video frame by the audio encoder's padding - and `plan_chunks` rounds up, so the
 can begin after the picture has ended. That chunk encodes happily and comes out carrying
 audio alone. The concat demuxer needs every file in its list to declare the same streams;
 given one that does not, the joined MP4's video track is left running a whole frame interval
-past its own last picture. `encode_chunks` therefore treats a chunk that produced no video as
-the end of the file, which subsumes the case of one that produced nothing at all. What is
-dropped with it is audio past the final frame, which is padding.
+past its own last picture. `encode_chunks` therefore treats a chunk that **FFprobe can find no
+video stream in** as the end of the file.
 
-**Nothing shifts the output timeline to keep it off zero.** An AAC encoder emits a priming
-frame before the content begins, so the first audio packet carries a negative timestamp, and
-MP4 has an edit list - the field built to say playback starts one frame in. `-avoid_negative_ts
-make_zero` answers the same question by moving *every* stream forward by that frame instead,
-which puts the picture and the subtitles one AAC frame late and leaves a sliver of an event
-where the first subtitle used to be. It does nothing at all on the other two outputs: MPEG-TS
-cannot carry a negative timestamp and FFmpeg shifts it there by default, and the join's input
-is already non-negative. So it belongs on none of the three.
+That criterion is narrower than "produced no video", and the difference matters. An MPEG-TS
+chunk still declares a video stream in its PMT on the strength of the audio alone, so a chunk
+holding a genuine audio tail and no picture - a source whose sound outlives its image - does
+not trip the guard and is joined in with its audio intact. What the guard actually catches is
+the sub-kilobyte final chunk that begins past the end of everything, which ffprobe reads as
+having no video stream at all. Nothing is dropped but that.
+
+**Nothing shifts the output timeline to keep it off zero.** Two different things put a negative
+timestamp in front of an MP4 mux, and MP4's edit list is the field built to carry both. An AAC
+encoder emits a priming frame before the content begins, so the one-pass encode's first audio
+packet is one frame early. And x264 holds frames back to reorder them, so the concat demuxer
+feeding the join hands over video whose first DTS is a reorder delay before its PTS - the
+join's input is *not* already non-negative, and assuming it was is what hid this.
+
+`-avoid_negative_ts make_zero` answers the same question a second time, by moving *every*
+stream forward until nothing is negative. On the one-pass encode that is one AAC frame. On the
+join it is the reorder delay, so the picture ends up starting at that delay rather than where
+the chunks put it - 0.080s at 25fps, 0.200s at 10fps, 0.500s at 4fps, one measurement each.
+Both cases drag the subtitles along too and leave a sliver of an event where the first one used
+to be. So it belonged on neither, and is on neither.
+
+Only on the chunks was it ever inert: MPEG-TS cannot carry a negative timestamp, so FFmpeg
+shifts it there by default and the chunk files are byte-identical either way. The shift is
+itself written as an edit rather than by moving samples, so a player that ignores edit lists
+saw the same file with or without the flag - which is how it sat in the join unnoticed. That is
+not a reason to put it back on a fourth output: a concat-fed MP4 mux is exactly where it does
+the most damage.
 
 Two things follow from the directory being named after the job id, which is the v5 UUID of
 the input path and so stable forever. A parked job's chunks would be found again by any later

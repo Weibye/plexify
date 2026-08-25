@@ -51,15 +51,33 @@ impl FFmpegCommandBuilder {
 
     /// Have the demuxer generate presentation timestamps for the next input.
     ///
-    /// Nothing here shifts the output timeline to keep it off zero. An AAC
-    /// encoder emits its priming frame before the content starts, so the first
-    /// audio packet carries a negative timestamp - and MP4 has an edit list,
-    /// which is the field built to say "playback begins one frame in".
-    /// `-avoid_negative_ts make_zero` answers the same question by moving
-    /// *every* stream forward by that frame instead, which puts the picture and
-    /// the subtitles one AAC frame late and splits the first subtitle event
-    /// around the seam. MPEG-TS cannot carry a negative timestamp at all, and
-    /// FFmpeg's own default shifts it there without being asked.
+    /// Nothing here shifts the output timeline to keep it off zero, and
+    /// `-avoid_negative_ts make_zero` is deliberately absent from all three
+    /// outputs.
+    ///
+    /// Two things put a negative timestamp in front of an MP4 mux. An AAC
+    /// encoder emits its priming frame before the content starts, so the
+    /// one-pass encode's first audio packet is one frame early; and x264 holds
+    /// frames back to reorder them, so the concat demuxer feeding the join
+    /// hands over video whose first DTS is a reorder delay before its PTS. MP4
+    /// has an edit list, which is the field built to express exactly that, and
+    /// both are already carried there.
+    ///
+    /// `make_zero` answers the same question a second time, by shifting *every*
+    /// stream forward until nothing is negative. On the one-pass encode that is
+    /// one AAC frame. On the join it is the reorder delay, which leaves the
+    /// picture starting at that delay rather than where the chunks put it -
+    /// measured 0.080s at 25fps, 0.200s at 10fps, 0.500s at 4fps. Either way
+    /// the audio and the subtitles are dragged along with it and the first
+    /// subtitle event is split around the seam.
+    ///
+    /// The shift is itself written as an edit, so a player that ignores edit
+    /// lists sees the same samples with or without the flag. That is why it
+    /// could sit here unnoticed, and is not a reason to put it back.
+    ///
+    /// Only on the chunks is it genuinely inert: they are MPEG-TS, which cannot
+    /// carry a negative timestamp at all, so FFmpeg shifts it there without
+    /// being asked and the chunk files come out byte-identical either way.
     pub fn with_generated_pts(self) -> Self {
         self.with_input_options(&["-fflags", "+genpts"])
     }
@@ -673,15 +691,23 @@ impl FFmpegProcessor {
 
             // The plan came from the container's duration, which is the longest
             // of its streams - so the final chunk can begin after the last
-            // video frame and before the end of the audio. Such a chunk encodes
-            // happily and comes out carrying audio alone, or nothing at all.
+            // video frame, and `plan_chunks` rounds up, so it can begin after
+            // the audio has ended too. What comes out is a chunk of a few
+            // hundred bytes that ffprobe can find no video stream in at all.
             //
             // The concat demuxer needs every file in its list to declare the
             // same streams. Given one that does not, the joined MP4's video
             // track is left running a whole frame interval past its own last
-            // picture. So a chunk that did not produce video is the end of the
-            // file, whatever else it produced: what it holds is the tail of the
-            // audio past the last frame, which is the encoder's padding.
+            // picture. So the criterion is exactly what is asked below: a chunk
+            // no video stream can be found in is the end of the file.
+            //
+            // That is narrower than "produced no video", and deliberately. A
+            // chunk that holds a real audio tail and no picture - a source
+            // whose sound outlives its image - still declares a video stream in
+            // its PMT, so it does not trip this and is joined in with its audio
+            // intact. Measured: 2s chunks past the last frame carry 0 video and
+            // 95 audio packets and are kept; only the sub-kilobyte final chunk
+            // is dropped.
             if self.probe_video_stream_count(&partial_path).await == Some(0) {
                 let _ = tokio::fs::remove_file(&partial_path).await;
                 debug!(
@@ -736,11 +762,14 @@ impl FFmpegProcessor {
         Ok(())
     }
 
-    /// How many video streams a file has, as far as FFprobe can tell.
+    /// How many lines FFprobe emits for a file's video streams.
     ///
-    /// Video rather than any stream, because a chunk that carries only audio is
-    /// no more use to the concat demuxer than an empty one: the list has to
-    /// declare the same streams throughout.
+    /// Not a stream count: `-of csv` gives a transport stream both a
+    /// `program,stream,N` line and a `stream,N` line, so one video stream comes
+    /// back as 2. Only `Some(0)` is ever consulted - "FFprobe found no video
+    /// stream here" - and that reading is sound whatever the count means above
+    /// zero. Video rather than any stream, because the concat demuxer needs
+    /// every file in its list to declare the same streams.
     async fn probe_video_stream_count(&self, path: &Path) -> Option<usize> {
         let output = self
             .probe_command()
