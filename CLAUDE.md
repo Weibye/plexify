@@ -190,9 +190,36 @@ Consequences to preserve when changing it:
 
 **A run can be narrowed without changing what canonical means.** `naming::scope_for` splits
 the path a user gave into a `library_root` (the parent of the outermost `Series`/`Anime`/
-`Movies` component) and a `scan_path` (what to walk). Validation walks the scan path and
-judges every file against the root, because a path starting `Season 06/` names no series and
-would be unresolvable. Two consequences that are easy to break:
+`Movies` component *that is actually a root* — see below) and a `scan_path` (what to walk).
+Validation walks the scan path and judges every file against the root, because a path
+starting `Season 06/` names no series and would be unresolvable.
+
+**A component's name does not establish that it is a library root, and only a directory
+holding two of them settles it.** `/srv/Anime` can equally be a media root that *holds*
+`Series/`, `Anime/`, `Movies/`, or the Anime root itself with series directories directly
+inside it. Taking the name at face value reads the first as the second, and then every file
+below looks like a tree nested into itself and the whole library becomes unresolvable at once
+— `validate --fix` inert on all of it. `scope_for` therefore lists each candidate directory
+and skips it when it holds **more than one distinct root** (`holds_library_roots`), falling
+through to the whole path when no candidate survives. This is the only place `naming` reads a
+disk; keep it out of parse/render, and keep the count where it is:
+
+- **One root-named child is not evidence, because it is exactly what `DuplicatedRoot`
+  reports.** `lib/Movies/Series/` is either a media root holding one library or a film
+  directory called `Series`, and `lib/Series/Series/` is either that or a tree rsynced into
+  itself. Reading either as a media root pushes `library_root` a level in, and the damage is
+  an *action*, not a message: the film directory then reads as a `Series` library, an episode
+  inside it earns a canonical destination, and `--fix` builds a season directory inside a film
+  folder. `fix.rs` cannot catch it — the destination came out of `render`; the root beneath it
+  is what is wrong. Leave that case to `parse`.
+- **Two distinct roots is unambiguous**, because no one library contains another.
+- **The residual cost is a refusal, and that is the right way to be wrong.** A media root
+  named after a root that holds exactly one — `/srv/Movies` containing only `Movies/` — is
+  still refused, as are an unreadable directory and a stray *file* named `Series`. Refusing a
+  library is recoverable by hand; a file moved to a wrong root is recoverable only through
+  `undo`, and only if someone notices.
+
+Two further consequences that are easy to break:
 
 - `fix` resolves destinations from `library_root`, never `scan_path`. A destination routinely
   falls outside the scanned subtree — correcting `Season 6` to `Season 06` moves a file into

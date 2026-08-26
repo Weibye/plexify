@@ -110,13 +110,15 @@ pub fn parse(path: &str) -> Result<MediaName, Unresolvable> {
         .ok_or(Unresolvable::NotAMediaFile)?;
     let root = LibraryRoot::from_component(root_name).ok_or(Unresolvable::OutsideLibrary)?;
 
-    // A root name appearing again below the root means the tree was nested into
-    // itself. Which copy is the real one is not ours to decide.
-    if let Some(duplicate) = below_root
+    // A root name below the root means the tree was nested into itself. Which
+    // copy is the real one is not ours to decide. Both names are reported, since
+    // the two need not be the same one: `Movies/Series/...` is a root inside a
+    // root without any name appearing twice.
+    if let Some(inner) = below_root
         .iter()
         .find_map(|component| LibraryRoot::from_component(component))
     {
-        return Err(Unresolvable::DuplicatedRoot { root: duplicate });
+        return Err(Unresolvable::DuplicatedRoot { outer: root, inner });
     }
 
     let (filename, directories) = below_root.split_last().ok_or(Unresolvable::NotAMediaFile)?;
