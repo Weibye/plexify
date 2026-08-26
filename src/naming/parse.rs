@@ -185,9 +185,17 @@ fn parse_episode(
     // rewriting a file to match a directory would spread that.
     let mut series = clean_name(&stem[..whole_marker.start()]);
     if series.is_empty() {
+        // The filename carried no name at all, so the directory is the only
+        // evidence left - but a directory carrying an episode marker is not
+        // evidence of what the series is called. It is also a name that cannot
+        // survive the round trip: `render` writes the series in front of the
+        // marker, and the parser reads the series back as whatever precedes the
+        // *first* marker, so a series name holding one of its own would be read
+        // short and prepended again on every run.
         series = directories
             .last()
-            .map(|directory| clean_name(&directory_annotations().replace(directory, "")))
+            .map(|directory| series_name_from_directory(directory))
+            .filter(|candidate| !episode_marker().is_match(candidate))
             .unwrap_or_default();
     }
     if series.is_empty() {
@@ -211,6 +219,14 @@ fn parse_episode(
         quality,
         extension: extension.to_string(),
     }))
+}
+
+/// The series name a directory component states, stripped of its annotations.
+///
+/// `Breaking Bad (2008) {tvdb-81189}` names the series `Breaking Bad`; the year
+/// and the identifier describe it rather than being part of its name.
+pub(super) fn series_name_from_directory(directory: &str) -> String {
+    clean_name(&directory_annotations().replace(directory, ""))
 }
 
 fn parse_season_directory(component: &str) -> Option<SeasonDirectory> {
@@ -556,6 +572,20 @@ mod tests {
             episode("Series/Breaking Bad (2008) {tvdb-81189}/Season 01/S01E01 - Pilot.mkv");
 
         assert_eq!(parsed.series, "Breaking Bad");
+    }
+
+    #[test]
+    fn refuses_a_directory_named_after_an_episode_rather_than_a_series() {
+        for path in [
+            "Series/S01E01/Season 01/S01E01 - Pilot.mkv",
+            "Series/Veronica Mars S02E04/Season 02/S02E04.mp4",
+        ] {
+            assert_eq!(
+                parse(path),
+                Err(Unresolvable::NoSeriesName),
+                "a directory holding a marker does not name the series: {path}"
+            );
+        }
     }
 
     #[test]

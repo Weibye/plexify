@@ -294,6 +294,55 @@ impl Unresolvable {
     }
 }
 
+/// A file whose series directory names a different series than the file does.
+///
+/// The filename is what this module parses and what Plex reads, so a directory
+/// disagreeing with it is worth saying out loud. Which of the two is *right* is
+/// not decidable from the path - a directory is often a curated abbreviation,
+/// and a filename can simply be wrong - so this is a note on a file and never a
+/// proposal. Nothing here renames a series directory: that would move every
+/// file in it on evidence that does not support the move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeriesDirectoryDisagreement {
+    /// The series directory as it is on disk.
+    pub directory: String,
+    /// The series name the file gives.
+    pub series: String,
+}
+
+/// Note whether the series directory holding a file disagrees with the file.
+///
+/// Both names are already in hand once the path is parsed, so this is a
+/// comparison rather than a second reading of the path. A file can be canonical
+/// and still sit in a disagreeing directory, and a file can need a rename *and*
+/// be in one, which is why this is separate from [`assess`] rather than a
+/// variant of it.
+pub fn series_directory_disagreement(relative_path: &Path) -> Option<SeriesDirectoryDisagreement> {
+    let path = to_forward_slashes(relative_path);
+
+    let episode = match parse(&path) {
+        Ok(MediaName::Episode(episode)) => episode,
+        _ => return None,
+    };
+
+    // Read the directory the same way the parser does when it falls back to it,
+    // so an annotation such as `(2008) {tvdb-81189}` is not mistaken for a
+    // different name.
+    let directory = episode.directories.last()?;
+    let stated = parse::series_name_from_directory(directory);
+
+    // A directory that states nothing cannot disagree, and a difference of case
+    // is not a disagreement about which series this is.
+    if stated.is_empty() || stated.eq_ignore_ascii_case(&episode.series) {
+        return None;
+    }
+
+    Some(SeriesDirectoryDisagreement {
+        directory: directory.clone(),
+        series: episode.series,
+    })
+}
+
 /// What should happen to a path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Assessment {
@@ -525,8 +574,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reports_a_directory_named_after_an_episode_instead_of_growing_the_name() {
+        assert_eq!(
+            assess(Path::new("Series/S01E01/Season 01/S01E01 - x.mkv")),
+            Assessment::Unresolvable(Unresolvable::NoSeriesName),
+            "neither the file nor its directory names the series, and a marker is not a name"
+        );
+    }
+
     /// The property the whole module rests on: whatever we propose must itself
     /// be canonical, or `--fix` would move a file twice.
+    ///
+    /// The corpus below is a list of tidy paths, all of which name their series
+    /// in the filename. That is the shape the property is *least* likely to fail
+    /// on, so [`no_path_is_renamed_twice`] widens it to paths whose series name
+    /// has to come from somewhere else.
     #[test]
     fn every_proposed_destination_is_itself_canonical() {
         let messy = [
@@ -554,6 +617,131 @@ mod tests {
                 assess(Path::new(&destination)),
                 Assessment::Canonical,
                 "proposed destination is not canonical: {path} -> {destination}"
+            );
+        }
+    }
+
+    /// The same property over a generated corpus rather than a hand-written one.
+    ///
+    /// Every combination of a series directory, a season directory and a
+    /// filename below is assessed, and a proposal for any of them has to be
+    /// canonical in its own right. Refusing a path is an acceptable answer here
+    /// and a rename to a path that would be renamed again is not, which is what
+    /// separates a heuristic that gives up from one that grows a filename.
+    #[test]
+    fn no_path_is_renamed_twice() {
+        let series_directories = [
+            "Elementary",
+            "Elementary (2012)",
+            "Breaking Bad (2008) {tvdb-81189}",
+            "Super Best Friends Play - FFX",
+            "S.W.A.T",
+            "S01E01",
+            "Veronica Mars S02E04",
+            "Show.S01",
+        ];
+        let season_directories = [
+            "",
+            "Season 1/",
+            "Season 01/",
+            "Season 01 - The Arc/",
+            "Season 00/",
+            "Specials/",
+            "Season 3/Extras/",
+        ];
+        let filenames = [
+            "S01E01.mkv",
+            "S01E01 - Pilot.mkv",
+            "Elementary - S01E01 - Pilot.mkv",
+            "Elementary.S01E01.Pilot.1080p.BluRay.x264.mkv",
+            "s01e01 - pilot.mkv",
+            "Elementary - S01E01 (1080p60).webm",
+            "S00E01 - [1080p][HorribleSubs].mkv",
+        ];
+
+        let mut proposals = 0;
+        for series_directory in series_directories {
+            for season_directory in season_directories {
+                for filename in filenames {
+                    let path = format!("Series/{series_directory}/{season_directory}{filename}");
+
+                    let destination = match assess(Path::new(&path)) {
+                        Assessment::Rename { destination } => destination,
+                        // Canonical is the property holding trivially, and a
+                        // refusal puts the path in front of a person, which is
+                        // the honest answer when nothing names the series.
+                        Assessment::Canonical | Assessment::Unresolvable(_) => continue,
+                    };
+                    proposals += 1;
+
+                    assert_eq!(
+                        assess(Path::new(&destination)),
+                        Assessment::Canonical,
+                        "a second run would move this again: {path} -> {destination}"
+                    );
+                }
+            }
+        }
+
+        assert!(
+            proposals > 0,
+            "the corpus proposed nothing, so it proved nothing"
+        );
+    }
+
+    #[test]
+    fn notes_a_series_directory_that_names_something_else() {
+        assert_eq!(
+            series_directory_disagreement(Path::new(
+                "Series/Super Best Friends Play - FFX/Season 01/Super Best Friends Play - Final Fantasy X - S01E13.webm"
+            )),
+            Some(SeriesDirectoryDisagreement {
+                directory: "Super Best Friends Play - FFX".to_string(),
+                series: "Super Best Friends Play - Final Fantasy X".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_canonical_file_can_still_sit_in_a_disagreeing_directory() {
+        let path = Path::new("Series/FFX/Season 01/Final Fantasy X - S01E13 - Zanarkand.webm");
+
+        assert_eq!(
+            assess(path),
+            Assessment::Canonical,
+            "the note is not a verdict, and must not turn a correct file into a rename"
+        );
+        assert_eq!(
+            series_directory_disagreement(path),
+            Some(SeriesDirectoryDisagreement {
+                directory: "FFX".to_string(),
+                series: "Final Fantasy X".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn says_nothing_when_the_directory_and_the_file_agree() {
+        for path in [
+            // The names match outright.
+            "Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap.mkv",
+            // An annotation on the directory describes the series rather than
+            // being part of its name.
+            "Series/Breaking Bad (2008) {tvdb-81189}/Season 01/Breaking Bad - S01E01 - Pilot.mkv",
+            // A difference of case is not a disagreement about which series.
+            "Series/breaking bad/Season 01/Breaking Bad - S01E01 - Pilot.mkv",
+            // The filename names no series, so the directory is where the name
+            // came from and cannot contradict it.
+            "Series/Breaking Bad/Season 01/S01E01 - Pilot.mkv",
+            // A film has no series directory to disagree with.
+            "Movies/The Dark Knight (2008)/The Dark Knight (2008).mkv",
+            // A path that cannot be parsed says nothing about anything.
+            "Series/S01E01/Season 01/S01E01 - x.mkv",
+        ] {
+            assert_eq!(
+                series_directory_disagreement(Path::new(path)),
+                None,
+                "for {path}"
             );
         }
     }
