@@ -5,6 +5,9 @@ use tempfile::TempDir;
 
 use serial_test::serial;
 
+use plexify::queue::JobQueue;
+use plexify::JobPriority;
+
 /// Path to the binary under test.
 ///
 /// Cargo builds the binary before running integration tests and supplies its path
@@ -762,51 +765,39 @@ fn test_plexifyignore_integration() {
     );
 }
 
-/// Test episode prioritization in work command
-#[test]
+/// Episodes are claimed in library order, from paths a real scan produced.
+///
+/// The queue is filled by running `scan` over a directory tree rather than by
+/// building jobs in memory, because that walk is the only thing that produces
+/// the separators and the season directories a worker actually meets.
+#[tokio::test]
 #[serial]
-fn test_episode_prioritization_integration() {
+async fn test_episode_prioritization_integration() {
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path();
 
-    // Create hierarchical directory structure for TV series
-    fs::create_dir_all(temp_path.join("Series/Better Call Saul/Season 01")).unwrap();
-    fs::create_dir_all(temp_path.join("Series/Breaking Bad/Season 01")).unwrap();
-    fs::create_dir_all(temp_path.join("Movies/Action")).unwrap();
+    // Two padded seasons, one unpadded, one `Specials`, and a long-running
+    // series numbered past ninety-nine: the shapes a library holds before
+    // anything has normalised it.
+    let episodes = [
+        "Series/Better Call Saul/Season 01/Better Call Saul S01E02 Mijo.mkv",
+        "Series/Better Call Saul/Season 01/Better Call Saul S01E01 Uno.mkv",
+        "Series/Breaking Bad/Season 1/Breaking Bad S01E03 Gray Matter.mkv",
+        "Series/Breaking Bad/Season 1/Breaking Bad S01E01 Pilot.mkv",
+        "Series/Firefly/Specials/Firefly S00E01 Here's How It Was.mkv",
+        "Anime/One Piece/Season 01/One Piece S01E108 Dashing Onto The Scene.mkv",
+        "Anime/One Piece/Season 01/One Piece S01E99 Spirit Of The Fight.mkv",
+        "Movies/Action/The Matrix (1999).mkv",
+    ];
 
-    // Create episode files in mixed order to test prioritization
-    // Better Call Saul (alphabetically first)
-    fs::write(
-        temp_path.join("Series/Better Call Saul/Season 01/Better Call Saul S01E02 Mijo.mkv"),
-        "dummy content",
-    )
-    .unwrap();
-    fs::write(
-        temp_path.join("Series/Better Call Saul/Season 01/Better Call Saul S01E01 Uno.mkv"),
-        "dummy content",
-    )
-    .unwrap();
+    for episode in episodes {
+        let path = episode
+            .split('/')
+            .fold(temp_path.to_path_buf(), |path, part| path.join(part));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "dummy content").unwrap();
+    }
 
-    // Breaking Bad (alphabetically second)
-    fs::write(
-        temp_path.join("Series/Breaking Bad/Season 01/Breaking Bad S01E03 Gray Matter.mkv"),
-        "dummy content",
-    )
-    .unwrap();
-    fs::write(
-        temp_path.join("Series/Breaking Bad/Season 01/Breaking Bad S01E01 Pilot.mkv"),
-        "dummy content",
-    )
-    .unwrap();
-
-    // Non-episode content (should come last)
-    fs::write(
-        temp_path.join("Movies/Action/The Matrix (1999).mkv"),
-        "dummy content",
-    )
-    .unwrap();
-
-    // First, scan to create jobs
     let scan_output = Command::new(PLEXIFY_BIN)
         .args([
             "scan",
@@ -823,37 +814,36 @@ fn test_episode_prioritization_integration() {
         String::from_utf8_lossy(&scan_output.stderr)
     );
 
-    // Verify jobs were created
-    let queue_dir = temp_path.join("_queue");
-    let job_count = fs::read_dir(&queue_dir)
-        .unwrap()
-        .filter(|entry| entry.as_ref().unwrap().path().extension() == Some("job".as_ref()))
-        .count();
-    assert_eq!(job_count, 5, "Should have created 5 job files");
+    let queue = JobQueue::new(temp_path.to_path_buf(), temp_path.to_path_buf());
+    let mut claimed_order = Vec::new();
+    while let Some(claimed) = queue.claim_job(Some(JobPriority::Episode)).await.unwrap() {
+        claimed_order.push(
+            claimed
+                .job
+                .input_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string(),
+        );
+        claimed.complete().await.unwrap();
+    }
 
-    // Test help command mentions the priority option
-    let help_output = Command::new(PLEXIFY_BIN)
-        .args(["work", "--help"])
-        .output()
-        .expect("Failed to run help command");
+    let expected = [
+        "Better Call Saul S01E01 Uno.mkv",
+        "Better Call Saul S01E02 Mijo.mkv",
+        "Breaking Bad S01E01 Pilot.mkv",
+        "Breaking Bad S01E03 Gray Matter.mkv",
+        "Firefly S00E01 Here's How It Was.mkv",
+        "One Piece S01E99 Spirit Of The Fight.mkv",
+        "One Piece S01E108 Dashing Onto The Scene.mkv",
+        // Nothing parses as an episode here, so the film is claimed last.
+        "The Matrix (1999).mkv",
+    ];
 
-    assert!(help_output.status.success(), "Help command failed");
-
-    let help_text = String::from_utf8_lossy(&help_output.stdout);
-    assert!(
-        help_text.contains("--priority"),
-        "Help should mention priority option: {}",
-        help_text
-    );
-    assert!(
-        help_text.contains("episode"),
-        "Help should mention episode priority option: {}",
-        help_text
-    );
-    assert!(
-        help_text.contains("none"),
-        "Help should mention none priority option: {}",
-        help_text
+    assert_eq!(
+        claimed_order, expected,
+        "jobs were not claimed in series, season and episode order"
     );
 }
 
