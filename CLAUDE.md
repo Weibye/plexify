@@ -109,10 +109,45 @@ chaining in a different order — which is exactly what happened when `with_outp
 before the stream mappings and every `-map` was thrown away.
 
 Input options are the exception to "order does not matter", and deliberately: they attach
-to the **next input declared**, so `.with_subtitle_duration_fix().with_input(source)` puts
-the flag on that input alone. Holding them in one bucket ahead of every input, as an earlier
-version did, silently put every option on input 0 — which is how the chunked join came to
-read its subtitles without `-fix_sub_duration` while the one-pass encode used it.
+to the **next input declared**, so `.with_concat_list(list).with_input(source)` puts
+`-f concat` on the list alone and reads the source as an ordinary file. Holding them in one
+bucket ahead of every input, as an earlier version did, silently put every option on input 0.
+
+**A subtitle stream is carried by name, and only if MP4 can hold it.** `-c:s mov_text` is a
+text encoder, and FFmpeg will not encode a picture into one, so mapping a bitmap subtitle
+stream — `hdmv_pgs_subtitle` from a Blu-ray, `dvd_subtitle` from a DVD — does not lose that
+stream, it fails the whole job and the video with it. `process_job` therefore probes the
+source's subtitle streams once and hands the same `SubtitleSelection` to both encode paths,
+which name the streams they can convert (`0:s:1`) rather than asking for the group (`0:s?`).
+`BITMAP_SUBTITLE_CODECS` lists what is provably impossible, not what is known to work: an
+unrecognised codec is mapped and left for FFmpeg to judge, because being wrong that way
+costs a job that can be run again, and being wrong the other way loses a track from a
+library. A dropped stream is named in a warning, and the source is renamed rather than
+deleted, so the track can still be taken from it.
+
+`dvb_teletext` is on that list for a different reason from the rest, and it is why the list
+cannot be derived by reading `ffmpeg -codecs`: teletext is not inherently a picture, but its
+only decoder emits one unless `-txt_format` says otherwise, and the default is `bitmap`.
+Output format as a *decoder option* rather than a codec property is the shape to look for
+before adding anything else. `arib_caption` and `eia_608` come off the same kind of broadcast
+capture and both decode to text, so both are correctly absent.
+
+**A dropped stream that is `forced` is reported differently, and that is all it is.** The
+probe asks for `stream_disposition=forced` in the call it already makes, so a track holding
+the translated signs a scene cannot be followed without costs nothing extra to tell apart
+from a decorative transcript. Nothing acts on the difference — the track is dropped and the
+job succeeds either way — because what *should* happen to a forced bitmap track is an open
+decision. The detection exists so that decision has something to act on, and so a log can
+distinguish a file that now plays a scene untranslated from one that lost a track nobody
+asked for. Adding the disposition changed the probe's CSV to `codec,forced[,language]`;
+`parse_probed_subtitle_line` stops splitting at three fields because FFprobe CSV-quotes a
+language tag containing a comma, and splitting further would read its tail as a field.
+
+Do not reach for `-fix_sub_duration` to resolve overlapping events. It holds each event back
+until the next one arrives so it can bound it, so the final event of every stream is never
+flushed and never reaches the output — silently, on every file. The MP4 muxer already ends a
+text sample where the following one starts, which is the whole of what the flag was there
+for.
 
 **Transcoded output is written to the work folder, then moved.** `FFmpegProcessor::process_job`
 encodes to `job.work_folder_output_path(work_folder)` and only then calls
