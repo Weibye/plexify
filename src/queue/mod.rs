@@ -447,23 +447,6 @@ impl JobQueue {
         }
         Ok(())
     }
-
-    /// Get count of pending jobs
-    #[allow(dead_code)]
-    pub async fn pending_count(&self) -> Result<usize> {
-        let mut count = 0;
-        let mut entries = async_fs::read_dir(&self.queue_dir).await?;
-
-        while let Some(entry) = entries.next_entry().await? {
-            if let Some(extension) = entry.path().extension() {
-                if extension == "job" {
-                    count += 1;
-                }
-            }
-        }
-
-        Ok(count)
-    }
 }
 
 /// Write a job file so that it is never observed half-written.
@@ -557,23 +540,26 @@ fn spawn_heartbeat(path: PathBuf) -> tokio::task::JoinHandle<()> {
 ///
 /// It is a separate file rather than a touch of the job file itself so that a
 /// worker killed mid-heartbeat cannot leave a half-written job behind.
-fn heartbeat_path_for(in_progress_path: &std::path::Path) -> PathBuf {
+pub(crate) fn heartbeat_path_for(in_progress_path: &std::path::Path) -> PathBuf {
     let mut name = in_progress_path.as_os_str().to_os_string();
     name.push(".heartbeat");
     PathBuf::from(name)
 }
 
-/// Whether a claimed job has gone quiet for longer than `stale_after`.
+/// When a claimed job last showed a sign of life.
 ///
-/// The most recent of the two timestamps wins, so a job claimed by a worker
-/// that has not yet written its first heartbeat is judged by its own mtime.
-/// A timestamp that cannot be read at all is treated as not stale: refusing to
-/// reclaim is always the safe answer.
-async fn is_stale(
+/// The most recent of the two timestamps wins, so a job claimed by a worker that
+/// has not yet written its first heartbeat is judged by its own mtime. `None`
+/// means neither timestamp could be read.
+///
+/// This is the single definition of "how long has this job been quiet", shared
+/// by the sweep below and by the status command. They must agree: a report that
+/// called a job stranded on a different rule from the one that reclaims it would
+/// be worse than no report.
+pub(crate) async fn last_activity(
     job_path: &std::path::Path,
     heartbeat_path: &std::path::Path,
-    stale_after: Duration,
-) -> bool {
+) -> Option<SystemTime> {
     let mut latest: Option<SystemTime> = None;
 
     for candidate in [job_path, heartbeat_path] {
@@ -587,7 +573,22 @@ async fn is_stale(
         }
     }
 
-    match latest.and_then(|t| SystemTime::now().duration_since(t).ok()) {
+    latest
+}
+
+/// Whether a claimed job has gone quiet for longer than `stale_after`.
+///
+/// A timestamp that cannot be read at all is treated as not stale: refusing to
+/// reclaim is always the safe answer.
+async fn is_stale(
+    job_path: &std::path::Path,
+    heartbeat_path: &std::path::Path,
+    stale_after: Duration,
+) -> bool {
+    match last_activity(job_path, heartbeat_path)
+        .await
+        .and_then(|t| SystemTime::now().duration_since(t).ok())
+    {
         Some(age) => age >= stale_after,
         None => false,
     }

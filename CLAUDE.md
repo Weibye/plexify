@@ -92,7 +92,9 @@ under carries the id of the worker that copied it.
 controls the queue location and **defaults to the current working directory**, not to the
 media directory. This trips people up constantly: running `scan` from two different shells
 with different CWDs silently produces two unrelated queues. `media_root` is retained on the
-queue only for resolving legacy relative job paths.
+queue only for resolving legacy relative job paths. Any command that reports on a queue must
+print the work root it resolved, as `status` does - otherwise the report and the mistake are
+indistinguishable.
 
 **Jobs are self-describing snapshots.** `Job::new` resolves the input path to absolute and
 bakes the fully-resolved `QualitySettings` into the job file at scan time. A job queued last
@@ -163,6 +165,28 @@ back.** Both are properties of the same three moves, and both are easy to undo b
   `_failed` and writes the parse error beside it as `{job}.error`. A read that *fails* is left
   alone: a work root on a network share drops out now and then, and that is worth another
   sweep rather than a decision.
+
+**`status` is the only way to read the queue, and it only reads.** `src/commands/status.rs`
+walks the same four directories and reports counts, the jobs in `_in_progress` with how long
+since their worker last checked in, and the jobs in `_failed` with their attempt count and
+recorded error. It moves, rewrites and deletes nothing, and deliberately does not call
+`init` - a work root that has never held a job must read as empty rather than be created by
+the act of asking about it, because that reading is the symptom of the `-w` mistake below and
+is what the report says out loud. Whether a job is stranded comes from `queue::last_activity`
+and `STALE_AFTER`, the same two things the sweep uses; a report judging that on its own rule
+would tell users about jobs the sweep will not reclaim. `execute` returns `QueueStatus` and
+rendering is separate, so another consumer reads the state rather than parsing the text.
+
+Reading a queue nothing is holding still means racing it, and two of the three absences
+`status` can meet are not errors. A job file that has *vanished* between the listing and the
+read is a worker's `complete()` doing its job, so it is skipped rather than reported as
+unreadable - only a file still present and unparseable is worth a corruption signal. A queue
+directory that is *absent* reads as empty, but one that cannot be *reached* is an error,
+because answering an unreachable share with the `-w` advice sends a user to change the one
+thing that is right. Windows makes that distinction invisible to `ErrorKind` - it reports
+`ERROR_BAD_NETPATH` as `NotFound` - so `is_absent` checks the raw code there, and narrowing
+it back to the kind alone silently restores the wrong answer on the platform where shared
+work roots are most likely.
 
 Whatever an interrupted encode left in the work folder is left alone by the sweep. Deciding
 what of it is still usable belongs to the encoder, not the queue. What must *not* be left
