@@ -59,21 +59,42 @@ idempotent and both primitives below have something stable to collide on. Never 
 random again.
 
 Any number of `work` processes on any number of machines can point at the same work root.
-Mutual exclusion comes from two filesystem primitives, both in `src/queue/mod.rs`:
+One job per input file comes from the name: every scanner that sees a file derives the same
+v5 id for it, and `job_exists` consults all four queue directories before a scan writes
+anything. What the two filesystem primitives in `src/queue/mod.rs` add is that each step
+between those directories happens all at once, so no other process ever sees a half-done one:
 
-- **Enqueue** creates `{uuid}.job.lock` as a *directory*. `create_dir` fails if it exists, so
-  the losing racer skips the job rather than double-writing it.
+- **Enqueue** publishes a job. It writes the file under a staging name and renames it onto
+  `{uuid}.job`, which replaces whatever is there in one step. It is not a claim on the name —
+  two scanners racing on one file both write, and the second rename wins — but neither can
+  leave a torn file or any debris behind. A marker claiming the name instead is worse than
+  nothing: a scanner that died between taking the name and writing the job would leave the
+  name taken with nothing under it, and every later scan would skip a file that is then in no
+  queue directory at all.
 - **Claim** renames the job file from `_queue/` into `_in_progress/`. Rename is atomic, so
   exactly one worker wins; losers see `NotFound` and move on.
 
 Preserve this property when touching the queue. Any change that reads-then-writes instead of
-renaming reintroduces the race that this design exists to avoid.
+renaming reintroduces the race that this design exists to avoid. The same goes for rewriting
+a job in place to record an attempt: `write_job_atomically` stages and renames, so a worker
+killed mid-rewrite leaves a job file that still parses.
+
+**What none of this rules out is two workers on one input**, so nothing downstream may assume
+it cannot happen. A scan whose `job_exists` found nothing and whose enqueue lands after a
+worker has claimed the job queues that file again while it is being encoded. The startup sweep
+can arrive at the same place from the other side: it records the attempt before it moves the
+job, and that rewrite ends in a rename that *creates* the file when it is absent, so a second
+sweeper working from a stale read can put a job back into `_in_progress` under the worker that
+has just claimed it (#132). Both windows are why the staging name a finished encode is copied
+under carries the id of the worker that copied it.
 
 **The work root is not the media root.** `JobQueue::new` takes both. `--work-dir`/`-w`
 controls the queue location and **defaults to the current working directory**, not to the
 media directory. This trips people up constantly: running `scan` from two different shells
 with different CWDs silently produces two unrelated queues. `media_root` is retained on the
-queue only for resolving legacy relative job paths.
+queue only for resolving legacy relative job paths. Any command that reports on a queue must
+print the work root it resolved, as `status` does - otherwise the report and the mistake are
+indistinguishable.
 
 **Jobs are self-describing snapshots.** `Job::new` resolves the input path to absolute and
 bakes the fully-resolved `QualitySettings` into the job file at scan time. A job queued last
@@ -88,15 +109,67 @@ chaining in a different order — which is exactly what happened when `with_outp
 before the stream mappings and every `-map` was thrown away.
 
 Input options are the exception to "order does not matter", and deliberately: they attach
-to the **next input declared**, so `.with_subtitle_duration_fix().with_input(source)` puts
-the flag on that input alone. Holding them in one bucket ahead of every input, as an earlier
-version did, silently put every option on input 0 — which is how the chunked join came to
-read its subtitles without `-fix_sub_duration` while the one-pass encode used it.
+to the **next input declared**, so `.with_concat_list(list).with_input(source)` puts
+`-f concat` on the list alone and reads the source as an ordinary file. Holding them in one
+bucket ahead of every input, as an earlier version did, silently put every option on input 0.
+
+**A subtitle stream is carried by name, and only if MP4 can hold it.** `-c:s mov_text` is a
+text encoder, and FFmpeg will not encode a picture into one, so mapping a bitmap subtitle
+stream — `hdmv_pgs_subtitle` from a Blu-ray, `dvd_subtitle` from a DVD — does not lose that
+stream, it fails the whole job and the video with it. `process_job` therefore probes the
+source's subtitle streams once and hands the same `SubtitleSelection` to both encode paths,
+which name the streams they can convert (`0:s:1`) rather than asking for the group (`0:s?`).
+`BITMAP_SUBTITLE_CODECS` lists what is provably impossible, not what is known to work: an
+unrecognised codec is mapped and left for FFmpeg to judge, because being wrong that way
+costs a job that can be run again, and being wrong the other way loses a track from a
+library. A dropped stream is named in a warning, and the source is renamed rather than
+deleted, so the track can still be taken from it.
+
+`dvb_teletext` is on that list for a different reason from the rest, and it is why the list
+cannot be derived by reading `ffmpeg -codecs`: teletext is not inherently a picture, but its
+only decoder emits one unless `-txt_format` says otherwise, and the default is `bitmap`.
+Output format as a *decoder option* rather than a codec property is the shape to look for
+before adding anything else. `arib_caption` and `eia_608` come off the same kind of broadcast
+capture and both decode to text, so both are correctly absent.
+
+**A dropped stream that is `forced` is reported differently, and that is all it is.** The
+probe asks for `stream_disposition=forced` in the call it already makes, so a track holding
+the translated signs a scene cannot be followed without costs nothing extra to tell apart
+from a decorative transcript. Nothing acts on the difference — the track is dropped and the
+job succeeds either way — because what *should* happen to a forced bitmap track is an open
+decision. The detection exists so that decision has something to act on, and so a log can
+distinguish a file that now plays a scene untranslated from one that lost a track nobody
+asked for. Adding the disposition changed the probe's CSV to `codec,forced[,language]`;
+`parse_probed_subtitle_line` stops splitting at three fields because FFprobe CSV-quotes a
+language tag containing a comma, and splitting further would read its tail as a field.
+
+Do not reach for `-fix_sub_duration` to resolve overlapping events. It holds each event back
+until the next one arrives so it can bound it, so the final event of every stream is never
+flushed and never reaches the output — silently, on every file. The MP4 muxer already ends a
+text sample where the following one starts, which is the whole of what the flag was there
+for.
 
 **Transcoded output is written to the work folder, then moved.** `FFmpegProcessor::process_job`
 encodes to `job.work_folder_output_path(work_folder)` and only then calls
 `move_to_destination`. This keeps a media server from indexing a half-written `.mp4` sitting
 next to the source. Preserve the write-then-move ordering.
+
+The move itself has to be a copy, because the work root and the media root are routinely on
+different volumes — so it copies to `{output}.{worker}.partial` beside the destination and
+renames that onto the destination, which within one directory is atomic. The destination name
+is therefore only ever taken by a whole file. That matters beyond the media server: `work` and
+`scan` both treat a file at the output path as an encode that is already done, so a copy
+interrupted straight onto the destination would be recorded as a finished job and leave a
+truncated `.mp4` in the library that nothing ever comes back for.
+
+The `{worker}` in that name is the id of the worker doing the copy, and it is what keeps the
+guarantee from depending on the queue never handing one input to two workers — which, as
+above, it cannot promise. Two workers sharing a staging name would copy into one file and each
+rename the splice onto the destination, which is the same corrupt output by another route. The
+id belongs to the worker rather than to the copy so that a worker retrying its own move writes
+over its last part-copy. A `.partial` left by a worker that was killed is nobody's to remove —
+no other worker can tell it from a copy still being made — so it sits in the library until a
+person clears it out. No command reports one.
 
 **A job that a worker stops running comes back, and a job that cannot succeed stops coming
 back.** Both are properties of the same three moves, and both are easy to undo by accident:
@@ -121,6 +194,34 @@ back.** Both are properties of the same three moves, and both are easy to undo b
   what makes the queue addressable. `job_exists` consults `_failed/`, so re-scanning cannot
   walk a parked job back into the queue; moving the file out by hand is what asks for a retry,
   and `clean` empties it along with everything else.
+- **A file in `_in_progress` that is not a job goes to `_failed` too.** Contents that will not
+  parse will not start parsing, and since `job_exists` goes by filename, a job file left there
+  keeps its media file out of the queue for as long as it sits. The sweep renames it into
+  `_failed` and writes the parse error beside it as `{job}.error`. A read that *fails* is left
+  alone: a work root on a network share drops out now and then, and that is worth another
+  sweep rather than a decision.
+
+**`status` is the only way to read the queue, and it only reads.** `src/commands/status.rs`
+walks the same four directories and reports counts, the jobs in `_in_progress` with how long
+since their worker last checked in, and the jobs in `_failed` with their attempt count and
+recorded error. It moves, rewrites and deletes nothing, and deliberately does not call
+`init` - a work root that has never held a job must read as empty rather than be created by
+the act of asking about it, because that reading is the symptom of the `-w` mistake below and
+is what the report says out loud. Whether a job is stranded comes from `queue::last_activity`
+and `STALE_AFTER`, the same two things the sweep uses; a report judging that on its own rule
+would tell users about jobs the sweep will not reclaim. `execute` returns `QueueStatus` and
+rendering is separate, so another consumer reads the state rather than parsing the text.
+
+Reading a queue nothing is holding still means racing it, and two of the three absences
+`status` can meet are not errors. A job file that has *vanished* between the listing and the
+read is a worker's `complete()` doing its job, so it is skipped rather than reported as
+unreadable - only a file still present and unparseable is worth a corruption signal. A queue
+directory that is *absent* reads as empty, but one that cannot be *reached* is an error,
+because answering an unreachable share with the `-w` advice sends a user to change the one
+thing that is right. Windows makes that distinction invisible to `ErrorKind` - it reports
+`ERROR_BAD_NETPATH` as `NotFound` - so `is_absent` checks the raw code there, and narrowing
+it back to the kind alone silently restores the wrong answer on the platform where shared
+work roots are most likely.
 
 Whatever an interrupted encode left in the work folder is left alone by the sweep. Deciding
 what of it is still usable belongs to the encoder, not the queue. What must *not* be left
@@ -227,9 +328,36 @@ Consequences to preserve when changing it:
 
 **A run can be narrowed without changing what canonical means.** `naming::scope_for` splits
 the path a user gave into a `library_root` (the parent of the outermost `Series`/`Anime`/
-`Movies` component) and a `scan_path` (what to walk). Validation walks the scan path and
-judges every file against the root, because a path starting `Season 06/` names no series and
-would be unresolvable. Two consequences that are easy to break:
+`Movies` component *that is actually a root* — see below) and a `scan_path` (what to walk).
+Validation walks the scan path and judges every file against the root, because a path
+starting `Season 06/` names no series and would be unresolvable.
+
+**A component's name does not establish that it is a library root, and only a directory
+holding two of them settles it.** `/srv/Anime` can equally be a media root that *holds*
+`Series/`, `Anime/`, `Movies/`, or the Anime root itself with series directories directly
+inside it. Taking the name at face value reads the first as the second, and then every file
+below looks like a tree nested into itself and the whole library becomes unresolvable at once
+— `validate --fix` inert on all of it. `scope_for` therefore lists each candidate directory
+and skips it when it holds **more than one distinct root** (`holds_library_roots`), falling
+through to the whole path when no candidate survives. This is the only place `naming` reads a
+disk; keep it out of parse/render, and keep the count where it is:
+
+- **One root-named child is not evidence, because it is exactly what `DuplicatedRoot`
+  reports.** `lib/Movies/Series/` is either a media root holding one library or a film
+  directory called `Series`, and `lib/Series/Series/` is either that or a tree rsynced into
+  itself. Reading either as a media root pushes `library_root` a level in, and the damage is
+  an *action*, not a message: the film directory then reads as a `Series` library, an episode
+  inside it earns a canonical destination, and `--fix` builds a season directory inside a film
+  folder. `fix.rs` cannot catch it — the destination came out of `render`; the root beneath it
+  is what is wrong. Leave that case to `parse`.
+- **Two distinct roots is unambiguous**, because no one library contains another.
+- **The residual cost is a refusal, and that is the right way to be wrong.** A media root
+  named after a root that holds exactly one — `/srv/Movies` containing only `Movies/` — is
+  still refused, as are an unreadable directory and a stray *file* named `Series`. Refusing a
+  library is recoverable by hand; a file moved to a wrong root is recoverable only through
+  `undo`, and only if someone notices.
+
+Two further consequences that are easy to break:
 
 - `fix` resolves destinations from `library_root`, never `scan_path`. A destination routinely
   falls outside the scanned subtree — correcting `Season 6` to `Season 06` moves a file into

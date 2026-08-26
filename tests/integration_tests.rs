@@ -5,6 +5,9 @@ use tempfile::TempDir;
 
 use serial_test::serial;
 
+use plexify::queue::JobQueue;
+use plexify::JobPriority;
+
 /// Path to the binary under test.
 ///
 /// Cargo builds the binary before running integration tests and supplies its path
@@ -762,51 +765,39 @@ fn test_plexifyignore_integration() {
     );
 }
 
-/// Test episode prioritization in work command
-#[test]
+/// Episodes are claimed in library order, from paths a real scan produced.
+///
+/// The queue is filled by running `scan` over a directory tree rather than by
+/// building jobs in memory, because that walk is the only thing that produces
+/// the separators and the season directories a worker actually meets.
+#[tokio::test]
 #[serial]
-fn test_episode_prioritization_integration() {
+async fn test_episode_prioritization_integration() {
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path();
 
-    // Create hierarchical directory structure for TV series
-    fs::create_dir_all(temp_path.join("Series/Better Call Saul/Season 01")).unwrap();
-    fs::create_dir_all(temp_path.join("Series/Breaking Bad/Season 01")).unwrap();
-    fs::create_dir_all(temp_path.join("Movies/Action")).unwrap();
+    // Two padded seasons, one unpadded, one `Specials`, and a long-running
+    // series numbered past ninety-nine: the shapes a library holds before
+    // anything has normalised it.
+    let episodes = [
+        "Series/Better Call Saul/Season 01/Better Call Saul S01E02 Mijo.mkv",
+        "Series/Better Call Saul/Season 01/Better Call Saul S01E01 Uno.mkv",
+        "Series/Breaking Bad/Season 1/Breaking Bad S01E03 Gray Matter.mkv",
+        "Series/Breaking Bad/Season 1/Breaking Bad S01E01 Pilot.mkv",
+        "Series/Firefly/Specials/Firefly S00E01 Here's How It Was.mkv",
+        "Anime/One Piece/Season 01/One Piece S01E108 Dashing Onto The Scene.mkv",
+        "Anime/One Piece/Season 01/One Piece S01E99 Spirit Of The Fight.mkv",
+        "Movies/Action/The Matrix (1999).mkv",
+    ];
 
-    // Create episode files in mixed order to test prioritization
-    // Better Call Saul (alphabetically first)
-    fs::write(
-        temp_path.join("Series/Better Call Saul/Season 01/Better Call Saul S01E02 Mijo.mkv"),
-        "dummy content",
-    )
-    .unwrap();
-    fs::write(
-        temp_path.join("Series/Better Call Saul/Season 01/Better Call Saul S01E01 Uno.mkv"),
-        "dummy content",
-    )
-    .unwrap();
+    for episode in episodes {
+        let path = episode
+            .split('/')
+            .fold(temp_path.to_path_buf(), |path, part| path.join(part));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "dummy content").unwrap();
+    }
 
-    // Breaking Bad (alphabetically second)
-    fs::write(
-        temp_path.join("Series/Breaking Bad/Season 01/Breaking Bad S01E03 Gray Matter.mkv"),
-        "dummy content",
-    )
-    .unwrap();
-    fs::write(
-        temp_path.join("Series/Breaking Bad/Season 01/Breaking Bad S01E01 Pilot.mkv"),
-        "dummy content",
-    )
-    .unwrap();
-
-    // Non-episode content (should come last)
-    fs::write(
-        temp_path.join("Movies/Action/The Matrix (1999).mkv"),
-        "dummy content",
-    )
-    .unwrap();
-
-    // First, scan to create jobs
     let scan_output = Command::new(PLEXIFY_BIN)
         .args([
             "scan",
@@ -823,37 +814,36 @@ fn test_episode_prioritization_integration() {
         String::from_utf8_lossy(&scan_output.stderr)
     );
 
-    // Verify jobs were created
-    let queue_dir = temp_path.join("_queue");
-    let job_count = fs::read_dir(&queue_dir)
-        .unwrap()
-        .filter(|entry| entry.as_ref().unwrap().path().extension() == Some("job".as_ref()))
-        .count();
-    assert_eq!(job_count, 5, "Should have created 5 job files");
+    let queue = JobQueue::new(temp_path.to_path_buf(), temp_path.to_path_buf());
+    let mut claimed_order = Vec::new();
+    while let Some(claimed) = queue.claim_job(Some(JobPriority::Episode)).await.unwrap() {
+        claimed_order.push(
+            claimed
+                .job
+                .input_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string(),
+        );
+        claimed.complete().await.unwrap();
+    }
 
-    // Test help command mentions the priority option
-    let help_output = Command::new(PLEXIFY_BIN)
-        .args(["work", "--help"])
-        .output()
-        .expect("Failed to run help command");
+    let expected = [
+        "Better Call Saul S01E01 Uno.mkv",
+        "Better Call Saul S01E02 Mijo.mkv",
+        "Breaking Bad S01E01 Pilot.mkv",
+        "Breaking Bad S01E03 Gray Matter.mkv",
+        "Firefly S00E01 Here's How It Was.mkv",
+        "One Piece S01E99 Spirit Of The Fight.mkv",
+        "One Piece S01E108 Dashing Onto The Scene.mkv",
+        // Nothing parses as an episode here, so the film is claimed last.
+        "The Matrix (1999).mkv",
+    ];
 
-    assert!(help_output.status.success(), "Help command failed");
-
-    let help_text = String::from_utf8_lossy(&help_output.stdout);
-    assert!(
-        help_text.contains("--priority"),
-        "Help should mention priority option: {}",
-        help_text
-    );
-    assert!(
-        help_text.contains("episode"),
-        "Help should mention episode priority option: {}",
-        help_text
-    );
-    assert!(
-        help_text.contains("none"),
-        "Help should mention none priority option: {}",
-        help_text
+    assert_eq!(
+        claimed_order, expected,
+        "jobs were not claimed in series, season and episode order"
     );
 }
 
@@ -1214,4 +1204,161 @@ fn test_undo_rejects_a_file_that_is_not_a_plan() {
         !output.status.success(),
         "undo should refuse a file it did not write"
     );
+}
+
+/// `status` answers for a work root nothing has ever scanned into, and does not
+/// create one by being asked.
+///
+/// This is the shape of the `-w` mistake: `scan` ran in one shell and `work` in
+/// another, so the queue the user is asking about is empty because it is not the
+/// queue they made. Erroring here - or quietly initialising the directories and
+/// reporting four zeroes with no explanation - both fail the user at the one
+/// moment the answer is worth anything.
+#[test]
+fn test_status_explains_a_work_root_that_was_never_scanned_into() {
+    let temp_dir = TempDir::new().unwrap();
+
+    let output = Command::new(PLEXIFY_BIN)
+        .args(["status", "--work-dir", temp_dir.path().to_str().unwrap()])
+        .output()
+        .expect("Failed to execute status command");
+
+    assert!(
+        output.status.success(),
+        "status must answer for an uninitialised work root, not fail on it"
+    );
+
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(text.contains("never held a job"), "got: {text}");
+    assert!(text.contains("-w/--work-dir"), "got: {text}");
+
+    assert!(
+        !temp_dir.path().join("_queue").exists(),
+        "asking about a queue must not create one"
+    );
+}
+
+/// A work root a scan initialised and put nothing in is an empty queue, not the
+/// `-w` mistake above.
+///
+/// Scanning a directory with no media in it is the ordinary way to reach this:
+/// the queue directories get created, no job is enqueued, and the flag names
+/// exactly the right place. Printing the `-w` advice here sends the user to
+/// change the one thing that is correct, which is the same failure the
+/// unreachable work root has.
+#[test]
+#[serial]
+fn test_status_tells_an_empty_queue_apart_from_a_misaddressed_one() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+
+    let scan = Command::new(PLEXIFY_BIN)
+        .args([
+            "scan",
+            temp_path.to_str().unwrap(),
+            "--work-dir",
+            temp_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute scan command");
+    assert!(scan.status.success());
+    assert!(temp_path.join("_queue").is_dir(), "scan must initialise");
+
+    let output = Command::new(PLEXIFY_BIN)
+        .args(["status", "-w", temp_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute status command");
+
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+
+    assert!(text.contains("This queue is empty"), "got: {text}");
+    assert!(!text.contains("never held a job"), "got: {text}");
+    assert!(!text.contains("-w/--work-dir"), "got: {text}");
+}
+
+/// A work root that cannot be listed must fail loudly rather than report an
+/// empty queue, because "empty" here would be a claim about a place we could not
+/// look - and the advice attached to it points at a flag that is not the problem.
+#[test]
+fn test_status_fails_on_a_work_root_it_cannot_read() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // A file where `_queue` should be: a path that exists and cannot be listed,
+    // which is what an unreachable shared work root looks like from here.
+    fs::write(temp_dir.path().join("_queue"), "not a directory").unwrap();
+
+    let output = Command::new(PLEXIFY_BIN)
+        .args(["status", "-w", temp_dir.path().to_str().unwrap()])
+        .output()
+        .expect("Failed to execute status command");
+
+    assert!(
+        !output.status.success(),
+        "a work root that could not be read must not exit 0"
+    );
+
+    // Both streams: the failure is logged through `tracing`, whose fmt layer
+    // writes to stdout, so which one carries it is not this test's business.
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(text.contains("could not be reached"), "got: {text}");
+    assert!(!text.contains("never held a job"), "got: {text}");
+}
+
+/// `status` counts a real queue and names the work root it counted.
+///
+/// The work root is asserted because `-w` defaults to the current working
+/// directory: a report that does not say which queue it read is unusable for the
+/// one mistake it most needs to catch.
+#[test]
+#[serial]
+fn test_status_reports_a_scanned_queue_without_changing_it() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+
+    fs::write(temp_path.join("one.mkv"), "").unwrap();
+    fs::write(temp_path.join("two.mkv"), "").unwrap();
+
+    let scan = Command::new(PLEXIFY_BIN)
+        .args([
+            "scan",
+            temp_path.to_str().unwrap(),
+            "--work-dir",
+            temp_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute scan command");
+    assert!(scan.status.success());
+
+    let mut before: Vec<_> = fs::read_dir(temp_path.join("_queue"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    before.sort();
+    assert_eq!(before.len(), 2);
+
+    let output = Command::new(PLEXIFY_BIN)
+        .args(["status", "-w", temp_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute status command");
+
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+
+    assert!(text.contains("Queued:      2"), "got: {text}");
+    assert!(text.contains("Work root:"), "got: {text}");
+    assert!(!text.contains("never held a job"), "got: {text}");
+
+    // Read-only is the whole contract. Asking must leave the queue exactly as it
+    // was, or `status` is not safe to point at a work root a worker is using.
+    let mut after: Vec<_> = fs::read_dir(temp_path.join("_queue"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    after.sort();
+    assert_eq!(before, after, "status must not move or rewrite anything");
 }

@@ -442,6 +442,7 @@ mod tests {
         ValidationReport {
             scanned_files: issues.len(),
             issues,
+            notes: Vec::new(),
             library_root: root.to_path_buf(),
             scan_path: root.to_path_buf(),
             validation_time: Duration::from_secs(0),
@@ -817,6 +818,7 @@ mod tests {
                 "Series/Elementary/Season 6/Elementary - S06E08 Sand Trap.mkv",
                 "Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap.mkv",
             )],
+            notes: Vec::new(),
             library_root: root.to_path_buf(),
             scan_path: root.join("Series/Elementary/Season 6"),
             validation_time: Duration::from_secs(0),
@@ -835,5 +837,86 @@ mod tests {
             "Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap.mkv"
         )
         .exists());
+    }
+
+    /// Fixing is only safe if it is a fixed point.
+    ///
+    /// A run that renames a file to something the next run would rename again
+    /// never settles, and against a library nobody can reconstruct that is worse
+    /// than doing nothing: the second pass has no memory of the first, so a name
+    /// that gains a component per pass gains one for ever.
+    #[test]
+    fn a_second_fix_run_finds_nothing_left_to_do() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        for path in [
+            "Series/Elementary/Season 6/Elementary - S06E08 Sand Trap.mkv",
+            "Series/Scrubs/Season 9/Scrubs.S09E02.RETAIL.DVDRip.XviD-REWARD.avi",
+            "Series/Breaking Bad (2008) {tvdb-81189}/Season 01/S01E01 - Pilot.mkv",
+            "Series/S01E01/Season 01/S01E01 - x.mkv",
+            "Anime/Cowboy Bebop/Cowboy Bebop - s01e05 - Ballad.mkv",
+        ] {
+            touch(root, path);
+        }
+
+        let first = apply(&plan(&assess_tree(root)), &root.join("first.json")).unwrap();
+        assert!(
+            !first.applied.is_empty(),
+            "the first run should have had work to do"
+        );
+
+        let second = apply(&plan(&assess_tree(root)), &root.join("second.json")).unwrap();
+
+        assert!(
+            second.applied.is_empty(),
+            "the first run left names the second one moves again: {:?}",
+            second.applied
+        );
+        assert!(
+            absolute(root, "Series/S01E01/Season 01/S01E01 - x.mkv").exists(),
+            "a directory that names no series is reported, not renamed around"
+        );
+    }
+
+    /// What `validate` produces, without the walker: assess every file under
+    /// `root` and collect the renames.
+    fn assess_tree(root: &Path) -> ValidationReport {
+        let mut files = Vec::new();
+        collect_files(root, &mut files);
+        files.sort();
+
+        let issues = files
+            .iter()
+            .filter_map(|file| {
+                let relative = file.strip_prefix(root).ok()?;
+                match crate::naming::assess(relative) {
+                    crate::naming::Assessment::Rename { destination } => Some(ValidationIssue {
+                        path: crate::paths::to_forward_slashes(relative),
+                        kind: IssueKind::Rename { destination },
+                    }),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        report(root, issues)
+    }
+
+    fn collect_files(directory: &Path, found: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(directory) else {
+            return;
+        };
+
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_files(&path, found);
+            } else if path
+                .extension()
+                .is_some_and(|extension| is_media_extension(&extension.to_string_lossy()))
+            {
+                found.push(path);
+            }
+        }
     }
 }
