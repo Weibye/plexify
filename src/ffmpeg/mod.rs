@@ -4,8 +4,6 @@ use std::process::Stdio;
 use tokio::process::Command;
 use tracing::{debug, error, info, warn};
 
-use uuid::Uuid;
-
 use crate::job::{Job, MediaFileType, QualitySettings};
 use crate::paths::to_forward_slashes;
 
@@ -262,26 +260,6 @@ pub fn chunk_dir_for(job: &Job, work_folder: &Path) -> PathBuf {
 /// Records the settings a chunk directory's contents were encoded with.
 const CHUNK_SETTINGS_FILE: &str = "settings.json";
 
-/// Where a finished output is copied to before it is renamed onto its
-/// destination.
-///
-/// It sits in the destination directory, because a rename is only atomic within
-/// one filesystem, and carries a suffix no part of the pipeline treats as media
-/// so that a copy which never finished cannot be taken for an encode that did.
-///
-/// The name carries `worker_id` because a staging name shared between workers is
-/// a second way to arrive at the corrupt output the staging name exists to
-/// prevent: two workers holding one input would copy into one file and each
-/// rename the splice onto the destination, which every later run then accepts as
-/// a finished encode. The id belongs to the worker rather than to the call so
-/// that a worker retrying a move writes over its own last attempt instead of
-/// leaving another part-copy beside the destination.
-pub fn staging_path_for(final_output_path: &Path, worker_id: &Uuid) -> PathBuf {
-    let mut staging = final_output_path.as_os_str().to_os_string();
-    staging.push(format!(".{worker_id}.partial"));
-    PathBuf::from(staging)
-}
-
 /// One piece of a resumable encode.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Chunk {
@@ -385,9 +363,6 @@ impl Default for Chunking {
 pub struct FFmpegProcessor {
     background_mode: bool,
     chunking: Chunking,
-    /// Tells this worker's staging files apart from every other worker's. See
-    /// [`staging_path_for`].
-    worker_id: Uuid,
 }
 
 impl FFmpegProcessor {
@@ -395,7 +370,6 @@ impl FFmpegProcessor {
         Self {
             background_mode,
             chunking: Chunking::default(),
-            worker_id: Uuid::new_v4(),
         }
     }
 
@@ -887,20 +861,7 @@ impl FFmpegProcessor {
         }
     }
 
-    /// Move completed file from work folder to media folder.
-    ///
-    /// The work root and the media root are routinely on different volumes, so
-    /// the file has to be copied rather than renamed - and a copy is not atomic.
-    /// It therefore goes to a staging name beside the destination and is renamed
-    /// onto the destination from there, which within one directory is atomic. A
-    /// media server sees the output either absent or whole, and a copy that dies
-    /// part-way leaves a `.partial` that no later run mistakes for a finished
-    /// encode: [`Job::output_exists`] does not accept it, so the job is tried
-    /// again rather than recorded as done.
-    ///
-    /// The staging name is this worker's alone ([`staging_path_for`]), so two
-    /// workers that both end up holding one input cannot splice their copies
-    /// together into one file and land it at the destination.
+    /// Move completed file from work folder to media folder
     pub async fn move_to_destination(
         &self,
         job: &Job,
@@ -923,27 +884,8 @@ impl FFmpegProcessor {
         }
 
         // Move the file from work folder to final location
-        let staging_path = staging_path_for(&final_output_path, &self.worker_id);
-
-        if let Err(e) = tokio::fs::copy(&work_output_path, &staging_path).await {
-            let _ = tokio::fs::remove_file(&staging_path).await;
-            return Err(anyhow!("Failed to copy output to {staging_path:?}: {e}"));
-        }
-
-        if let Err(e) = tokio::fs::rename(&staging_path, &final_output_path).await {
-            let _ = tokio::fs::remove_file(&staging_path).await;
-            return Err(anyhow!(
-                "Failed to move output into place at {final_output_path:?}: {e}"
-            ));
-        }
-
-        // The output is where it belongs, so the move has succeeded. A work file
-        // that will not delete is worth a word but not a failed job: reporting
-        // failure here would send the job round again to find its own finished
-        // output at the destination.
-        if let Err(e) = tokio::fs::remove_file(&work_output_path).await {
-            warn!("Could not remove {work_output_path:?} after moving it: {e}");
-        }
+        tokio::fs::copy(&work_output_path, &final_output_path).await?;
+        tokio::fs::remove_file(&work_output_path).await?;
 
         info!(
             "📁 Moved completed file: {:?} -> {:?}",
@@ -2203,202 +2145,5 @@ mod tests {
 
         let content = tokio::fs::read_to_string(&final_path).await.unwrap();
         assert_eq!(content, "test content");
-    }
-
-    /// A job whose output goes to `media/`, with the finished encode already
-    /// sitting in the work folder waiting to be moved.
-    async fn job_ready_to_move(temp_dir: &TempDir) -> (Job, PathBuf) {
-        let work_folder = temp_dir.path().join("work");
-        let media_folder = temp_dir.path().join("media");
-        tokio::fs::create_dir_all(&work_folder).await.unwrap();
-        tokio::fs::create_dir_all(&media_folder).await.unwrap();
-
-        let job = Job::new(
-            PathBuf::from("film.mkv"),
-            MediaFileType::Mkv,
-            QualitySettings::default(),
-            PostProcessingSettings {
-                disable_source_files: false,
-            },
-            &media_folder,
-        );
-
-        tokio::fs::write(job.work_folder_output_path(&work_folder), "a whole encode")
-            .await
-            .unwrap();
-
-        (job, work_folder)
-    }
-
-    #[tokio::test]
-    async fn a_move_that_fails_leaves_nothing_the_pipeline_calls_finished() {
-        let temp_dir = TempDir::new().unwrap();
-        let (job, work_folder) = job_ready_to_move(&temp_dir).await;
-        let final_path = job.full_output_path(None);
-
-        let processor = FFmpegProcessor::new(false);
-
-        // A directory in the way of the staging name is a copy that cannot
-        // start, standing in for the disk filling up or the share dropping out
-        // half way through one.
-        let staging_path = staging_path_for(&final_path, &processor.worker_id);
-        tokio::fs::create_dir(&staging_path).await.unwrap();
-
-        assert!(processor
-            .move_to_destination(&job, None, &work_folder)
-            .await
-            .is_err());
-
-        assert!(
-            !final_path.exists(),
-            "the destination name is only ever taken by a finished file"
-        );
-        assert!(
-            !job.output_exists(None),
-            "a job whose move failed must be tried again, not recorded as done"
-        );
-        assert!(
-            job.work_folder_output_path(&work_folder).exists(),
-            "the encode that was not moved stays where the next attempt looks"
-        );
-
-        // And the next attempt, with the obstruction gone, completes the move.
-        tokio::fs::remove_dir(&staging_path).await.unwrap();
-        processor
-            .move_to_destination(&job, None, &work_folder)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            tokio::fs::read_to_string(&final_path).await.unwrap(),
-            "a whole encode"
-        );
-        assert!(!staging_path.exists());
-        assert!(!job.work_folder_output_path(&work_folder).exists());
-    }
-
-    #[tokio::test]
-    async fn a_part_copied_file_left_by_a_killed_move_is_not_taken_for_the_output() {
-        let temp_dir = TempDir::new().unwrap();
-        let (job, work_folder) = job_ready_to_move(&temp_dir).await;
-        let final_path = job.full_output_path(None);
-        let processor = FFmpegProcessor::new(false);
-        let staging_path = staging_path_for(&final_path, &processor.worker_id);
-
-        // What a worker killed mid-copy leaves behind: some of the bytes, under
-        // the staging name. This worker's own, because a worker retrying its
-        // move is the case that has to write over it rather than around it.
-        tokio::fs::write(&staging_path, "a whole").await.unwrap();
-
-        assert!(
-            !job.output_exists(None),
-            "debris from an interrupted copy is not an output"
-        );
-
-        processor
-            .move_to_destination(&job, None, &work_folder)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            tokio::fs::read_to_string(&final_path).await.unwrap(),
-            "a whole encode",
-            "the retry writes over the debris rather than around it"
-        );
-        assert!(!staging_path.exists());
-    }
-
-    #[test]
-    fn two_workers_stage_one_destination_under_names_of_their_own() {
-        let final_path = PathBuf::from("/library/Series/Show/Show - S01E01.mp4");
-
-        let one = FFmpegProcessor::new(false);
-        let other = FFmpegProcessor::new(false);
-
-        assert_ne!(
-            staging_path_for(&final_path, &one.worker_id),
-            staging_path_for(&final_path, &other.worker_id),
-            "two workers holding one input must not copy into one file"
-        );
-
-        // A worker's own staging name does not move under it between the copy
-        // and the rename, so a retry writes over its last part-copy.
-        assert_eq!(
-            staging_path_for(&final_path, &one.worker_id),
-            staging_path_for(&final_path, &one.worker_id)
-        );
-
-        // And whatever the name, the pipeline still reads it as staging debris
-        // rather than as media.
-        assert_eq!(
-            staging_path_for(&final_path, &one.worker_id)
-                .extension()
-                .unwrap(),
-            "partial"
-        );
-    }
-
-    #[tokio::test]
-    async fn two_workers_moving_one_output_do_not_splice_their_copies() {
-        let temp_dir = TempDir::new().unwrap();
-        let media_folder = temp_dir.path().join("media");
-        tokio::fs::create_dir_all(&media_folder).await.unwrap();
-
-        let job = Job::new(
-            PathBuf::from("film.mkv"),
-            MediaFileType::Mkv,
-            QualitySettings::default(),
-            PostProcessingSettings {
-                disable_source_files: false,
-            },
-            &media_folder,
-        );
-        let final_path = job.full_output_path(None);
-
-        // Two workers that both ended up holding this input - the queue is
-        // meant to prevent it, but the destination is a media library and the
-        // cost of being wrong is a file nobody can reconstruct. Each has its
-        // own encode of the same source, big enough that the two copies are in
-        // flight at the same time.
-        let encodes = [(b'a', "one"), (b'b', "other")].map(|(byte, name)| {
-            let work_folder = temp_dir.path().join(name);
-            std::fs::create_dir_all(&work_folder).unwrap();
-            let content = vec![byte; 8 * 1024 * 1024];
-            std::fs::write(job.work_folder_output_path(&work_folder), &content).unwrap();
-            (FFmpegProcessor::new(false), work_folder, content)
-        });
-        let [(one, one_work, one_content), (other, other_work, other_content)] = &encodes;
-
-        let (first, second) = tokio::join!(
-            one.move_to_destination(&job, None, one_work),
-            other.move_to_destination(&job, None, other_work)
-        );
-        first.unwrap();
-        second.unwrap();
-
-        // Whichever rename landed last, the destination holds one worker's
-        // encode from end to end. A shared staging name would leave the two
-        // interleaved, and `output_exists` would call that finished.
-        let landed = tokio::fs::read(&final_path).await.unwrap();
-        assert!(
-            &landed == one_content || &landed == other_content,
-            "the destination holds {} bytes that are neither encode",
-            landed.len()
-        );
-
-        let mut left_behind = Vec::new();
-        let mut entries = std::fs::read_dir(&media_folder).unwrap();
-        while let Some(Ok(entry)) = entries.next() {
-            left_behind.push(entry.file_name().to_string_lossy().to_string());
-        }
-        assert_eq!(
-            left_behind,
-            vec![final_path
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .to_string()],
-            "each worker takes its own staging file with it"
-        );
     }
 }

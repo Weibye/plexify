@@ -85,21 +85,6 @@ impl WorkCommand {
                     .await;
             }
         }
-        if !swept.unreadable.is_empty() {
-            error!(
-                "🚫 Moved {} unreadable job file(s) to _failed; the parse error is beside each one.",
-                swept.unreadable.len()
-            );
-
-            // Nothing will come back for these either, so the same reasoning as
-            // for a parked job applies to whatever they left half-encoded.
-            for job_name in &swept.unreadable {
-                let job_id = job_name.trim_end_matches(".job");
-                processor
-                    .discard_work_for_id(job_id, &queue.in_progress_dir)
-                    .await;
-            }
-        }
 
         // Set up signal handling for graceful shutdown
         tokio::pin! {
