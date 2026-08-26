@@ -61,33 +61,32 @@ impl JobQueue {
         Ok(())
     }
 
-    /// Add a job to the queue using atomic file operations
+    /// Add a job to the queue.
+    ///
+    /// The job is written under a staging name and renamed into place. Rename is
+    /// atomic and the job filename is the v5 id of the input path, so two
+    /// scanners racing on one file end up with one job file holding one of two
+    /// identical writes - the same outcome a claim on the name would give, with
+    /// nothing left behind to clean up.
+    ///
+    /// That last part is why the name is not claimed with a marker of its own: a
+    /// scanner interrupted after taking a name and before writing the job would
+    /// leave the name taken with no job under it, and every later scan would
+    /// then skip a file that is in no queue directory at all.
     pub async fn enqueue_job(&self, job: &Job) -> Result<()> {
-        let job_content = serde_json::to_string_pretty(job)?;
         let job_filename = job.job_filename();
         let job_path = self.queue_dir.join(&job_filename);
-        let lock_dir = self.queue_dir.join(format!("{job_filename}.lock"));
 
-        // Use a lock directory for atomic job creation
-        if async_fs::create_dir(&lock_dir).await.is_err() {
-            debug!("Job already being created: {}", job_filename);
-            return Ok(()); // Job is already being created by another process
-        }
+        write_job_atomically(&job_path, job)
+            .await
+            .map_err(|e| anyhow!("Failed to create job file: {e}"))?;
 
-        // Write job file
-        match async_fs::write(&job_path, job_content.as_bytes()).await {
-            Ok(_) => {
-                debug!("Created job: {}", job_filename);
-                // Remove lock directory
-                let _ = async_fs::remove_dir(&lock_dir).await;
-                Ok(())
-            }
-            Err(e) => {
-                // Clean up lock directory on error
-                let _ = async_fs::remove_dir(&lock_dir).await;
-                Err(anyhow!("Failed to create job file: {e}"))
-            }
-        }
+        // A lock directory left in the queue by an older writer is debris: names
+        // are no longer claimed that way, and a job now sits beside it.
+        let _ = async_fs::remove_dir(self.queue_dir.join(format!("{job_filename}.lock"))).await;
+
+        debug!("Created job: {}", job_filename);
+        Ok(())
     }
 
     /// Atomically claim a job from the queue with optional prioritization
@@ -293,24 +292,34 @@ impl JobQueue {
                 continue;
             }
 
-            match self.reclaim_one(path, &job_name).await {
-                Ok(Some(disposition)) => {
-                    let _ = async_fs::remove_file(&heartbeat_path).await;
-                    match disposition {
-                        FailureDisposition::Requeued { .. } => {
-                            info!("♻️ Reclaimed abandoned job: {job_name}");
-                            outcome.reclaimed.push(job_name);
-                        }
-                        FailureDisposition::Parked { attempts } => {
-                            warn!(
-                                "🚫 {job_name} has taken down {attempts} workers; parking it in _failed."
-                            );
-                            outcome.parked.push(job_name);
-                        }
-                    }
+            let reclaimed = match self.reclaim_one(path, &job_name).await {
+                Ok(reclaimed) => reclaimed,
+                Err(e) => {
+                    warn!("Could not reclaim {job_name}: {e}");
+                    continue;
                 }
-                Ok(None) => debug!("Another worker got to {job_name} first"),
-                Err(e) => warn!("Could not reclaim {job_name}: {e}"),
+            };
+
+            if reclaimed.moved_the_job() {
+                let _ = async_fs::remove_file(&heartbeat_path).await;
+            }
+
+            match reclaimed {
+                Reclaimed::Lost => debug!("Another worker got to {job_name} first"),
+                Reclaimed::Counted(FailureDisposition::Requeued { .. }) => {
+                    info!("♻️ Reclaimed abandoned job: {job_name}");
+                    outcome.reclaimed.push(job_name);
+                }
+                Reclaimed::Counted(FailureDisposition::Parked { attempts }) => {
+                    warn!(
+                        "🚫 {job_name} has taken down {attempts} workers; parking it in _failed."
+                    );
+                    outcome.parked.push(job_name);
+                }
+                Reclaimed::Unreadable => {
+                    warn!("🚫 {job_name} is not readable as a job; moving it to _failed.");
+                    outcome.unreadable.push(job_name);
+                }
             }
         }
 
@@ -336,15 +345,26 @@ impl JobQueue {
     /// forever, at the cost of a worker each time round rather than ten seconds.
     /// It is the same loop `_failed` exists to break, so it ends the same way.
     ///
-    /// `Ok(None)` means another worker got there first, which is not an error:
-    /// the move is a rename, and the loser of a race simply does nothing.
+    /// [`Reclaimed::Lost`] means another worker got there first, which is not an
+    /// error: the move is a rename, and the loser of a race simply does nothing.
     async fn reclaim_one(
         &self,
         in_progress_path: &std::path::Path,
         job_name: &str,
-    ) -> Result<Option<FailureDisposition>> {
+    ) -> Result<Reclaimed> {
         let content = async_fs::read_to_string(in_progress_path).await?;
-        let mut job: Job = serde_json::from_str(&content)?;
+
+        // A read that failed is worth another sweep - a network work root drops
+        // out from under a worker now and then - but contents that are not a job
+        // will not become one, and nothing else ever looks in `_in_progress`.
+        let mut job: Job = match serde_json::from_str(&content) {
+            Ok(job) => job,
+            Err(e) => {
+                return self
+                    .quarantine_unreadable(in_progress_path, job_name, &e.to_string())
+                    .await
+            }
+        };
 
         job.attempts += 1;
         job.last_error = Some(format!(
@@ -355,11 +375,9 @@ impl JobQueue {
         let attempts = job.attempts;
         let park = attempts >= MAX_ATTEMPTS;
 
-        async_fs::write(
-            in_progress_path,
-            serde_json::to_string_pretty(&job)?.as_bytes(),
-        )
-        .await?;
+        // The count goes in under a staging name and is renamed over the job, so
+        // a sweeper interrupted here leaves a job file that still parses.
+        write_job_atomically(in_progress_path, &job).await?;
 
         let destination = if park {
             self.failed_dir.join(job_name)
@@ -371,10 +389,44 @@ impl JobQueue {
         }
 
         match async_fs::rename(in_progress_path, &destination).await {
-            Ok(_) if park => Ok(Some(FailureDisposition::Parked { attempts })),
-            Ok(_) => Ok(Some(FailureDisposition::Requeued { attempts })),
-            Err(_) => Ok(None),
+            Ok(_) if park => Ok(Reclaimed::Counted(FailureDisposition::Parked { attempts })),
+            Ok(_) => Ok(Reclaimed::Counted(FailureDisposition::Requeued {
+                attempts,
+            })),
+            Err(_) => Ok(Reclaimed::Lost),
         }
+    }
+
+    /// Move a job file that cannot be read as a job out of `_in_progress`.
+    ///
+    /// Contents that are not a job are not going to become one, so a sweep that
+    /// only warned about them would warn on every worker startup forever, while
+    /// `job_exists` - which goes by filename - kept the media file out of the
+    /// queue for just as long. `_failed` is where a person already looks for a
+    /// job that needs a decision, and the parse error goes beside it.
+    async fn quarantine_unreadable(
+        &self,
+        in_progress_path: &std::path::Path,
+        job_name: &str,
+        reason: &str,
+    ) -> Result<Reclaimed> {
+        async_fs::create_dir_all(&self.failed_dir).await?;
+        let destination = self.failed_dir.join(job_name);
+
+        // A rename, like every other move between these directories, so two
+        // sweepers cannot both take the same file.
+        if async_fs::rename(in_progress_path, &destination)
+            .await
+            .is_err()
+        {
+            return Ok(Reclaimed::Lost);
+        }
+
+        let mut note = destination.into_os_string();
+        note.push(".error");
+        let _ = async_fs::write(PathBuf::from(note), reason.as_bytes()).await;
+
+        Ok(Reclaimed::Unreadable)
     }
 
     /// Clean up all queue directories
@@ -412,6 +464,33 @@ impl JobQueue {
     }
 }
 
+/// Write a job file so that it is never observed half-written.
+///
+/// The contents go to a staging name of their own and are renamed onto the job
+/// path, which replaces whatever is there in one step. A writer killed part-way
+/// through therefore leaves either the previous job file or nothing - never a
+/// torn file that no later run can parse - and the staging name carries a v4
+/// uuid so that two writers cannot tear each other's copy.
+async fn write_job_atomically(job_path: &std::path::Path, job: &Job) -> Result<()> {
+    let content = serde_json::to_string_pretty(job)?;
+
+    let mut staging = job_path.as_os_str().to_os_string();
+    staging.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    let staging = PathBuf::from(staging);
+
+    if let Err(e) = async_fs::write(&staging, content.as_bytes()).await {
+        let _ = async_fs::remove_file(&staging).await;
+        return Err(anyhow!("could not write {staging:?}: {e}"));
+    }
+
+    if let Err(e) = async_fs::rename(&staging, job_path).await {
+        let _ = async_fs::remove_file(&staging).await;
+        return Err(anyhow!("could not move {staging:?} into place: {e}"));
+    }
+
+    Ok(())
+}
+
 /// The last `limit` characters of a message, marked as truncated if anything
 /// was dropped.
 fn tail(message: &str, limit: usize) -> String {
@@ -431,12 +510,32 @@ pub struct SweepOutcome {
     pub reclaimed: Vec<String>,
     /// Jobs that have now taken down `MAX_ATTEMPTS` workers and were parked.
     pub parked: Vec<String>,
+    /// Job files that could not be read as jobs and were moved to `_failed`.
+    pub unreadable: Vec<String>,
 }
 
 impl SweepOutcome {
     /// Whether the sweep moved anything at all.
     pub fn is_empty(&self) -> bool {
-        self.reclaimed.is_empty() && self.parked.is_empty()
+        self.reclaimed.is_empty() && self.parked.is_empty() && self.unreadable.is_empty()
+    }
+}
+
+/// What the sweep did with one file in `_in_progress`.
+enum Reclaimed {
+    /// The attempt was counted and the job moved on, to `_queue` or `_failed`.
+    Counted(FailureDisposition),
+    /// The file could not be read as a job and was moved to `_failed`.
+    Unreadable,
+    /// Another sweeper moved the file first; this one did nothing.
+    Lost,
+}
+
+impl Reclaimed {
+    /// Whether this sweep is the one that moved the file out of `_in_progress`,
+    /// and so the one that owns whatever was left beside it.
+    fn moved_the_job(&self) -> bool {
+        !matches!(self, Reclaimed::Lost)
     }
 }
 
@@ -564,9 +663,10 @@ impl<'a> ClaimedJob<'a> {
         let park = attempts >= MAX_ATTEMPTS;
 
         // Rewrite in place first, then move: the move stays a rename, which is
-        // what keeps two workers from both getting the job.
-        let content = serde_json::to_string_pretty(&self.job)?;
-        async_fs::write(&self.in_progress_path, content.as_bytes()).await?;
+        // what keeps two workers from both getting the job. The rewrite is
+        // itself a rename onto the job file, so a worker killed here leaves a
+        // job the next sweep can still read.
+        write_job_atomically(&self.in_progress_path, &self.job).await?;
 
         let destination = if park {
             self.queue.failed_dir.join(&self.job_name)
@@ -615,6 +715,8 @@ mod tests {
     use super::*;
     use crate::job::{Job, MediaFileType, PostProcessingSettings, QualitySettings};
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::test;
 
@@ -623,9 +725,6 @@ mod tests {
     /// Dropping the claim is what an interrupted worker does: the job file
     /// stays in `_in_progress` and the heartbeat stops being refreshed.
     async fn queue_with_one_claimed_job(temp_dir: &TempDir) -> (JobQueue, String) {
-        let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
-        queue.init().await.unwrap();
-
         let job = Job::new(
             PathBuf::from("show.mkv"),
             MediaFileType::Mkv,
@@ -633,7 +732,15 @@ mod tests {
             PostProcessingSettings::default(),
             temp_dir.path(),
         );
-        queue.enqueue_job(&job).await.unwrap();
+        queue_with_one_claimed_job_for(temp_dir, &job).await
+    }
+
+    /// As above, for a job the caller has built itself.
+    async fn queue_with_one_claimed_job_for(temp_dir: &TempDir, job: &Job) -> (JobQueue, String) {
+        let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        queue.init().await.unwrap();
+
+        queue.enqueue_job(job).await.unwrap();
 
         let job_name = {
             let claimed = queue.claim_job(None).await.unwrap().unwrap();
@@ -641,6 +748,74 @@ mod tests {
         };
 
         (queue, job_name)
+    }
+
+    /// A job whose file is too big to be written in one go, so that a reader
+    /// running alongside a writer lands inside the write rather than between
+    /// two of them. Only the length of the path matters; nothing opens it.
+    fn a_job_whose_file_takes_a_while_to_write(media_root: &Path) -> Job {
+        Job::new(
+            PathBuf::from(format!("{}.mkv", "l".repeat(64 * 1024))),
+            MediaFileType::Mkv,
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            media_root,
+        )
+    }
+
+    /// Watches a job file from a thread of its own and reports every moment it
+    /// held less than a whole job.
+    ///
+    /// This is the only way to observe the difference a staged write makes.
+    /// Writing straight to the job path truncates it first, so for as long as
+    /// the write runs the path holds a file that is there and is not a job -
+    /// which is what the next reader of that path gets. Writing to a staging
+    /// name and renaming means the path only ever holds one whole version or
+    /// the other, and this thread finds nothing.
+    ///
+    /// It samples the length rather than parsing the contents because a sample
+    /// has to be cheap to be dense: a read of the whole file takes longer than
+    /// the write it is trying to catch.
+    struct Reader {
+        stop: Arc<AtomicBool>,
+        thread: std::thread::JoinHandle<Vec<u64>>,
+    }
+
+    impl Reader {
+        /// Watch `path`, where a whole job is at least `whole` bytes long.
+        fn watching(path: PathBuf, whole: u64) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let until = Arc::clone(&stop);
+
+            let thread = std::thread::spawn(move || {
+                let mut torn = Vec::new();
+                while !until.load(Ordering::Relaxed) {
+                    // A file that is momentarily absent, or that the OS will
+                    // not hand over while it is being replaced, is not an
+                    // observation: the question is only what a reader that does
+                    // get an answer is told.
+                    // Through an open handle, because the length in a
+                    // directory entry lags behind the file itself.
+                    if let Ok(file) = std::fs::File::open(&path) {
+                        if let Ok(metadata) = file.metadata() {
+                            if metadata.len() < whole {
+                                torn.push(metadata.len());
+                            }
+                        }
+                    }
+                }
+                torn
+            });
+
+            Self { stop, thread }
+        }
+
+        /// Stop watching, and give back the length of every partial job file
+        /// that was on the path while it ran.
+        fn stop(self) -> Vec<u64> {
+            self.stop.store(true, Ordering::Relaxed);
+            self.thread.join().unwrap()
+        }
     }
 
     /// The heartbeat file that belongs to a claimed job.
@@ -960,6 +1135,207 @@ mod tests {
         let job: Job = serde_json::from_str(legacy).unwrap();
         assert_eq!(job.attempts, 0);
         assert_eq!(job.last_error, None);
+    }
+
+    #[test]
+    async fn a_lock_left_by_an_interrupted_scan_does_not_keep_a_file_out_of_the_queue() {
+        let temp_dir = TempDir::new().unwrap();
+        let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        queue.init().await.unwrap();
+
+        let job = Job::new(
+            PathBuf::from("show.mkv"),
+            MediaFileType::Mkv,
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            temp_dir.path(),
+        );
+
+        // A scan that stopped after taking the name and before writing the job.
+        // Nothing in any queue directory records the file, so no later run has
+        // any way to notice it was missed.
+        let lock_dir = queue.queue_dir.join(format!("{}.lock", job.job_filename()));
+        std::fs::create_dir(&lock_dir).unwrap();
+        assert!(!queue.job_exists(&job).await.unwrap());
+
+        queue.enqueue_job(&job).await.unwrap();
+
+        assert!(
+            queue.queue_dir.join(job.job_filename()).exists(),
+            "a name taken by a scan that died must not be taken forever"
+        );
+        assert!(!lock_dir.exists(), "the debris is cleared away with it");
+
+        let claimed = queue.claim_job(None).await.unwrap().unwrap();
+        assert!(claimed.job.input_path.ends_with("show.mkv"));
+    }
+
+    #[test]
+    async fn two_scans_of_one_library_never_leave_a_reader_half_a_job() {
+        let temp_dir = TempDir::new().unwrap();
+        let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        queue.init().await.unwrap();
+
+        let job = a_job_whose_file_takes_a_while_to_write(temp_dir.path());
+        let job_path = queue.queue_dir.join(job.job_filename());
+
+        // The job is on disk before the racing scans start, so a reader that
+        // finds nothing there has found a job file mid-rewrite - which is what
+        // a worker claiming from this queue would be reading.
+        queue.enqueue_job(&job).await.unwrap();
+        let whole = std::fs::metadata(&job_path).unwrap().len();
+        let reader = Reader::watching(job_path.clone(), whole);
+
+        // Two scanners on one work root, writing the same file at the same
+        // time, over a job file that is already there. Repeatedly, because the
+        // write is a small part of what a scan does and the question is
+        // whether the window exists at all.
+        for _ in 0..40 {
+            let (first, second) = tokio::join!(queue.enqueue_job(&job), queue.enqueue_job(&job));
+            first.unwrap();
+            second.unwrap();
+        }
+
+        let torn = reader.stop();
+        assert!(
+            torn.is_empty(),
+            "a scan left the job path holding {torn:?} bytes, which is not a job"
+        );
+
+        let mut job_files = Vec::new();
+        let mut entries = std::fs::read_dir(&queue.queue_dir).unwrap();
+        while let Some(Ok(entry)) = entries.next() {
+            job_files.push(entry.file_name().to_string_lossy().to_string());
+        }
+
+        assert_eq!(
+            job_files,
+            vec![job.job_filename()],
+            "one file means one job, and no staging debris beside it"
+        );
+
+        // The one job that survived is a whole one, not two interleaved writes.
+        let queued: Job = serde_json::from_str(
+            &std::fs::read_to_string(queue.queue_dir.join(job.job_filename())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(queued.id, job.id);
+    }
+
+    #[test]
+    async fn a_job_file_that_cannot_be_read_is_moved_out_of_the_way() {
+        let temp_dir = TempDir::new().unwrap();
+        let (queue, job_name) = queue_with_one_claimed_job(&temp_dir).await;
+        let in_progress_path = queue.in_progress_dir.join(&job_name);
+
+        // A job file that is not a job - a torn write from an older worker, or a
+        // network work root that dropped out mid-rewrite. Nothing but the sweep
+        // ever looks in `_in_progress`, so left in place it is warned about at
+        // every startup and never resolved.
+        std::fs::write(&in_progress_path, b"{\"id\": \"half a job").unwrap();
+        age(
+            &[&in_progress_path, &heartbeat_of(&in_progress_path)],
+            Duration::from_secs(600),
+        );
+
+        let swept = queue
+            .reclaim_stranded_jobs(Duration::from_secs(300))
+            .await
+            .unwrap();
+
+        assert_eq!(swept.unreadable, vec![job_name.clone()]);
+        assert!(swept.reclaimed.is_empty() && swept.parked.is_empty());
+        assert!(!in_progress_path.exists());
+        assert!(queue.failed_dir.join(&job_name).exists());
+        assert!(
+            !heartbeat_of(&in_progress_path).exists(),
+            "the heartbeat goes with the job it belonged to"
+        );
+
+        // Why it could not be read is recorded where a person will find it.
+        let note = std::fs::read_to_string(queue.failed_dir.join(format!("{job_name}.error")))
+            .expect("the parse error is written beside the job");
+        assert!(!note.is_empty());
+
+        // And the next worker has nothing left to warn about.
+        let swept = queue
+            .reclaim_stranded_jobs(Duration::from_secs(300))
+            .await
+            .unwrap();
+        assert!(swept.is_empty());
+    }
+
+    #[test]
+    async fn recording_an_attempt_never_leaves_a_reader_half_a_job() {
+        let temp_dir = TempDir::new().unwrap();
+        let job = a_job_whose_file_takes_a_while_to_write(temp_dir.path());
+        let (queue, job_name) = queue_with_one_claimed_job_for(&temp_dir, &job).await;
+        let in_progress_path = queue.in_progress_dir.join(&job_name);
+
+        // Debris under a staging name from a sweeper that was killed part way
+        // through a rewrite of its own. The sweep judges jobs, and this is not
+        // one: it must be left where it is and counted as nothing.
+        let mut debris = in_progress_path.as_os_str().to_os_string();
+        debris.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
+        let debris = PathBuf::from(debris);
+        std::fs::write(&debris, b"{\"id\": \"half a job").unwrap();
+
+        // The sweep records an attempt against the job before it moves it, and
+        // that rewrite is the moment a reader can catch it. Nothing but the
+        // sweep looks in `_in_progress`, so the reader here stands for the
+        // second sweeper: two workers starting together is the ordinary case.
+        // A rewrite only ever adds to a job - an attempt count, an error - so
+        // anything shorter than the job as claimed is a write in flight.
+        let whole = std::fs::metadata(&in_progress_path).unwrap().len();
+        let reader = Reader::watching(in_progress_path.clone(), whole);
+
+        // The rewrite is a small part of what a sweep does, so one sweep is a
+        // thin sample of a window that must not exist at all. Each round puts
+        // the job back as it was and abandons it again.
+        for _ in 0..40 {
+            age(
+                &[&in_progress_path, &heartbeat_of(&in_progress_path)],
+                Duration::from_secs(600),
+            );
+
+            let swept = queue
+                .reclaim_stranded_jobs(Duration::from_secs(300))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                swept.reclaimed,
+                vec![job_name.clone()],
+                "a job whose worker stopped goes back to the queue"
+            );
+            assert!(
+                swept.parked.is_empty() && swept.unreadable.is_empty(),
+                "the sweep judges jobs, and a staging file is not one"
+            );
+
+            let requeued: Job = serde_json::from_str(
+                &std::fs::read_to_string(queue.queue_dir.join(&job_name)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(requeued.attempts, 1);
+
+            // Put the job back as the last worker found it and abandon it
+            // again, so the next round is the same round.
+            queue.enqueue_job(&job).await.unwrap();
+            let claimed = queue.claim_job(None).await.unwrap().unwrap();
+            drop(claimed);
+        }
+
+        let torn = reader.stop();
+        assert!(
+            torn.is_empty(),
+            "a sweep left the job path holding {torn:?} bytes, which is not a job"
+        );
+
+        assert!(
+            debris.exists(),
+            "a staging file the sweep did not write is not the sweep's to remove"
+        );
     }
 
     #[test]
