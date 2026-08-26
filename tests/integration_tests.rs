@@ -1208,112 +1208,6 @@ fn test_undo_rejects_a_file_that_is_not_a_plan() {
     );
 }
 
-/// A report reaches stdout and the log lines do not, so a command can be piped.
-///
-/// Asserted against the binary's real streams rather than the subscriber's
-/// configuration, because the defect this pins was exactly configuration and
-/// reality disagreeing: `fmt::layer()` looks channel-agnostic and writes to
-/// stdout. Capturing the two separately is what `2>/dev/null` does, so a report
-/// line found here is a line that survives it.
-#[test]
-#[serial]
-fn test_report_is_on_stdout_and_logs_are_on_stderr() {
-    let temp_dir = TempDir::new().unwrap();
-    let series = temp_dir.path().join("Series/Breaking Bad/Season 01");
-    fs::create_dir_all(&series).unwrap();
-    fs::write(
-        series.join("Breaking Bad S01E01 Pilot.mkv"),
-        "dummy content",
-    )
-    .unwrap();
-
-    let output = Command::new(PLEXIFY_BIN)
-        .env("RUST_LOG", "plexify=info")
-        .args(["validate", temp_dir.path().to_str().unwrap()])
-        .output()
-        .expect("Failed to execute validate command");
-
-    assert!(output.status.success(), "validate should succeed");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        stdout.contains("Library Naming Report") && stdout.contains("Files scanned:"),
-        "the report is the command's output and belongs on stdout: stdout='{stdout}'"
-    );
-    assert!(
-        !stdout.contains("Starting validate command") && !stdout.contains("INFO"),
-        "no log line may reach stdout, or a piped report carries diagnostics with it: stdout='{stdout}'"
-    );
-    assert!(
-        stderr.contains("Starting validate command"),
-        "the log lines are not lost, only moved: stderr='{stderr}'"
-    );
-}
-
-/// A failing command says why on stderr, and says it in full.
-///
-/// Two claims in one run, because they fail together. Exit 1 with the reason on
-/// stdout leaves a caller checking stderr with nothing to read, and the reason
-/// itself has to survive the exit point: `undo` attaches which file it could not
-/// read to the operating system's account of why, and the `{}` form of an
-/// `anyhow` error would print the first and discard the second.
-#[test]
-#[serial]
-fn test_failure_reason_is_on_stderr_with_its_context_chain() {
-    let temp_dir = TempDir::new().unwrap();
-    let missing_plan = temp_dir.path().join("plexify-fix-0.json");
-
-    let output = Command::new(PLEXIFY_BIN)
-        .args(["undo", missing_plan.to_str().unwrap()])
-        .output()
-        .expect("Failed to execute undo");
-
-    assert!(
-        !output.status.success(),
-        "undo should fail when the plan file is not there"
-    );
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        !stdout.contains("could not read the plan file"),
-        "a failure is a diagnostic and must not be written to the output stream: stdout='{stdout}'"
-    );
-    assert!(
-        stderr.contains("could not read the plan file"),
-        "a caller reading stderr must find out what went wrong: stderr='{stderr}'"
-    );
-    assert!(
-        stderr.contains("os error"),
-        "the cause under the context must survive the exit point, not just its outermost layer: stderr='{stderr}'"
-    );
-}
-
-/// With stderr discarded, a failing command writes nothing at all to stdout.
-///
-/// The literal shape of the complaint: `plexify ... 2>/dev/null` putting an
-/// error into the stream a caller is capturing as data.
-#[test]
-#[serial]
-fn test_failing_command_writes_nothing_to_stdout_when_stderr_is_discarded() {
-    let temp_dir = TempDir::new().unwrap();
-    let missing_plan = temp_dir.path().join("plexify-fix-0.json");
-
-    let output = Command::new(PLEXIFY_BIN)
-        .args(["undo", missing_plan.to_str().unwrap()])
-        .stderr(std::process::Stdio::null())
-        .output()
-        .expect("Failed to execute undo");
-
-    assert!(!output.status.success(), "undo should fail");
-    assert!(
-        output.stdout.is_empty(),
-        "a command that produced no output must leave stdout empty: stdout='{}'",
-        String::from_utf8_lossy(&output.stdout)
-    );
 /// `status` answers for a work root nothing has ever scanned into, and does not
 /// create one by being asked.
 ///
@@ -1469,4 +1363,112 @@ fn test_status_reports_a_scanned_queue_without_changing_it() {
         .collect();
     after.sort();
     assert_eq!(before, after, "status must not move or rewrite anything");
+}
+
+/// A report reaches stdout and the log lines do not, so a command can be piped.
+///
+/// Asserted against the binary's real streams rather than the subscriber's
+/// configuration, because the defect this pins was exactly configuration and
+/// reality disagreeing: `fmt::layer()` looks channel-agnostic and writes to
+/// stdout. Capturing the two separately is what `2>/dev/null` does, so a report
+/// line found here is a line that survives it.
+#[test]
+#[serial]
+fn test_report_is_on_stdout_and_logs_are_on_stderr() {
+    let temp_dir = TempDir::new().unwrap();
+    let series = temp_dir.path().join("Series/Breaking Bad/Season 01");
+    fs::create_dir_all(&series).unwrap();
+    fs::write(
+        series.join("Breaking Bad S01E01 Pilot.mkv"),
+        "dummy content",
+    )
+    .unwrap();
+
+    let output = Command::new(PLEXIFY_BIN)
+        .env("RUST_LOG", "plexify=info")
+        .args(["validate", temp_dir.path().to_str().unwrap()])
+        .output()
+        .expect("Failed to execute validate command");
+
+    assert!(output.status.success(), "validate should succeed");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stdout.contains("Library Naming Report") && stdout.contains("Files scanned:"),
+        "the report is the command's output and belongs on stdout: stdout='{stdout}'"
+    );
+    assert!(
+        !stdout.contains("Starting validate command") && !stdout.contains("INFO"),
+        "no log line may reach stdout, or a piped report carries diagnostics with it: stdout='{stdout}'"
+    );
+    assert!(
+        stderr.contains("Starting validate command"),
+        "the log lines are not lost, only moved: stderr='{stderr}'"
+    );
+}
+
+/// A failing command says why on stderr, and says it in full.
+///
+/// Two claims in one run, because they fail together. Exit 1 with the reason on
+/// stdout leaves a caller checking stderr with nothing to read, and the reason
+/// itself has to survive the exit point: `undo` attaches which file it could not
+/// read to the operating system's account of why, and the `{}` form of an
+/// `anyhow` error would print the first and discard the second.
+#[test]
+#[serial]
+fn test_failure_reason_is_on_stderr_with_its_context_chain() {
+    let temp_dir = TempDir::new().unwrap();
+    let missing_plan = temp_dir.path().join("plexify-fix-0.json");
+
+    let output = Command::new(PLEXIFY_BIN)
+        .args(["undo", missing_plan.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute undo");
+
+    assert!(
+        !output.status.success(),
+        "undo should fail when the plan file is not there"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !stdout.contains("could not read the plan file"),
+        "a failure is a diagnostic and must not be written to the output stream: stdout='{stdout}'"
+    );
+    assert!(
+        stderr.contains("could not read the plan file"),
+        "a caller reading stderr must find out what went wrong: stderr='{stderr}'"
+    );
+    assert!(
+        stderr.contains("os error"),
+        "the cause under the context must survive the exit point, not just its outermost layer: stderr='{stderr}'"
+    );
+}
+
+/// With stderr discarded, a failing command writes nothing at all to stdout.
+///
+/// The literal shape of the complaint: `plexify ... 2>/dev/null` putting an
+/// error into the stream a caller is capturing as data.
+#[test]
+#[serial]
+fn test_failing_command_writes_nothing_to_stdout_when_stderr_is_discarded() {
+    let temp_dir = TempDir::new().unwrap();
+    let missing_plan = temp_dir.path().join("plexify-fix-0.json");
+
+    let output = Command::new(PLEXIFY_BIN)
+        .args(["undo", missing_plan.to_str().unwrap()])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .expect("Failed to execute undo");
+
+    assert!(!output.status.success(), "undo should fail");
+    assert!(
+        output.stdout.is_empty(),
+        "a command that produced no output must leave stdout empty: stdout='{}'",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }
