@@ -51,24 +51,37 @@ impl FFmpegCommandBuilder {
         Self::default()
     }
 
-    /// Add common FFmpeg flags for media processing.
-    ///
-    /// `+genpts` is a demuxer flag and belongs to the input; `avoid_negative_ts`
-    /// is a muxer option and belongs to the output.
-    pub fn with_common_flags(self) -> Self {
-        self.with_generated_pts().with_negative_timestamp_fix()
-    }
-
     /// Have the demuxer generate presentation timestamps for the next input.
+    ///
+    /// Nothing here shifts the output timeline to keep it off zero, and
+    /// `-avoid_negative_ts make_zero` is deliberately absent from all three
+    /// outputs.
+    ///
+    /// Two things put a negative timestamp in front of an MP4 mux. An AAC
+    /// encoder emits its priming frame before the content starts, so the
+    /// one-pass encode's first audio packet is one frame early; and x264 holds
+    /// frames back to reorder them, so the concat demuxer feeding the join
+    /// hands over video whose first DTS is a reorder delay before its PTS. MP4
+    /// has an edit list, which is the field built to express exactly that, and
+    /// both are already carried there.
+    ///
+    /// `make_zero` answers the same question a second time, by shifting *every*
+    /// stream forward until nothing is negative. On the one-pass encode that is
+    /// one AAC frame. On the join it is the reorder delay, which leaves the
+    /// picture starting at that delay rather than where the chunks put it -
+    /// measured 0.080s at 25fps, 0.200s at 10fps, 0.500s at 4fps. Either way
+    /// the audio and the subtitles are dragged along with it and the first
+    /// subtitle event is split around the seam.
+    ///
+    /// The shift is itself written as an edit, so a player that ignores edit
+    /// lists sees the same samples with or without the flag. That is why it
+    /// could sit here unnoticed, and is not a reason to put it back.
+    ///
+    /// Only on the chunks is it genuinely inert: they are MPEG-TS, which cannot
+    /// carry a negative timestamp at all, so FFmpeg shifts it there without
+    /// being asked and the chunk files come out byte-identical either way.
     pub fn with_generated_pts(self) -> Self {
         self.with_input_options(&["-fflags", "+genpts"])
-    }
-
-    /// Shift the output so no timestamp is negative.
-    pub fn with_negative_timestamp_fix(mut self) -> Self {
-        self.output_options
-            .extend_from_slice(&["-avoid_negative_ts".to_string(), "make_zero".to_string()]);
-        self
     }
 
     /// Hold options for the next input declared.
@@ -748,7 +761,7 @@ impl FFmpegProcessor {
         output_path: &Path,
     ) -> Result<()> {
         let ffmpeg_builder = FFmpegCommandBuilder::new()
-            .with_common_flags()
+            .with_generated_pts()
             .with_video_encoding(&job.quality_settings)
             .with_audio_encoding(&job.quality_settings)
             .with_subtitle_encoding()
@@ -826,7 +839,6 @@ impl FFmpegProcessor {
         // again; only the subtitles, which were held back, are encoded here.
         let mux_builder = FFmpegCommandBuilder::new()
             .with_overwrite()
-            .with_negative_timestamp_fix()
             .with_concat_list(&list_path)
             .with_video_and_audio_copy()
             .with_subtitle_encoding()
@@ -892,7 +904,7 @@ impl FFmpegProcessor {
             let partial_path = chunk.partial_path(chunk_dir);
 
             let mut builder = FFmpegCommandBuilder::new()
-                .with_common_flags()
+                .with_generated_pts()
                 .with_overwrite()
                 .with_seek(chunk.start)
                 .with_input(input_path)
@@ -912,15 +924,30 @@ impl FFmpegProcessor {
             )
             .await?;
 
-            // The plan came from a probed duration, and a container can
-            // over-report one. A chunk whose seek landed past the end of the
-            // source encodes happily and produces nothing; joined in, it would
-            // be swallowed without complaint. Treat it as the end of the file.
-            if self.probe_stream_count(&partial_path).await == Some(0) {
+            // The plan came from the container's duration, which is the longest
+            // of its streams - so the final chunk can begin after the last
+            // video frame, and `plan_chunks` rounds up, so it can begin after
+            // the audio has ended too. What comes out is a chunk of a few
+            // hundred bytes that ffprobe can find no video stream in at all.
+            //
+            // The concat demuxer needs every file in its list to declare the
+            // same streams. Given one that does not, the joined MP4's video
+            // track is left running a whole frame interval past its own last
+            // picture. So the criterion is exactly what is asked below: a chunk
+            // no video stream can be found in is the end of the file.
+            //
+            // That is narrower than "produced no video", and deliberately. A
+            // chunk that holds a real audio tail and no picture - a source
+            // whose sound outlives its image - still declares a video stream in
+            // its PMT, so it does not trip this and is joined in with its audio
+            // intact. Measured: 2s chunks past the last frame carry 0 video and
+            // 95 audio packets and are kept; only the sub-kilobyte final chunk
+            // is dropped.
+            if self.probe_video_stream_count(&partial_path).await == Some(0) {
                 let _ = tokio::fs::remove_file(&partial_path).await;
                 debug!(
-                    "Chunk {} starts past the end of the source; the file is shorter than its \
-                     container claims",
+                    "Chunk {} begins after the last video frame; the picture is shorter than the \
+                     container's duration",
                     chunk.index + 1
                 );
                 break;
@@ -970,11 +997,27 @@ impl FFmpegProcessor {
         Ok(())
     }
 
-    /// How many streams a file has, as far as FFprobe can tell.
-    async fn probe_stream_count(&self, path: &Path) -> Option<usize> {
+    /// How many lines FFprobe emits for a file's video streams.
+    ///
+    /// Not a stream count: `-of csv` gives a transport stream both a
+    /// `program,stream,N` line and a `stream,N` line, so one video stream comes
+    /// back as 2. Only `Some(0)` is ever consulted - "FFprobe found no video
+    /// stream here" - and that reading is sound whatever the count means above
+    /// zero. Video rather than any stream, because the concat demuxer needs
+    /// every file in its list to declare the same streams.
+    async fn probe_video_stream_count(&self, path: &Path) -> Option<usize> {
         let output = self
             .probe_command()
-            .args(["-v", "error", "-show_entries", "stream=index", "-of", "csv"])
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v",
+                "-show_entries",
+                "stream=index",
+                "-of",
+                "csv",
+            ])
             .arg(path)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1392,7 +1435,7 @@ mod tests {
         };
 
         let args = FFmpegCommandBuilder::new()
-            .with_common_flags()
+            .with_generated_pts()
             .with_overwrite()
             .with_seek(600.0)
             .with_input("/media/film.mkv")
@@ -1468,7 +1511,7 @@ mod tests {
         };
 
         let args = FFmpegCommandBuilder::new()
-            .with_common_flags()
+            .with_generated_pts()
             .with_inputs(&["/path/to/video.webm", "/path/to/video.vtt"])
             .with_stream_mapping(&["0:v:0", "0:a:0", "1:s:0"])
             .with_video_encoding(&quality)
@@ -1486,8 +1529,6 @@ mod tests {
             "/path/to/video.webm",
             "-i",
             "/path/to/video.vtt",
-            "-avoid_negative_ts",
-            "make_zero",
             "-map",
             "0:v:0",
             "-map",
@@ -1521,7 +1562,7 @@ mod tests {
         };
 
         let args = FFmpegCommandBuilder::new()
-            .with_common_flags()
+            .with_generated_pts()
             .with_input("/path/to/video.mkv")
             .with_stream_mapping(&["0:v:0", "0:a:0", "0:s:0"])
             .with_video_encoding(&quality)
@@ -1537,8 +1578,6 @@ mod tests {
             "+genpts",
             "-i",
             "/path/to/video.mkv",
-            "-avoid_negative_ts",
-            "make_zero",
             "-map",
             "0:v:0",
             "-map",
@@ -1575,7 +1614,7 @@ mod tests {
         let quality = QualitySettings::default();
 
         let args = FFmpegCommandBuilder::new()
-            .with_common_flags()
+            .with_generated_pts()
             .with_video_encoding(&quality)
             .with_subtitle_encoding()
             .with_overwrite()
@@ -1648,13 +1687,27 @@ mod tests {
 
     /// Build a short MKV carrying video, audio and one subtitle track.
     fn build_chunking_source(path: &Path, seconds: u32) {
-        let subtitles = path.with_extension("srt");
-        std::fs::write(
-            &subtitles,
+        build_source(
+            path,
+            seconds,
             "1\n00:00:00,500 --> 00:00:01,500\nfirst line\n\n\
              2\n00:00:01,600 --> 00:00:03,000\nspanning a chunk boundary\n",
         )
-        .unwrap();
+    }
+
+    /// The same, with subtitles the caller chooses.
+    fn build_source(path: &Path, seconds: u32, srt: &str) {
+        build_source_with_audio(path, seconds, srt, "aac")
+    }
+
+    /// The same again, with the source's audio codec the caller's choice.
+    ///
+    /// Which codec that is decides whether the container starts before zero,
+    /// and one test turns on that - see
+    /// `the_one_pass_encode_starts_the_output_where_the_source_starts`.
+    fn build_source_with_audio(path: &Path, seconds: u32, srt: &str, audio_codec: &str) {
+        let subtitles = path.with_extension("srt");
+        std::fs::write(&subtitles, srt).unwrap();
 
         let built = std::process::Command::new("ffmpeg")
             .args([
@@ -1681,7 +1734,7 @@ mod tests {
                 "-preset",
                 "ultrafast",
                 "-c:a",
-                "aac",
+                audio_codec,
                 "-c:s",
                 "srt",
                 "-y",
@@ -1712,6 +1765,75 @@ mod tests {
             .trim()
             .parse()
             .unwrap()
+    }
+
+    /// Where the container says the file begins.
+    fn probed_start_time(path: &Path) -> f64 {
+        let output = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=start_time",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+            ])
+            .arg(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0.0)
+    }
+
+    /// How long one stream of a file runs, as the container declares it.
+    ///
+    /// This is the figure a player lays out its scrub bar from, and the one
+    /// that has to agree with the source: a track declared longer than its own
+    /// last frame is a tail of nothing.
+    fn probed_stream_duration(path: &Path, stream: &str) -> f64 {
+        let output = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                stream,
+                "-show_entries",
+                "stream=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+            ])
+            .arg(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .and_then(|line| line.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no {stream} stream duration in {path:?}"))
+    }
+
+    /// The presentation timestamps of one stream's packets, in order.
+    fn packet_times(path: &Path, stream: &str) -> Vec<f64> {
+        let output = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                stream,
+                "-show_entries",
+                "packet=pts_time",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().trim_end_matches(',').parse().ok())
+            .collect()
     }
 
     /// The codecs of every stream in a file, in order.
@@ -1791,6 +1913,170 @@ mod tests {
         assert!(!work_folder.join(format!("{}.chunks", job.id)).exists());
     }
 
+    /// What the output timeline owes to the source's, on the one-pass path.
+    ///
+    /// The source's audio is FLAC rather than the AAC every other fixture here
+    /// uses, and that is load-bearing rather than incidental. An AAC encoder
+    /// emits a priming frame, so an MKV built with one declares a container
+    /// `start_time` of -23ms, and FFmpeg 6.1 offsets a whole input forward by
+    /// that much to bring it back to zero. Video and audio return to zero
+    /// through the filter graph; a transcoded subtitle stream never enters one,
+    /// so it keeps the offset and `mov_text` fills the gap it left at the head.
+    /// That is FFmpeg's own arithmetic on the way in - measured identically
+    /// with the audio track dropped altogether, with ALAC, and with `-c:a
+    /// copy`, and unmoved by every muxer option that could plausibly answer it
+    /// - so it is not what this test is here to measure, and on a source that
+    /// starts at zero it does not arise. FFmpeg 9.0 does not do it at all.
+    ///
+    /// What the test does measure is unaffected by the choice: the *output*
+    /// audio is AAC either way, so the muxer still has a priming frame's
+    /// negative timestamp in front of it, and `-avoid_negative_ts make_zero`
+    /// still moves the picture to 23ms and still splits the first subtitle
+    /// event around the seam. Both assertions below fail against pre-fix code
+    /// on FFmpeg 6.1.1 and on 9.0 alike.
+    #[tokio::test]
+    async fn the_one_pass_encode_starts_the_output_where_the_source_starts() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("clip.mkv");
+        // A subtitle on the first frame, which is where a shifted timeline
+        // shows itself: the event cannot move without something being invented
+        // to fill the gap it left behind.
+        build_source_with_audio(
+            &input,
+            4,
+            "1\n00:00:00,000 --> 00:00:01,000\nfirst line\n\n\
+             2\n00:00:01,000 --> 00:00:02,000\nsecond line\n\n\
+             3\n00:00:02,000 --> 00:00:03,000\nthird line\n",
+            "flac",
+        );
+
+        // The fixture is only measuring the muxer if the source itself does not
+        // begin before zero. Said out loud so that changing its audio codec
+        // back fails here, naming the reason, rather than in an assertion that
+        // looks like the fix regressed.
+        let source_start = probed_start_time(&input);
+        assert!(
+            source_start.abs() < 0.001,
+            "the source starts at {source_start}s, so FFmpeg's own input offset is in the \
+             measurement as well as the muxer's"
+        );
+
+        let work_folder = temp.path().join("work");
+        std::fs::create_dir_all(&work_folder).unwrap();
+
+        let job = chunking_job(&input);
+        FFmpegProcessor::new(false)
+            .with_chunking(Chunking {
+                chunk_seconds: 2.0,
+                // Above the source length, so this is the one-pass path.
+                min_source_seconds: 60.0,
+            })
+            .process_job(&job, None, Some(&work_folder))
+            .await
+            .unwrap();
+
+        let output = job.work_folder_output_path(&work_folder);
+
+        // The AAC encoder's priming frame carries a negative timestamp, and MP4
+        // has an edit list to say so. Shifting the whole output forward to keep
+        // it off zero instead moves the picture one AAC frame - 21ms at 48kHz -
+        // later than the source it came from.
+        let first_frame = packet_times(&output, "v")
+            .first()
+            .copied()
+            .expect("the output should carry video");
+        assert!(
+            first_frame < 0.005,
+            "the first picture is at {first_frame}s, not at the start of the file"
+        );
+
+        // And the first subtitle event is the one that cannot survive the
+        // shift: moving it off zero leaves a gap that mov_text fills with a
+        // sliver of an event, which shows as a flicker of the first line.
+        let events = subtitle_events(&subtitle_timings(&output));
+        assert_eq!(
+            events.first(),
+            Some(&(0, 1000)),
+            "the first subtitle should be the source's own first event: {events:?}"
+        );
+        for (start, duration) in &events {
+            assert!(
+                *duration > 100,
+                "a {duration}ms subtitle at {start}ms is the seam a shifted timeline leaves \
+                 behind, not an event the source has: {events:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_joined_output_ends_where_the_source_ends() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("film.mkv");
+        // Long enough for ten chunk boundaries at the test chunk length. The
+        // faults this guards against are both invisible on a shorter source:
+        // the tail is one video frame, and a boundary that did not declare the
+        // length it was cut to costs a few milliseconds each time round.
+        build_chunking_source(&input, 20);
+
+        let work_folder = temp.path().join("work");
+        std::fs::create_dir_all(&work_folder).unwrap();
+
+        let job = chunking_job(&input);
+        let processor = FFmpegProcessor::new(false).with_chunking(TEST_CHUNKING);
+
+        let source_duration = probed_duration(&input);
+        let planned = plan_chunks(source_duration, TEST_CHUNKING.chunk_seconds);
+        assert!(
+            planned.len() > 10,
+            "the source must cross enough boundaries for a per-boundary error to show: {} chunks",
+            planned.len()
+        );
+
+        processor
+            .process_job(&job, None, Some(&work_folder))
+            .await
+            .unwrap();
+
+        let output = job.work_folder_output_path(&work_folder);
+
+        // The container's duration is the longest of its streams, so the plan's
+        // final chunk can begin after the last picture and hold nothing but the
+        // audio encoder's padding. Joined in, that chunk leaves the video track
+        // running a whole frame interval past its own last frame.
+        //
+        // The same figure catches a boundary that stopped declaring its length,
+        // because that error is per boundary and this source crosses ten of
+        // them.
+        let video = probed_stream_duration(&output, "v");
+        assert!(
+            (video - source_duration).abs() < 0.02,
+            "the joined video runs {video}s against a {source_duration}s source"
+        );
+
+        let audio = probed_stream_duration(&output, "a");
+        assert!(
+            (audio - source_duration).abs() < 0.05,
+            "the joined audio runs {audio}s against a {source_duration}s source"
+        );
+
+        // And the picture itself is where it belongs at the end of the file,
+        // not merely declared to be.
+        let last_frame = *packet_times(&output, "v").last().unwrap();
+        let source_last_frame = *packet_times(&input, "v").last().unwrap();
+        assert!(
+            (last_frame - source_last_frame).abs() < 0.05,
+            "the last picture is at {last_frame}s, against {source_last_frame}s in the source"
+        );
+    }
+
     #[tokio::test]
     async fn a_chunk_an_earlier_attempt_finished_is_not_encoded_again() {
         if !ffmpeg_present() {
@@ -1819,7 +2105,7 @@ mod tests {
         let untouched = std::fs::metadata(&first_chunk).unwrap().modified().unwrap();
 
         // The next worker picks the job back up and finishes it.
-        processor
+        let encoded = processor
             .encode_chunks(&job, &input, &chunk_dir, &chunks)
             .await
             .unwrap();
@@ -1829,7 +2115,14 @@ mod tests {
             untouched,
             "the chunk the first worker finished was encoded a second time"
         );
-        for chunk in &chunks {
+        // What was encoded, rather than what was planned: the plan divides up
+        // the container's duration, and its final chunk can begin after the
+        // last picture, in which case it is dropped rather than joined in.
+        assert!(
+            encoded.len() > 1,
+            "the test source must span several chunks: {encoded:?}"
+        );
+        for chunk in &encoded {
             assert!(
                 chunk.path(&chunk_dir).exists(),
                 "chunk {} is missing",
@@ -1895,20 +2188,11 @@ mod tests {
         // A builder used for flags alone has nowhere to put them, and dropping
         // them silently is exactly the failure the buckets exist to avoid.
         let args = FFmpegCommandBuilder::new()
-            .with_common_flags()
+            .with_generated_pts()
             .with_overwrite()
             .build();
 
-        assert_eq!(
-            args,
-            vec![
-                "-y",
-                "-fflags",
-                "+genpts",
-                "-avoid_negative_ts",
-                "make_zero"
-            ]
-        );
+        assert_eq!(args, vec!["-y", "-fflags", "+genpts"]);
     }
 
     #[tokio::test]
@@ -2832,21 +3116,21 @@ mod tests {
         assert!(SubtitleSelection::Unprobed.dropped().is_empty());
     }
 
-    /// Subtitle event start times, in hundredths of a second, with slivers
-    /// dropped.
+    /// Subtitle events as whole milliseconds, so the comparison is not about
+    /// float noise.
     ///
-    /// The one-pass encode carries `-avoid_negative_ts make_zero`, and the audio
-    /// it encodes starts one AAC frame - 1024/44100, about 23ms - before zero,
-    /// so the whole timeline including the subtitles shifts by that much and the
-    /// first event is split around the seam. The join has no negative timestamp
-    /// to correct, because the chunks were muxed with `-muxdelay 0`. That offset
-    /// is not a difference in subtitle handling, and comparing raw packets would
-    /// make this test about it.
-    fn subtitle_events(timings: &[(f64, f64)]) -> Vec<i64> {
+    /// Nothing else is normalised away. Both paths take their subtitles from the
+    /// same source with the same flags into the same container, and neither
+    /// moves the timeline off zero, so the lists are the same list.
+    fn subtitle_events(timings: &[(f64, f64)]) -> Vec<(i64, i64)> {
         timings
             .iter()
-            .filter(|(_, duration)| *duration > 0.05)
-            .map(|(start, _)| (start * 10.0).round() as i64)
+            .map(|(start, duration)| {
+                (
+                    (start * 1000.0).round() as i64,
+                    (duration * 1000.0).round() as i64,
+                )
+            })
             .collect()
     }
 
@@ -3008,7 +3292,7 @@ mod tests {
     fn test_ffmpeg_command_builder_build_command() {
         let quality = QualitySettings::default();
         let builder = FFmpegCommandBuilder::new()
-            .with_common_flags()
+            .with_generated_pts()
             .with_video_encoding(&quality);
 
         let mut cmd = Command::new("ffmpeg");
@@ -3025,7 +3309,7 @@ mod tests {
         let quality = QualitySettings::default();
 
         let _builder = FFmpegCommandBuilder::new()
-            .with_common_flags()
+            .with_generated_pts()
             .with_input("test.mkv")
             .with_stream_mapping(&["0:v:0", "0:a:0", "0:s:0"])
             .with_video_encoding(&quality)
