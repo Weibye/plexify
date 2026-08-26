@@ -1697,6 +1697,15 @@ mod tests {
 
     /// The same, with subtitles the caller chooses.
     fn build_source(path: &Path, seconds: u32, srt: &str) {
+        build_source_with_audio(path, seconds, srt, "aac")
+    }
+
+    /// The same again, with the source's audio codec the caller's choice.
+    ///
+    /// Which codec that is decides whether the container starts before zero,
+    /// and one test turns on that - see
+    /// `the_one_pass_encode_starts_the_output_where_the_source_starts`.
+    fn build_source_with_audio(path: &Path, seconds: u32, srt: &str, audio_codec: &str) {
         let subtitles = path.with_extension("srt");
         std::fs::write(&subtitles, srt).unwrap();
 
@@ -1725,7 +1734,7 @@ mod tests {
                 "-preset",
                 "ultrafast",
                 "-c:a",
-                "aac",
+                audio_codec,
                 "-c:s",
                 "srt",
                 "-y",
@@ -1756,6 +1765,26 @@ mod tests {
             .trim()
             .parse()
             .unwrap()
+    }
+
+    /// Where the container says the file begins.
+    fn probed_start_time(path: &Path) -> f64 {
+        let output = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=start_time",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+            ])
+            .arg(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0.0)
     }
 
     /// How long one stream of a file runs, as the container declares it.
@@ -1884,6 +1913,27 @@ mod tests {
         assert!(!work_folder.join(format!("{}.chunks", job.id)).exists());
     }
 
+    /// What the output timeline owes to the source's, on the one-pass path.
+    ///
+    /// The source's audio is FLAC rather than the AAC every other fixture here
+    /// uses, and that is load-bearing rather than incidental. An AAC encoder
+    /// emits a priming frame, so an MKV built with one declares a container
+    /// `start_time` of -23ms, and FFmpeg 6.1 offsets a whole input forward by
+    /// that much to bring it back to zero. Video and audio return to zero
+    /// through the filter graph; a transcoded subtitle stream never enters one,
+    /// so it keeps the offset and `mov_text` fills the gap it left at the head.
+    /// That is FFmpeg's own arithmetic on the way in - measured identically
+    /// with the audio track dropped altogether, with ALAC, and with `-c:a
+    /// copy`, and unmoved by every muxer option that could plausibly answer it
+    /// - so it is not what this test is here to measure, and on a source that
+    /// starts at zero it does not arise. FFmpeg 9.0 does not do it at all.
+    ///
+    /// What the test does measure is unaffected by the choice: the *output*
+    /// audio is AAC either way, so the muxer still has a priming frame's
+    /// negative timestamp in front of it, and `-avoid_negative_ts make_zero`
+    /// still moves the picture to 23ms and still splits the first subtitle
+    /// event around the seam. Both assertions below fail against pre-fix code
+    /// on FFmpeg 6.1.1 and on 9.0 alike.
     #[tokio::test]
     async fn the_one_pass_encode_starts_the_output_where_the_source_starts() {
         if !ffmpeg_present() {
@@ -1895,12 +1945,24 @@ mod tests {
         // A subtitle on the first frame, which is where a shifted timeline
         // shows itself: the event cannot move without something being invented
         // to fill the gap it left behind.
-        build_source(
+        build_source_with_audio(
             &input,
             4,
             "1\n00:00:00,000 --> 00:00:01,000\nfirst line\n\n\
              2\n00:00:01,000 --> 00:00:02,000\nsecond line\n\n\
              3\n00:00:02,000 --> 00:00:03,000\nthird line\n",
+            "flac",
+        );
+
+        // The fixture is only measuring the muxer if the source itself does not
+        // begin before zero. Said out loud so that changing its audio codec
+        // back fails here, naming the reason, rather than in an assertion that
+        // looks like the fix regressed.
+        let source_start = probed_start_time(&input);
+        assert!(
+            source_start.abs() < 0.001,
+            "the source starts at {source_start}s, so FFmpeg's own input offset is in the \
+             measurement as well as the muxer's"
         );
 
         let work_folder = temp.path().join("work");

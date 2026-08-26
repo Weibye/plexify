@@ -286,6 +286,18 @@ saw the same file with or without the flag - which is how it sat in the join unn
 not a reason to put it back on a fourth output: a concat-fed MP4 mux is exactly where it does
 the most damage.
 
+That claim is about what plexify's own command line asks the muxer for, and it stops there.
+FFmpeg 6.1, which is what `apt` installs on the Ubuntu CI runs, offsets an entire input
+forward when the container declares a `start_time` before zero - as an MKV with AAC audio
+does, by the priming frame. Video and audio come back to zero through the filter graph; a
+transcoded subtitle stream never enters one, so it keeps the offset and lands 23ms late with
+`mov_text` filling the head. Nothing on the command line answers that - it is unchanged by
+every `-avoid_negative_ts` value, by `-muxdelay`, `-max_interleave_delta`,
+`+negative_cts_offsets`, and by dropping the audio track altogether - and FFmpeg 9.0 does not
+do it at all. So a fixture measuring the muxer has to start at zero itself, which is why
+`the_one_pass_encode_starts_the_output_where_the_source_starts` builds its source with FLAC
+audio and asserts that it did.
+
 Two things follow from the directory being named after the job id, which is the v5 UUID of
 the input path and so stable forever. A parked job's chunks would be found again by any later
 job for the same file, so the chunk directory records the `QualitySettings` it was filled
