@@ -21,6 +21,9 @@
 //! # Process jobs from the queue
 //! plexify work /path/to/media
 //!
+//! # Ask the queue what state it is in
+//! plexify status
+//!
 //! # Report what emptying the queue would delete, then ask
 //! plexify clean /path/to/media
 //!
@@ -47,8 +50,8 @@ use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use plexify::commands::{
-    add::AddCommand, clean::CleanCommand, scan::ScanCommand, validate::ValidateCommand,
-    work::WorkCommand,
+    add::AddCommand, clean::CleanCommand, scan::ScanCommand, status::StatusCommand,
+    validate::ValidateCommand, work::WorkCommand,
 };
 use plexify::queue::QueueDirectory;
 use plexify::JobPriority;
@@ -105,6 +108,12 @@ enum Commands {
         #[arg(long, default_value = "none", value_enum)]
         priority: JobPriority,
     },
+    /// Report what is in the queue, and why anything in it is not moving
+    Status {
+        /// Path to the work directory (defaults to current working directory)
+        #[arg(long, short = 'w')]
+        work_dir: Option<PathBuf>,
+    },
     /// Delete a work root's queue directories, after reporting what is in them
     Clean {
         /// Path to the media directory
@@ -148,13 +157,17 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
+    // Logs are diagnostics and go to stderr; stdout carries only what a command
+    // deliberately prints, so a report can be piped or redirected on its own.
+    // `fmt::layer()` defaults to stdout, so the writer has to be said out loud -
+    // without it `RUST_LOG`, a documented variable, corrupts the output stream
+    // it is turned up to investigate.
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "plexify=info".into()),
         )
-        .with(tracing_subscriber::fmt::layer())
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
 
     let cli = Cli::parse();
@@ -198,6 +211,22 @@ async fn main() -> Result<()> {
             WorkCommand::new(path, work_root, background, priority)
                 .execute()
                 .await
+        }
+        Commands::Status { work_dir } => {
+            let work_root = work_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
+            info!("Starting status command for work: {:?}", work_root);
+
+            // No media path is asked for. Nothing this command reports is
+            // resolved against the media root, and requiring a directory that
+            // does not affect the answer would be a wart on the one command
+            // whose whole purpose is to be easy to reach for.
+            match StatusCommand::new(work_root).execute().await {
+                Ok(status) => {
+                    print!("{}", plexify::commands::status::render(&status));
+                    Ok(())
+                }
+                Err(e) => Err(e),
+            }
         }
         Commands::Clean {
             path,
@@ -283,7 +312,13 @@ async fn main() -> Result<()> {
     };
 
     if let Err(e) = result {
-        error!("Command failed: {}", e);
+        // `{:#}` prints the whole context chain on one line. The `{}` form shows
+        // only the outermost layer, which threw away every `.with_context(...)`
+        // in the project at the one point a user reads: `fix` and `undo` attach
+        // the source and destination of a move to the operating system's reason,
+        // and only the summary arrived. Code below may therefore say what it was
+        // doing with `.context(...)` and leave the cause attached.
+        error!("Command failed: {:#}", e);
         std::process::exit(1);
     }
 

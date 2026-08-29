@@ -307,6 +307,7 @@ mod tests {
                     },
                 })
                 .collect(),
+            notes: Vec::new(),
             library_root: root.to_path_buf(),
             scan_path: root.to_path_buf(),
             validation_time: Duration::from_secs(0),
