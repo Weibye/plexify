@@ -31,6 +31,17 @@ cargo clippy --all-targets --all-features
 should not be introduced. The fourth CI job is a `rustsec/audit-check` dependency scan,
 which has no local equivalent.
 
+**Local green and CI green are not the same thing.** The test job runs on `ubuntu-latest`
+with FFmpeg installed by `apt-get`, and the FFmpeg-dependent tests are sensitive to which
+build they meet - `-avoid_negative_ts` does not default the same way across versions, so an
+encode that starts its output where the source starts on one machine can carry a one-frame
+head shift on another. The four commands above passing locally therefore says nothing about
+the platform CI runs on. Check the run on the pull request before calling a change finished,
+and when an assertion rests on what FFmpeg does, record which FFmpeg it was measured on.
+Never weaken an assertion to turn CI green: a behaviour that cannot be made
+version-independent should be narrowed, or given a documented minimum version, rather than
+asserted more loosely.
+
 ### Running the CLI against real media
 
 The binary mutates a media library in place — `work` deletes or disables source files, and
@@ -424,6 +435,15 @@ Recognised variables: `FFMPEG_PRESET`, `FFMPEG_CRF`, `FFMPEG_AUDIO_BITRATE`, `SL
 
 **Async is tokio throughout**; errors are `anyhow::Result<T>`; logging is `tracing`, initialised
 in `main.rs` with the `plexify=info` default filter.
+
+**The two streams carry different things, and `main.rs` is where that is decided.** Logs are
+diagnostics and go to **stderr**; **stdout** carries only what a command deliberately prints,
+so a report survives being piped. `fmt::layer()` defaults to stdout, so the writer is stated
+explicitly and must stay stated - dropping it puts every log line back in with the report, and
+`RUST_LOG` then corrupts the output it was turned up to investigate. The exit point prints a
+failure with `{:#}`, which renders an `anyhow` context chain in full; a command may therefore
+attach `.context(...)` and trust that the cause underneath still reaches the user, which the
+`{}` form silently discarded.
 
 ## Conventions
 
