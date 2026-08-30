@@ -121,3 +121,76 @@ jobs:
       uses: rustsec/audit-check@v2
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
+
+  pi_binary:
+    name: Pi binary (aarch64 musl)
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: aarch64-unknown-linux-musl
+
+    - name: Cache cargo dependencies
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ubuntu-latest-cargo-aarch64-musl-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ubuntu-latest-cargo-aarch64-musl-
+
+    # No C cross-toolchain is installed and none is needed: every dependency is
+    # pure Rust, so the bundled `rust-lld` links the whole thing. Wiring up
+    # `aarch64-linux-musl-gcc` would be one more thing to keep working, for no
+    # gain until something in the tree starts building C.
+    - name: Build
+      run: cargo build --release --target aarch64-unknown-linux-musl
+      env:
+        CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: rust-lld
+
+    # The whole point of choosing musl. A glibc build links against whatever
+    # version the runner happens to carry and then refuses to start on a Pi
+    # carrying an older one - a failure that would happen at the destination,
+    # on someone else's machine, rather than here.
+    - name: Refuse a binary that is not static
+      run: |
+        binary=target/aarch64-unknown-linux-musl/release/plexify
+        file "$binary"
+        readelf -h "$binary" | grep -E 'Class|Machine|Type'
+        if readelf -l "$binary" | grep -q INTERP; then
+          echo "::error::the binary names a dynamic loader, so it is not static"
+          exit 1
+        fi
+        if readelf -d "$binary" 2>/dev/null | grep -q NEEDED; then
+          echo "::error::the binary needs shared libraries, so it is not static"
+          exit 1
+        fi
+
+    - name: Install qemu
+      run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+
+    # Linking is not running. This executes the ARM64 binary on an x86 runner so
+    # that "it builds" and "it starts" are two separate claims and the second
+    # one has been seen to happen. It is emulation, not the hardware: it cannot
+    # speak for the Pi's kernel or its FFmpeg, only for the binary itself.
+    - name: Run it
+      run: |
+        binary=target/aarch64-unknown-linux-musl/release/plexify
+        qemu-aarch64-static "$binary" --version
+        qemu-aarch64-static "$binary" audit --help > /dev/null
+
+    - name: Upload
+      uses: actions/upload-artifact@v4
+      with:
+        name: plexify-aarch64-unknown-linux-musl
+        path: target/aarch64-unknown-linux-musl/release/plexify
+        if-no-files-found: error

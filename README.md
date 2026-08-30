@@ -66,9 +66,36 @@ cargo build --release
 cargo install --path .
 ```
 
-### Option 2: Pre-built Binaries (Coming Soon)
+### Option 2: The Raspberry Pi binary
 
-Pre-built binaries for Linux, macOS, and Windows will be available in the GitHub releases.
+Every CI run builds a statically linked `aarch64-unknown-linux-musl` binary and
+attaches it to the run as an artifact named
+`plexify-aarch64-unknown-linux-musl`. It is static, so it needs no Rust
+toolchain, no glibc of a particular version, and nothing else installed on the
+Pi. `audit` additionally needs `ffprobe` on the machine holding the files;
+`work` needs `ffmpeg` as well.
+
+Download it from the Actions run, then:
+
+```bash
+# from the machine that downloaded it
+scp plexify pi@your-pi:/home/pi/plexify
+ssh pi@your-pi 'chmod +x /home/pi/plexify && /home/pi/plexify --version'
+```
+
+To read a library without changing anything on it:
+
+```bash
+ssh pi@your-pi '/home/pi/plexify audit /path/to/media --target lg-cx-webos'
+```
+
+`audit` only reads. `scan`, `work` and `validate --fix` change a library, so
+point those at a copy before pointing them at one that matters.
+
+### Option 3: Pre-built Binaries for everything else (Coming Soon)
+
+Binaries for Linux, macOS, and Windows, published to GitHub releases and
+updated in place, are not built yet.
 
 ## Usage
 
