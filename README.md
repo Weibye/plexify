@@ -99,7 +99,32 @@ plexify validate /path/to/media
 
 # Carry out the renames it proposes
 plexify validate /path/to/media --fix
+
+# Report what each file needs before a client will Direct Play it
+plexify audit /path/to/media --target chromecast-gen2-3
 ```
+
+### Direct Play audit
+
+`audit` probes each file with FFprobe and judges what it finds against one
+client's playback envelope. It reports and changes nothing.
+
+```bash
+plexify audit /path/to/media --target chromecast-gen2-3
+plexify audit /path/to/media --target lg-cx-webos
+plexify audit /path/to/media --target ./my-device.toml
+```
+
+Results are grouped by what fixing them costs, and the two are never added
+together: a remux swaps an audio or subtitle track and copies the video
+bitstream across, while a re-encode rebuilds the video and, on a Raspberry Pi,
+runs slower than realtime.
+
+Envelopes live in `targets/` as TOML. Every value in one records whether it was
+`observed` on the hardware or `assumed` from a specification, and the report
+marks any verdict resting on an assumption with `?`. Three spec-derived
+assumptions in this project have already turned out to be wrong on the device,
+so a claim nobody has watched happen is not allowed to look like a measurement.
 
 ### The work directory
 

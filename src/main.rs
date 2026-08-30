@@ -39,6 +39,9 @@
 //! # Carry out the renames it proposes
 //! plexify validate /path/to/media --fix
 //!
+//! # Report what each file needs before a client will Direct Play it
+//! plexify audit /path/to/media --target chromecast-gen2-3
+//!
 //! # Put a fix run back the way it found things
 //! plexify undo plexify-fix-1787309398.json --apply
 //! ```
@@ -50,8 +53,8 @@ use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use plexify::commands::{
-    add::AddCommand, clean::CleanCommand, scan::ScanCommand, status::StatusCommand,
-    validate::ValidateCommand, work::WorkCommand,
+    add::AddCommand, audit::AuditCommand, clean::CleanCommand, scan::ScanCommand,
+    status::StatusCommand, validate::ValidateCommand, work::WorkCommand,
 };
 use plexify::queue::QueueDirectory;
 use plexify::JobPriority;
@@ -144,6 +147,16 @@ enum Commands {
         /// Carry out the reversal instead of only reporting it
         #[arg(long)]
         apply: bool,
+    },
+    /// Report what each file needs before a client will Direct Play it
+    Audit {
+        /// Path to the media directory to audit
+        path: PathBuf,
+        /// The client to judge against: a built-in envelope's name, or the path
+        /// to a TOML one. There is no default, because picking a device for the
+        /// reader would be a claim about their living room.
+        #[arg(long, short = 't')]
+        target: String,
     },
     /// Report what in the library is not in canonical form
     Validate {
@@ -270,6 +283,20 @@ async fn main() -> Result<()> {
                         Ok(())
                     }
                 }
+                Err(e) => Err(e),
+            }
+        }
+        Commands::Audit { path, target } => {
+            info!("Starting audit for path: {:?}, target: {}", path, target);
+
+            match AuditCommand::new(path, &target) {
+                Ok(audit_cmd) => match audit_cmd.execute().await {
+                    Ok(report) => {
+                        audit_cmd.print_report(&report);
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                },
                 Err(e) => Err(e),
             }
         }
