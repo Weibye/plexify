@@ -5,7 +5,7 @@ use tracing::{info, warn};
 use crate::job::MediaFileType;
 use crate::queue::JobQueue;
 
-use super::job_processor::{JobProcessResult, JobProcessor, JobProcessorConfig};
+use super::job_processor::{operation_for, JobProcessResult, JobProcessor, JobProcessorConfig};
 
 /// Command to create a job for an individual media file
 pub struct AddCommand {
@@ -65,8 +65,10 @@ impl AddCommand {
 
         // Process the file
         let processor = JobProcessor::new(&queue, &config, &media_root);
+        // `add` names one file and asks no client about it, so the extension
+        // decides. `scan --target` is where a conformance check belongs.
         let result = processor
-            .process_media_file(&relative_path, file_type.clone())
+            .process_media_file(&relative_path, file_type.clone(), operation_for(&file_type))
             .await?;
 
         // Handle the result

@@ -82,6 +82,15 @@ plexify scan /path/to/media
 # Scan with a quality preset for consistent encoding settings
 plexify scan --preset quality /path/to/media
 
+# Ask a client what each file needs before queueing anything. A file it
+# already Direct Plays produces no job at all.
+plexify scan --target lg-cx-webos /path/to/media
+
+# Name every client the library has to serve. Each file is queued with the
+# most expensive work any of them needs, because that is the only answer
+# that satisfies all of them.
+plexify scan --target lg-cx-webos --target chromecast-gen2-3 /path/to/media
+
 # Process jobs from the queue (foreground)
 plexify work /path/to/media
 

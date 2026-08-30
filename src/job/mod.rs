@@ -67,6 +67,27 @@ pub enum AudioAction {
     Transcode { channels: Option<u32> },
 }
 
+impl AudioAction {
+    /// The action that satisfies both of two targets' answers.
+    fn hardest(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Copy, action) | (action, Self::Copy) => action,
+            (Self::Transcode { channels: one }, Self::Transcode { channels: other }) => {
+                Self::Transcode {
+                    // Two caps: the lower one is inside both. A cap and no cap
+                    // is the cap - re-encoding at six channels does not satisfy
+                    // the device that will only take two.
+                    channels: match (one, other) {
+                        (Some(one), Some(other)) => Some(one.min(other)),
+                        (Some(cap), None) | (None, Some(cap)) => Some(cap),
+                        (None, None) => None,
+                    },
+                }
+            }
+        }
+    }
+}
+
 /// What a remux does with the source's subtitle tracks.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 pub enum SubtitleAction {
@@ -103,6 +124,31 @@ pub enum SubtitleAction {
     /// does, and the only copy of the track is then the source file, which
     /// `work` keeps beside the output as `.disabled` rather than deleting.
     Extract,
+}
+
+impl SubtitleAction {
+    /// The action that satisfies both of two targets' answers.
+    ///
+    /// Read each as what one client *requires*, which is what makes the order
+    /// fall out rather than being chosen. `Keep` requires nothing: that client
+    /// is content with the track where it is. `Extract` requires the track to
+    /// leave the container. `Drop` requires the same and adds that no sidecar
+    /// can hold it - which is a fact about the track rather than about the
+    /// client, so two targets cannot disagree about it.
+    ///
+    /// So `Drop` beats `Extract` beats `Keep`, and the middle case is the one
+    /// that changed: extracting to satisfy a client that burns the track in
+    /// costs the other client nothing, because the server hands a sidecar to
+    /// any of them and converts it without touching the picture. Combining
+    /// used to mean a device that rendered the track perfectly well lost it
+    /// because another one burned it in. It no longer does.
+    fn hardest(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Drop, _) | (_, Self::Drop) => Self::Drop,
+            (Self::Extract, _) | (_, Self::Extract) => Self::Extract,
+            (Self::Keep, Self::Keep) => Self::Keep,
+        }
+    }
 }
 
 impl Operation {
@@ -146,6 +192,36 @@ impl Operation {
         };
 
         Some(Self::Remux { audio, subtitles })
+    }
+
+    /// The work that leaves a file playable on every target that asked for
+    /// some, where each of `self` and `other` is one target's answer.
+    ///
+    /// The expensive answer wins, because it is the only one that satisfies
+    /// both. This is the rule that decides a quarter of this library: the two
+    /// shipped envelopes disagree about 586 MPEG-4 AVIs, which the LG decodes
+    /// and the Chromecast does not, so a remux against one is a re-encode
+    /// against the pair.
+    ///
+    /// Going the other way is not a cheaper version of the same thing. A file
+    /// left conforming on only one device is one the Pi is asked to transcode
+    /// the moment it is played on the other, and the Pi cannot transcode video
+    /// at all - the playback does not degrade, it collapses. Days of encoding
+    /// bought once is the lesser cost.
+    pub fn hardest(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Reencode, _) | (_, Self::Reencode) => Self::Reencode,
+            (
+                Self::Remux { audio, subtitles },
+                Self::Remux {
+                    audio: other_audio,
+                    subtitles: other_subtitles,
+                },
+            ) => Self::Remux {
+                audio: audio.hardest(other_audio),
+                subtitles: subtitles.hardest(other_subtitles),
+            },
+        }
     }
 
     /// Whether the output carries the source's subtitle tracks.
@@ -617,6 +693,48 @@ mod tests {
         assert_eq!(
             job.subtitle_path,
             Some(PathBuf::from("/test/media/video.vtt"))
+        );
+    }
+
+    #[test]
+    fn combining_two_targets_keeps_the_subtitles_rather_than_losing_them() {
+        use SubtitleAction::{Drop, Extract, Keep};
+
+        // The case the two shipped envelopes produce: the LG burns `mov_text`
+        // in, the Chromecast overlays it. Extracting satisfies the first and
+        // costs the second nothing, because the server hands a sidecar to
+        // either of them without touching the picture.
+        assert_eq!(Keep.hardest(Extract), Extract);
+        assert_eq!(Extract.hardest(Keep), Extract);
+
+        assert_eq!(Keep.hardest(Keep), Keep);
+        assert_eq!(Extract.hardest(Extract), Extract);
+
+        // A track no sidecar can hold is a fact about the track, not about the
+        // client, so it cannot be argued away by a target that would have kept
+        // it.
+        assert_eq!(Keep.hardest(Drop), Drop);
+        assert_eq!(Extract.hardest(Drop), Drop);
+    }
+
+    #[test]
+    fn combining_audio_takes_the_cap_that_is_inside_both() {
+        use AudioAction::{Copy, Transcode};
+
+        assert_eq!(Copy.hardest(Copy), Copy);
+        assert_eq!(
+            Copy.hardest(Transcode { channels: Some(2) }),
+            Transcode { channels: Some(2) }
+        );
+        // Re-encoding at six channels does not satisfy the device that will
+        // only take two.
+        assert_eq!(
+            Transcode { channels: None }.hardest(Transcode { channels: Some(2) }),
+            Transcode { channels: Some(2) }
+        );
+        assert_eq!(
+            Transcode { channels: Some(6) }.hardest(Transcode { channels: Some(2) }),
+            Transcode { channels: Some(2) }
         );
     }
 

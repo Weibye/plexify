@@ -1,29 +1,54 @@
 use anyhow::{anyhow, Result};
 use indicatif::{ProgressBar, ProgressStyle};
-use std::path::PathBuf;
+use rayon::prelude::*;
+use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
 use crate::ignore::IgnoreFilter;
-use crate::job::MediaFileType;
+use crate::job::{MediaFileType, Operation};
+use crate::probe::probe;
 use crate::queue::JobQueue;
+use crate::target::{evaluate, PlaybackTarget};
 
-use super::job_processor::{JobProcessResult, JobProcessor, JobProcessorConfig};
+use super::job_processor::{operation_for, JobProcessResult, JobProcessor, JobProcessorConfig};
+
+/// What a scan decided about one file.
+enum Resolution {
+    /// Queue this work.
+    Work(Operation),
+    /// Every target plays it as it is, so there is no job to make.
+    Conforms,
+    /// FFprobe could not read it, so nothing is known about what it needs.
+    Unreadable(String),
+}
 
 /// Command to scan a directory for media files and create jobs
 pub struct ScanCommand {
     media_root: PathBuf,
     work_root: PathBuf,
     preset: Option<String>,
+    /// The clients every queued file has to play on. Empty means none was
+    /// named, and the extension decides as it did before.
+    targets: Vec<PlaybackTarget>,
 }
 
 impl ScanCommand {
-    pub fn new(media_root: PathBuf, work_root: PathBuf, preset: Option<String>) -> Self {
-        Self {
+    pub fn new(
+        media_root: PathBuf,
+        work_root: PathBuf,
+        preset: Option<String>,
+        targets: &[String],
+    ) -> Result<Self> {
+        Ok(Self {
             media_root,
             work_root,
             preset,
-        }
+            targets: targets
+                .iter()
+                .map(|spec| PlaybackTarget::load(spec))
+                .collect::<Result<Vec<_>>>()?,
+        })
     }
 
     pub async fn execute(&self) -> Result<()> {
@@ -176,30 +201,62 @@ impl ScanCommand {
         let config = JobProcessorConfig::from_preset(self.preset.as_deref())?;
         let processor = JobProcessor::new(&queue, &config, &self.media_root);
 
-        for (path, file_type) in &media_files {
+        let resolutions = self.resolve(&media_files).await?;
+        let mut conforming = 0;
+        let mut unreadable = Vec::new();
+
+        for ((path, file_type), resolution) in media_files.iter().zip(resolutions) {
             if let Some(ref pb) = job_pb {
                 pb.set_message(format!(
                     "{file_type:?}: {:?}",
                     path.file_name().unwrap_or_default()
                 ));
+                pb.inc(1);
             }
 
+            let operation = match resolution {
+                Resolution::Work(operation) => operation,
+                Resolution::Conforms => {
+                    conforming += 1;
+                    debug!("Every target plays {path:?} as it is");
+                    continue;
+                }
+                // Doing nothing is the only answer here that cannot be wrong.
+                // Queueing a re-encode would spend days on a file that may need
+                // nothing, and passing over it quietly would hide a file that
+                // may need everything - so it is named instead.
+                Resolution::Unreadable(reason) => {
+                    unreadable.push((path.clone(), reason));
+                    continue;
+                }
+            };
+
             let result = processor
-                .process_media_file(path, file_type.clone())
+                .process_media_file(path, file_type.clone(), operation)
                 .await?;
             processor.log_result(path, file_type, &result);
 
             if result == JobProcessResult::Created {
                 job_count += 1;
             }
-
-            if let Some(ref pb) = job_pb {
-                pb.inc(1);
-            }
         }
 
         if let Some(pb) = job_pb {
             pb.finish_and_clear();
+        }
+
+        if conforming > 0 {
+            info!("✅ {conforming} files already play on every target, and were not queued.");
+        }
+
+        for (path, reason) in &unreadable {
+            warn!("⚠️ Not queued, because FFprobe could not read it: {path:?}: {reason}");
+        }
+        if !unreadable.is_empty() {
+            warn!(
+                "⚠️ {} files could not be probed. Nothing is known about what they need, so nothing was decided for them.",
+                unreadable.len()
+            );
         }
 
         info!(
@@ -208,11 +265,87 @@ impl ScanCommand {
         );
         Ok(())
     }
+
+    /// What each file needs, asked of every target.
+    ///
+    /// With no target named nothing is probed and the extension decides, which
+    /// is what this command did before it could ask. Naming a target costs one
+    /// FFprobe per file, and no more than one however many targets are named.
+    async fn resolve(&self, files: &[(PathBuf, MediaFileType)]) -> Result<Vec<Resolution>> {
+        if self.targets.is_empty() {
+            return Ok(files
+                .iter()
+                .map(|(_, file_type)| Resolution::Work(operation_for(file_type)))
+                .collect());
+        }
+
+        info!(
+            "🔍 Probing {} files against {}...",
+            files.len(),
+            self.targets
+                .iter()
+                .map(|target| target.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        let paths: Vec<PathBuf> = files
+            .iter()
+            .map(|(path, _)| self.media_root.join(path))
+            .collect();
+        let targets = self.targets.clone();
+
+        let probe_pb = ProgressBar::new(paths.len() as u64);
+        probe_pb.set_style(
+            ProgressStyle::with_template("Probing {bar:30.cyan/blue} {pos}/{len}")
+                .unwrap()
+                .progress_chars("█▉▊▋▌▍▎▏ "),
+        );
+
+        // A wall of blocking subprocesses, so they run on the blocking pool
+        // rather than parking a runtime worker for the length of a library.
+        let resolutions = tokio::task::spawn_blocking(move || {
+            let resolutions = paths
+                .par_iter()
+                .map(|path| {
+                    let resolution = resolve_one(path, &targets);
+                    probe_pb.inc(1);
+                    resolution
+                })
+                .collect();
+            probe_pb.finish_and_clear();
+            resolutions
+        })
+        .await?;
+
+        Ok(resolutions)
+    }
+}
+
+/// What one file needs in order to play on every one of `targets`.
+fn resolve_one(path: &Path, targets: &[PlaybackTarget]) -> Resolution {
+    let media = match probe(path) {
+        Ok(media) => media,
+        Err(error) => return Resolution::Unreadable(format!("{error:#}")),
+    };
+
+    // One probe, every target: the file is read once however many clients are
+    // being satisfied, and a conforming answer from all of them is no job.
+    let operation = targets
+        .iter()
+        .filter_map(|target| Operation::for_conformance(&evaluate(&media, target), target))
+        .reduce(Operation::hardest);
+
+    match operation {
+        Some(operation) => Resolution::Work(operation),
+        None => Resolution::Conforms,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job::{AudioAction, SubtitleAction};
     use std::fs;
     use tempfile::TempDir;
 
@@ -223,7 +356,9 @@ mod tests {
             temp_dir.path().to_path_buf(),
             temp_dir.path().to_path_buf(),
             None,
-        );
+            &[],
+        )
+        .unwrap();
 
         let result = scan_cmd.execute().await;
         assert!(result.is_ok());
@@ -235,7 +370,9 @@ mod tests {
             PathBuf::from("/nonexistent/path"),
             PathBuf::from("/tmp"),
             None,
-        );
+            &[],
+        )
+        .unwrap();
 
         let result = scan_cmd.execute().await;
         assert!(result.is_err());
@@ -248,7 +385,9 @@ mod tests {
             temp_dir.path().to_path_buf(),
             temp_dir.path().to_path_buf(),
             Some("quality".to_string()),
-        );
+            &[],
+        )
+        .unwrap();
 
         let result = scan_cmd.execute().await;
         assert!(result.is_ok());
@@ -261,7 +400,9 @@ mod tests {
             temp_dir.path().to_path_buf(),
             temp_dir.path().to_path_buf(),
             Some("invalid_preset".to_string()),
-        );
+            &[],
+        )
+        .unwrap();
 
         let result = scan_cmd.execute().await;
         assert!(result.is_err());
@@ -290,7 +431,9 @@ mod tests {
             media_root.to_path_buf(),
             temp_dir.path().to_path_buf(),
             Some("quality".to_string()),
-        );
+            &[],
+        )
+        .unwrap();
         let result = scan_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -335,7 +478,9 @@ mod tests {
             media_root.to_path_buf(),
             temp_dir.path().to_path_buf(),
             Some("quality".to_string()),
-        );
+            &[],
+        )
+        .unwrap();
         let result = scan_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -380,7 +525,9 @@ mod tests {
             media_root.to_path_buf(),
             temp_dir.path().to_path_buf(),
             Some("quality".to_string()),
-        );
+            &[],
+        )
+        .unwrap();
         let result = scan_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -396,6 +543,194 @@ mod tests {
         assert_eq!(job_count, 5);
     }
 
+    fn ffmpeg_present() -> bool {
+        let available = std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+
+        if !available {
+            assert!(
+                std::env::var("CI").is_err(),
+                "FFmpeg must be installed in CI: these tests are the only check that a scan asks a real file what it needs"
+            );
+            eprintln!("skipping: ffmpeg is not on PATH");
+        }
+
+        available
+    }
+
+    fn build(path: &Path, args: &[&str]) {
+        let built = std::process::Command::new("ffmpeg")
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=1:size=160x120:rate=10",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=duration=1",
+            ])
+            .args(args)
+            .arg("-y")
+            .arg(path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(built.success(), "could not build {path:?}");
+    }
+
+    /// Every job the queue holds, by the file it transcodes.
+    fn queued(work_root: &Path) -> Vec<(String, Operation)> {
+        let mut jobs: Vec<(String, Operation)> = fs::read_dir(work_root.join("_queue"))
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                if path.extension()? != "job" {
+                    return None;
+                }
+                let job: crate::job::Job =
+                    serde_json::from_str(&fs::read_to_string(&path).ok()?).ok()?;
+                Some((
+                    job.input_path.file_name()?.to_string_lossy().to_string(),
+                    job.operation,
+                ))
+            })
+            .collect();
+        jobs.sort_by(|left, right| left.0.cmp(&right.0));
+        jobs
+    }
+
+    /// The whole point of asking a client before queueing: a file it already
+    /// plays produces no job at all.
+    #[tokio::test]
+    async fn a_file_the_target_already_plays_is_not_queued() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        // H.264 high, 8-bit, stereo AAC: what the Chromecast is observed to
+        // Direct Play, in an MKV that only needs its container changed.
+        build(
+            &media_root.join("conforms.mp4"),
+            &[
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                "high",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-ac",
+                "2",
+            ],
+        );
+        build(
+            &media_root.join("surround.mkv"),
+            &[
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                "high",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-ac",
+                "6",
+            ],
+        );
+
+        ScanCommand::new(
+            media_root.to_path_buf(),
+            media_root.to_path_buf(),
+            None,
+            &["chromecast-gen2-3".to_string()],
+        )
+        .unwrap()
+        .execute()
+        .await
+        .unwrap();
+
+        // The MP4 is not a job because nothing needs doing to it - not because
+        // scan does not look at MP4s, which it never has.
+        assert_eq!(
+            queued(media_root),
+            vec![(
+                "surround.mkv".to_string(),
+                Operation::Remux {
+                    audio: AudioAction::Transcode { channels: Some(2) },
+                    subtitles: SubtitleAction::Keep,
+                }
+            )],
+            "only the file that needs work is queued, and only for the track that is wrong"
+        );
+    }
+
+    /// The rule that decides a quarter of this library. The LG decodes MPEG-4
+    /// and the Chromecast does not, so the same AVI is a remux against one and
+    /// a re-encode against the pair.
+    #[tokio::test]
+    async fn naming_two_targets_queues_the_work_that_satisfies_both() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+        build(
+            &media_root.join("film.avi"),
+            &["-c:v", "mpeg4", "-c:a", "aac", "-ac", "2"],
+        );
+
+        let scan = |targets: Vec<String>, work: PathBuf| {
+            let media_root = media_root.to_path_buf();
+            async move {
+                fs::create_dir_all(&work).unwrap();
+                ScanCommand::new(media_root, work.clone(), None, &targets)
+                    .unwrap()
+                    .execute()
+                    .await
+                    .unwrap();
+                queued(&work)
+            }
+        };
+
+        let lg = scan(vec!["lg-cx-webos".to_string()], media_root.join("lg")).await;
+        assert_eq!(
+            lg,
+            vec![(
+                "film.avi".to_string(),
+                Operation::Remux {
+                    audio: AudioAction::Copy,
+                    subtitles: SubtitleAction::Keep,
+                }
+            )],
+            "the LG decodes MPEG-4, so only the container is wrong"
+        );
+
+        let both = scan(
+            vec!["lg-cx-webos".to_string(), "chromecast-gen2-3".to_string()],
+            media_root.join("both"),
+        )
+        .await;
+        assert_eq!(
+            both,
+            vec![("film.avi".to_string(), Operation::Reencode)],
+            "the Chromecast does not, and a file that plays on only one device \
+             is one the Pi is asked to transcode when it is played on the other"
+        );
+    }
+
     #[tokio::test]
     async fn scan_queues_avi_files_alongside_the_rest() {
         let temp_dir = TempDir::new().unwrap();
@@ -406,10 +741,16 @@ mod tests {
         // Already an MP4, so there is nothing to do to it.
         fs::write(media_root.join("done.mp4"), "").unwrap();
 
-        ScanCommand::new(media_root.to_path_buf(), media_root.to_path_buf(), None)
-            .execute()
-            .await
-            .unwrap();
+        ScanCommand::new(
+            media_root.to_path_buf(),
+            media_root.to_path_buf(),
+            None,
+            &[],
+        )
+        .unwrap()
+        .execute()
+        .await
+        .unwrap();
 
         let job_count = fs::read_dir(media_root.join("_queue"))
             .unwrap()
@@ -447,7 +788,9 @@ mod tests {
             media_root.to_path_buf(),
             temp_dir.path().to_path_buf(),
             None,
-        );
+            &[],
+        )
+        .unwrap();
         let result = scan_cmd.execute().await;
 
         assert!(result.is_ok());
@@ -491,7 +834,9 @@ mod tests {
             media_root.to_path_buf(),
             temp_dir.path().to_path_buf(),
             None,
-        );
+            &[],
+        )
+        .unwrap();
         let result = scan_cmd.execute().await;
 
         assert!(result.is_ok());

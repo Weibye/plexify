@@ -36,6 +36,33 @@ pub enum Field {
 }
 
 impl Field {
+    /// Every property a client's Direct Play decision turns on.
+    ///
+    /// The list exists to be walked by a test, because the failure it guards
+    /// against has already happened once: `MediaProbe` carried the container
+    /// and nothing checked it, so every AVI in the library reported as
+    /// conforming on the device whose measured stall is the reason the remux
+    /// path exists. Nothing said what evaluating a file *consists of*, so the
+    /// probe and the checks could drift apart in silence.
+    ///
+    /// A variant added here fails `every_field_is_reachable` until something
+    /// produces it, which is the question worth asking of a new field: not
+    /// "does anything read this" but "does the decision account for it".
+    pub const ALL: [Field; 12] = [
+        Field::Container,
+        Field::NoVideoStream,
+        Field::VideoCodec,
+        Field::VideoProfile,
+        Field::VideoLevel,
+        Field::BitDepth,
+        Field::PixelFormat,
+        Field::Resolution,
+        Field::RefFrames,
+        Field::AudioCodec,
+        Field::AudioChannels,
+        Field::Subtitles,
+    ];
+
     /// What it costs to make this property conform.
     ///
     /// Anything the video bitstream itself carries has to be re-encoded.
@@ -531,6 +558,116 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    /// Every field in `Field::ALL` is produced by some file, so the list of
+    /// properties and the checks that read them cannot drift apart in silence.
+    ///
+    /// This is the check that was missing when `MediaProbe` carried a container
+    /// nothing evaluated. It is deliberately not "is this struct field read":
+    /// a `pub` field has no reader the compiler can see, and the question that
+    /// matters is whether the decision accounts for the property, which is what
+    /// walking `ALL` asks.
+    ///
+    /// One file cannot exercise them all, and that is a property of the model
+    /// rather than a gap in the test: a file with no video stream has no bit
+    /// depth to be wrong about, and profile and level are only asked once the
+    /// codec is one the client decodes.
+    #[test]
+    fn every_field_is_reachable() {
+        let broken: Vec<(&str, MediaProbe)> = vec![
+            (
+                "no video",
+                MediaProbe {
+                    video: None,
+                    ..plexify_output()
+                },
+            ),
+            (
+                "container",
+                MediaProbe {
+                    container: Some("avi".to_string()),
+                    ..plexify_output()
+                },
+            ),
+            ("codec", with_video(|video| video.codec = "av1".to_string())),
+            (
+                "profile",
+                with_video(|video| video.profile = Some("extended".to_string())),
+            ),
+            ("level", with_video(|video| video.level = Some(50))),
+            ("bit depth", with_video(|video| video.bit_depth = Some(10))),
+            (
+                "pixel format",
+                with_video(|video| video.pixel_format = Some("yuv444p".to_string())),
+            ),
+            ("resolution", with_video(|video| video.height = Some(2160))),
+            (
+                "ref frames",
+                with_video(|video| video.ref_frames = Some(16)),
+            ),
+            (
+                "audio codec",
+                MediaProbe {
+                    audio: vec![AudioStream {
+                        codec: "dts".to_string(),
+                        channels: Some(2),
+                        language: None,
+                    }],
+                    ..plexify_output()
+                },
+            ),
+            (
+                "audio channels",
+                MediaProbe {
+                    audio: vec![AudioStream {
+                        codec: "aac".to_string(),
+                        channels: Some(6),
+                        language: None,
+                    }],
+                    ..plexify_output()
+                },
+            ),
+            (
+                "subtitles",
+                MediaProbe {
+                    subtitles: vec![SubtitleStream {
+                        codec: "hdmv_pgs_subtitle".to_string(),
+                        language: None,
+                    }],
+                    ..plexify_output()
+                },
+            ),
+        ];
+
+        let mut reached = std::collections::BTreeSet::new();
+        for (what, probe) in &broken {
+            let verdict = evaluate(probe, &chromecast());
+            assert!(
+                !verdict.reasons().is_empty(),
+                "the {what} file was meant to fail and did not"
+            );
+            reached.extend(verdict.reasons().iter().map(|reason| reason.field));
+        }
+
+        let all: std::collections::BTreeSet<Field> = Field::ALL.into_iter().collect();
+        assert_eq!(
+            all.difference(&reached).collect::<Vec<_>>(),
+            Vec::<&Field>::new(),
+            "a Field nothing produces is a property the checks do not account for"
+        );
+    }
+
+    /// A conforming file with one thing wrong with its video.
+    fn with_video(break_it: impl FnOnce(&mut VideoStream)) -> MediaProbe {
+        let mut probe = plexify_output();
+        break_it(
+            probe
+                .video
+                .as_mut()
+                .expect("the fixture has a video stream"),
+        );
+        probe
     }
 
     fn claims(conformance: &Conformance) -> Vec<String> {
