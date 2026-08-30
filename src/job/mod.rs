@@ -73,13 +73,36 @@ pub enum SubtitleAction {
     /// Carry them into the output as `mov_text`.
     #[default]
     Keep,
-    /// Leave them out.
+    /// Leave them out, and write nothing in their place.
     ///
     /// Measured: the LG's Plex app burns `mov_text` into the picture rather
     /// than overlaying it, and re-encodes the video to do it. Carrying a track
     /// the client cannot overlay would cost the transcode a remux exists to
     /// avoid, so on that target the track has to go.
+    ///
+    /// **Nothing produces this.** `Extract` empties the container just as
+    /// thoroughly and keeps the tracks, so there is no case left where losing
+    /// them outright is the better answer. It is kept for one reason that is
+    /// not a guess: a job file is a self-describing snapshot that outlives the
+    /// code which wrote it, and the version of `for_conformance` that shipped
+    /// with the remux path produced this. A queue holding one of those jobs
+    /// still has to deserialize. Removing the variant is safe only once no
+    /// such job file can exist.
     Drop,
+    /// Take the subtitles out of the container and write the ones that can be
+    /// written beside it as sidecar files.
+    ///
+    /// The container then carries no subtitle stream, so nothing is burned in,
+    /// and the server converts a sidecar for whatever the client asks for
+    /// without touching the picture.
+    ///
+    /// Note what the name does not promise: **every** stream leaves the
+    /// container, but only text becomes a sidecar. An image-based track - PGS,
+    /// VobSub - is pictures of text, and turning it into text would be OCR, so
+    /// it is reported and left where it is. On that path this does what `Drop`
+    /// does, and the only copy of the track is then the source file, which
+    /// `work` keeps beside the output as `.disabled` rather than deleting.
+    Extract,
 }
 
 impl Operation {
@@ -113,8 +136,11 @@ impl Operation {
             (false, false) => AudioAction::Copy,
         };
 
+        // The track is why the client would burn the picture, but it is also
+        // the subtitles the viewer turned on. It leaves the container and lands
+        // beside it rather than being lost.
         let subtitles = if has(Field::Subtitles) {
-            SubtitleAction::Drop
+            SubtitleAction::Extract
         } else {
             SubtitleAction::Keep
         };
@@ -132,7 +158,19 @@ impl Operation {
         !matches!(
             self,
             Operation::Remux {
-                subtitles: SubtitleAction::Drop,
+                subtitles: SubtitleAction::Drop | SubtitleAction::Extract,
+                ..
+            }
+        )
+    }
+
+    /// Whether the source's subtitle tracks are written beside the output
+    /// instead of into it.
+    pub fn extracts_subtitles(&self) -> bool {
+        matches!(
+            self,
+            Operation::Remux {
+                subtitles: SubtitleAction::Extract,
                 ..
             }
         )
@@ -650,7 +688,9 @@ mod tests {
             })
         );
 
-        // A track the client burns in: drop it, and do not touch the audio.
+        // A track the client burns in: take it out of the container and write
+        // it beside the file, and do not touch the audio. It is the subtitles
+        // the viewer turned on, so losing it is not a fix.
         let mut burned_in = conforming();
         burned_in.subtitles = vec![SubtitleStream {
             codec: "mov_text".to_string(),
@@ -660,7 +700,7 @@ mod tests {
             Operation::for_conformance(&evaluate(&burned_in, &lg), &lg),
             Some(Operation::Remux {
                 audio: AudioAction::Copy,
-                subtitles: SubtitleAction::Drop,
+                subtitles: SubtitleAction::Extract,
             })
         );
 

@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::job::{AudioAction, Job, MediaFileType, Operation, QualitySettings};
 use crate::paths::to_forward_slashes;
+use crate::subtitles::{self, Sidecar, SidecarFormat};
 
 /// Builder for constructing FFmpeg commands with a fluent API.
 ///
@@ -428,6 +429,14 @@ const BITMAP_SUBTITLE_CODECS: [&str; 5] = [
     "xsub",
 ];
 
+/// Whether a codec is pictures of text rather than text.
+///
+/// Exposed because extraction has to answer the same question: an image track
+/// cannot become a sidecar, and turning one into text would be OCR.
+pub fn is_bitmap_subtitle(codec: &str) -> bool {
+    BITMAP_SUBTITLE_CODECS.contains(&codec)
+}
+
 /// One subtitle stream, as FFprobe describes it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubtitleStream {
@@ -780,11 +789,11 @@ impl FFmpegProcessor {
         // disk speed, so there is no work worth protecting - and the chunk path
         // re-encodes the video, which would throw away the copy that is the
         // whole point of the operation.
-        if let (Some(work_folder), Operation::Reencode) = (work_folder, job.operation) {
-            if let Some(duration) = self.probe_duration(&input_path).await {
-                if duration >= self.chunking.min_source_seconds {
-                    return self
-                        .process_in_chunks(
+        let chunked = match (work_folder, job.operation) {
+            (Some(work_folder), Operation::Reencode) => {
+                match self.probe_duration(&input_path).await {
+                    Some(duration) if duration >= self.chunking.min_source_seconds => {
+                        self.process_in_chunks(
                             job,
                             &input_path,
                             subtitles.as_ref(),
@@ -792,13 +801,95 @@ impl FFmpegProcessor {
                             work_folder,
                             duration,
                         )
-                        .await;
+                        .await?;
+                        true
+                    }
+                    _ => false,
                 }
+            }
+            _ => false,
+        };
+
+        if !chunked {
+            self.process_in_one_pass(job, &input_path, subtitles.as_ref(), &output_path)
+                .await?;
+        }
+
+        // Only once the media file itself is written. A sidecar beside an
+        // output that never arrived is a subtitle for nothing.
+        if job.operation.extracts_subtitles() {
+            self.extract_sidecars(&input_path, &output_path).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Write the source's text subtitle tracks beside the output.
+    ///
+    /// They are written next to the output wherever that is - the work folder
+    /// for a job that has one - and travel with it, for the same reason the
+    /// video does: a media server that indexes a half-written subtitle shows a
+    /// broken track.
+    async fn extract_sidecars(&self, input_path: &Path, output_path: &Path) -> Result<()> {
+        let Some(streams) = self.probe_subtitle_streams(input_path).await else {
+            warn!("FFprobe could not read the subtitle streams of {input_path:?}; no sidecar was written, and the tracks are still in the source.");
+            return Ok(());
+        };
+
+        let plan = subtitles::plan(&streams, output_path);
+
+        for stream in &plan.unconvertible {
+            warn!(
+                "{input_path:?} carries a {} subtitle track{}; it is pictures of text and cannot become a sidecar, so it is left behind rather than guessed at.",
+                stream.codec,
+                stream
+                    .language
+                    .as_deref()
+                    .map(|language| format!(" in {language}"))
+                    .unwrap_or_default()
+            );
+        }
+
+        for sidecar in &plan.sidecars {
+            self.run(sidecar.ffmpeg_args(input_path), "subtitle sidecar")
+                .await?;
+
+            if sidecar.format == SidecarFormat::Original {
+                self.keep_only_if_styled(sidecar).await;
             }
         }
 
-        self.process_in_one_pass(job, &input_path, subtitles.as_ref(), &output_path)
-            .await
+        Ok(())
+    }
+
+    /// Delete a preserved original whose events turn out not to need it.
+    ///
+    /// The plan proposes one for every ASS track, because only the events can
+    /// say whether the conversion to SRT loses anything. Where it loses
+    /// nothing, a second file offering the viewer the same words twice is
+    /// clutter.
+    async fn keep_only_if_styled(&self, sidecar: &Sidecar) {
+        let styled = match tokio::fs::read_to_string(&sidecar.path).await {
+            Ok(text) => subtitles::carries_styling(&text),
+            // Unreadable is not the same as unstyled, and this is the branch
+            // that deletes: keep the file and let a person look at it.
+            Err(e) => {
+                warn!(
+                    "Could not read {:?} to see whether it is styled, so it is kept: {e}",
+                    sidecar.path
+                );
+                return;
+            }
+        };
+
+        if styled {
+            info!(
+                "Kept {:?} beside the SRT: its events are positioned or styled, which SRT cannot hold.",
+                sidecar.path
+            );
+        } else if let Err(e) = tokio::fs::remove_file(&sidecar.path).await {
+            warn!("Could not remove the unstyled {:?}: {e}", sidecar.path);
+        }
     }
 
     /// Work out which of a source's subtitle streams can go into the output,
@@ -1309,6 +1400,13 @@ impl FFmpegProcessor {
             ));
         }
 
+        // A media file and the files named after it move as a group, and in
+        // this order: a sidecar that arrives first is a subtitle for a file
+        // that is not there yet, and one that never arrives is a track the
+        // library will never show.
+        self.move_sidecars(&work_output_path, &final_output_path)
+            .await;
+
         // The output is where it belongs, so the move has succeeded. A work file
         // that will not delete is worth a word but not a failed job: reporting
         // failure here would send the job round again to find its own finished
@@ -1324,6 +1422,65 @@ impl FFmpegProcessor {
 
         Ok(())
     }
+    /// Move the subtitle sidecars written beside a work-folder output to sit
+    /// beside the finished file.
+    ///
+    /// Only the subtitle extensions this project writes are carried, rather
+    /// than everything sharing the stem. The work folder also holds this job's
+    /// chunk directory and its partial files, and a mover that took anything
+    /// with the right prefix would eventually take one of those.
+    ///
+    /// A sidecar that will not move is a warning, not a failed job: the media
+    /// file is already at its destination, and failing here would send the job
+    /// round again to find its own finished output in place.
+    async fn move_sidecars(&self, work_output: &Path, final_output: &Path) {
+        const SIDECAR_EXTENSIONS: [&str; 5] = ["srt", "ass", "ssa", "vtt", "ttxt"];
+
+        let (Some(directory), Some(work_stem), Some(final_stem)) = (
+            work_output.parent(),
+            work_output.file_stem().map(|stem| stem.to_string_lossy()),
+            final_output.file_stem().map(|stem| stem.to_string_lossy()),
+        ) else {
+            return;
+        };
+
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(suffix) = name
+                .strip_prefix(work_stem.as_ref())
+                .and_then(|rest| rest.strip_prefix('.'))
+            else {
+                continue;
+            };
+
+            let extension = suffix.rsplit('.').next().unwrap_or_default();
+            if !SIDECAR_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()) {
+                continue;
+            }
+
+            let destination = final_output.with_file_name(format!("{final_stem}.{suffix}"));
+            if let Err(e) = tokio::fs::copy(&path, &destination).await {
+                warn!("Could not put the subtitle {destination:?} beside its file: {e}");
+                continue;
+            }
+
+            if let Err(e) = tokio::fs::remove_file(&path).await {
+                warn!("Could not remove {path:?} after moving it: {e}");
+            }
+
+            info!("Moved subtitle: {:?} -> {:?}", path, destination);
+        }
+    }
+
     pub async fn disable_source_files(&self, job: &Job, media_root: Option<&Path>) -> Result<()> {
         let input_path = job.full_input_path(media_root);
         let disabled_input = input_path.with_extension(format!(
@@ -3810,6 +3967,368 @@ mod tests {
                 .to_string_lossy()
                 .to_string()],
             "each worker takes its own staging file with it"
+        );
+    }
+
+    /// A source carrying two text subtitle tracks, one of them styled ASS.
+    fn build_subtitled_source(path: &Path, directory: &Path) -> PathBuf {
+        let english = directory.join("english.srt");
+        std::fs::write(
+            &english,
+            "1\n00:00:00,100 --> 00:00:01,500\nHello there.\n\n",
+        )
+        .unwrap();
+
+        let signs = directory.join("signs.ass");
+        std::fs::write(
+            &signs,
+            "[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize\nStyle: Default,Arial,20\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.10,0:00:01.50,Default,,0,0,0,,{\\pos(320,100)}SHOP\n",
+        )
+        .unwrap();
+
+        let built = std::process::Command::new("ffmpeg")
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=2:size=160x120:rate=10",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=duration=2",
+            ])
+            .arg("-i")
+            .arg(&english)
+            .arg("-i")
+            .arg(&signs)
+            .args([
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
+                "-map",
+                "2:s",
+                "-map",
+                "3:s",
+                "-c:v",
+                "libx264",
+                "-c:a",
+                "aac",
+                "-c:s",
+                "copy",
+                "-metadata:s:s:0",
+                "language=eng",
+                "-metadata:s:s:1",
+                "language=jpn",
+                "-y",
+            ])
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(built.success(), "could not build the subtitled source");
+
+        path.to_path_buf()
+    }
+
+    fn sidecar_names(directory: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(directory)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| !name.ends_with(".mkv") && !name.ends_with(".mp4"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The whole point of #162: the tracks leave the container so nothing is
+    /// burned in, and they land beside it rather than being lost.
+    #[test]
+    fn extracting_subtitles_empties_the_container_and_writes_them_beside_it() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let source = temp_dir.path().join("sources");
+        std::fs::create_dir_all(&source).unwrap();
+        let input = build_subtitled_source(&source.join("show.mkv"), &source);
+
+        let job = Job::new(
+            input.clone(),
+            MediaFileType::Mkv,
+            Operation::Remux {
+                audio: AudioAction::Copy,
+                subtitles: SubtitleAction::Extract,
+            },
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            temp_dir.path(),
+        );
+
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(FFmpegProcessor::new(false).process_job(&job, None, None))
+            .expect("the remux should succeed");
+
+        // Nothing left in the container to burn in.
+        assert!(
+            !streams_of(&job.output_path)
+                .iter()
+                .any(|stream| stream.starts_with("subtitle")),
+            "the output still carries a subtitle stream: {:?}",
+            streams_of(&job.output_path)
+        );
+
+        let names = sidecar_names(&source);
+        assert!(
+            names.contains(&"show.eng.srt".to_string()),
+            "the English track should be beside the file: {names:?}"
+        );
+        // Extracted even though it is not English: `work` disables the source,
+        // so a track left behind is lost.
+        assert!(
+            names.contains(&"show.jpn.srt".to_string()),
+            "the Japanese track should survive too: {names:?}"
+        );
+        // The styled ASS is kept as well, because SRT cannot hold its position.
+        assert!(
+            names.contains(&"show.jpn.ass".to_string()),
+            "a styled track keeps its original: {names:?}"
+        );
+
+        let srt = std::fs::read_to_string(source.join("show.eng.srt")).unwrap();
+        assert!(srt.contains("Hello there."), "{srt}");
+    }
+
+    /// The population this whole issue is about: an MP4 this project produced
+    /// itself, carrying `mov_text`. Proposing an original for it asked FFmpeg
+    /// for a muxer that does not exist, and the job failed *after* the media
+    /// file had been written - at its destination, with no work folder to hold
+    /// it back, and an error naming no subtitle.
+    #[test]
+    fn a_mov_text_source_extracts_instead_of_failing_the_job() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let source = temp_dir.path().join("sources");
+        std::fs::create_dir_all(&source).unwrap();
+
+        let english = source.join("english.srt");
+        std::fs::write(
+            &english,
+            "1\n00:00:00,100 --> 00:00:01,500\nAlready ours.\n\n",
+        )
+        .unwrap();
+
+        // mov_text is an MP4 codec; Matroska will not carry it. The output
+        // therefore lands on the input's own path, so this runs through a work
+        // folder - which is the realistic route anyway.
+        let input = source.join("past-output.mp4");
+        let built = std::process::Command::new("ffmpeg")
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=2:size=160x120:rate=10",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=duration=2",
+            ])
+            .arg("-i")
+            .arg(&english)
+            .args([
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
+                "-map",
+                "2:s",
+                "-c:v",
+                "libx264",
+                "-c:a",
+                "aac",
+                "-c:s",
+                "mov_text",
+                "-metadata:s:s:0",
+                "language=eng",
+                "-y",
+            ])
+            .arg(&input)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(built.success(), "could not build the mov_text source");
+        assert!(
+            stream_codecs(&input)
+                .iter()
+                .any(|codec| codec == "mov_text"),
+            "the fixture must actually carry mov_text: {:?}",
+            stream_codecs(&input)
+        );
+
+        let job = Job::new(
+            input,
+            MediaFileType::Mkv,
+            Operation::Remux {
+                audio: AudioAction::Copy,
+                subtitles: SubtitleAction::Extract,
+            },
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            temp_dir.path(),
+        );
+
+        let work_folder = temp_dir.path().join("work");
+        std::fs::create_dir_all(&work_folder).unwrap();
+
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(FFmpegProcessor::new(false).process_job(&job, None, Some(&work_folder)))
+            .expect("a mov_text source must not fail the job");
+
+        let names = sidecar_names(&work_folder);
+        assert!(
+            names.iter().any(|name| name.ends_with(".eng.srt")),
+            "the track should have been extracted: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.ends_with(".ttxt")),
+            "nothing should propose a file FFmpeg cannot write: {names:?}"
+        );
+    }
+
+    /// The unstyled original is deleted again: two files with the same words is
+    /// clutter, and only the events could say which case this was.
+    #[test]
+    fn an_unstyled_ass_track_leaves_only_its_srt() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let source = temp_dir.path().join("sources");
+        std::fs::create_dir_all(&source).unwrap();
+
+        let plain = source.join("plain.ass");
+        std::fs::write(
+            &plain,
+            "[Script Info]\nScriptType: v4.00+\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize\nStyle: Default,Arial,20\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.10,0:00:01.50,Default,,0,0,0,,Just dialogue.\n",
+        )
+        .unwrap();
+
+        let input = source.join("show.mkv");
+        let built = std::process::Command::new("ffmpeg")
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=2:size=160x120:rate=10",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=duration=2",
+            ])
+            .arg("-i")
+            .arg(&plain)
+            .args([
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
+                "-map",
+                "2:s",
+                "-c:v",
+                "libx264",
+                "-c:a",
+                "aac",
+                "-c:s",
+                "copy",
+                "-metadata:s:s:0",
+                "language=eng",
+                "-y",
+            ])
+            .arg(&input)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(built.success(), "could not build the source");
+
+        let job = Job::new(
+            input,
+            MediaFileType::Mkv,
+            Operation::Remux {
+                audio: AudioAction::Copy,
+                subtitles: SubtitleAction::Extract,
+            },
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            temp_dir.path(),
+        );
+
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(FFmpegProcessor::new(false).process_job(&job, None, None))
+            .expect("the remux should succeed");
+
+        let names = sidecar_names(&source);
+        assert!(names.contains(&"show.eng.srt".to_string()), "{names:?}");
+        assert!(
+            !names.iter().any(|name| name == "show.eng.ass"),
+            "an unstyled original is not worth keeping: {names:?}"
+        );
+    }
+
+    /// A sidecar written into the work folder has to arrive beside the finished
+    /// file, or the library never sees the track.
+    #[tokio::test]
+    async fn sidecars_move_out_of_the_work_folder_with_their_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let work_folder = temp_dir.path().join("work");
+        let media = temp_dir.path().join("media");
+        std::fs::create_dir_all(&work_folder).unwrap();
+        std::fs::create_dir_all(&media).unwrap();
+
+        let job = Job::new(
+            media.join("show.mkv"),
+            MediaFileType::Mkv,
+            Operation::Remux {
+                audio: AudioAction::Copy,
+                subtitles: SubtitleAction::Extract,
+            },
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            &media,
+        );
+
+        let work_output = job.work_folder_output_path(&work_folder);
+        let work_stem = work_output
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        std::fs::write(&work_output, "video").unwrap();
+        std::fs::write(work_folder.join(format!("{work_stem}.eng.srt")), "subs").unwrap();
+        // Not a sidecar, and it must not be dragged along.
+        std::fs::write(work_folder.join(format!("{work_stem}.log")), "noise").unwrap();
+
+        FFmpegProcessor::new(false)
+            .move_to_destination(&job, None, &work_folder)
+            .await
+            .expect("the move should succeed");
+
+        assert!(media.join("show.eng.srt").exists(), "the subtitle followed");
+        assert!(!work_folder.join(format!("{work_stem}.eng.srt")).exists());
+        assert!(
+            work_folder.join(format!("{work_stem}.log")).exists(),
+            "only subtitles move"
         );
     }
 
