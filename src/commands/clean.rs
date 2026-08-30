@@ -635,7 +635,7 @@ fn identify(job_file: &Path, job: Option<&Job>) -> JobIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::{Job, MediaFileType, PostProcessingSettings, QualitySettings};
+    use crate::job::{Job, MediaFileType, Operation, PostProcessingSettings, QualitySettings};
     use tempfile::TempDir;
 
     /// Says yes, and records that it was asked.
@@ -717,6 +717,7 @@ mod tests {
         Job::new(
             PathBuf::from(input),
             MediaFileType::Mkv,
+            Operation::Reencode,
             QualitySettings::default(),
             PostProcessingSettings::default(),
             Path::new("/media"),

@@ -84,6 +84,9 @@ impl AddCommand {
                         relative_path
                     );
                 }
+                MediaFileType::Avi => {
+                    info!("✅ Successfully created remux job for: {:?}", relative_path);
+                }
             },
             JobProcessResult::OutputExists => {
                 warn!("⚠️ Output file already exists for: {:?}", relative_path);

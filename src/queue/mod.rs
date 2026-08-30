@@ -771,7 +771,7 @@ impl<'a> ClaimedJob<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::{Job, MediaFileType, PostProcessingSettings, QualitySettings};
+    use crate::job::{Job, MediaFileType, Operation, PostProcessingSettings, QualitySettings};
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -795,6 +795,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("show.mkv"),
             MediaFileType::Mkv,
+            Operation::Reencode,
             QualitySettings::default(),
             PostProcessingSettings::default(),
             temp_dir.path(),
@@ -824,6 +825,7 @@ mod tests {
         Job::new(
             PathBuf::from(format!("{}.mkv", "l".repeat(64 * 1024))),
             MediaFileType::Mkv,
+            Operation::Reencode,
             QualitySettings::default(),
             PostProcessingSettings::default(),
             media_root,
@@ -955,6 +957,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("waited.mkv"),
             MediaFileType::Mkv,
+            Operation::Reencode,
             QualitySettings::default(),
             PostProcessingSettings::default(),
             temp_dir.path(),
@@ -992,6 +995,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("long-film.mkv"),
             MediaFileType::Mkv,
+            Operation::Reencode,
             QualitySettings::default(),
             PostProcessingSettings::default(),
             temp_dir.path(),
@@ -1138,6 +1142,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("corrupt.mkv"),
             MediaFileType::Mkv,
+            Operation::Reencode,
             QualitySettings::default(),
             PostProcessingSettings::default(),
             temp_dir.path(),
@@ -1202,6 +1207,8 @@ mod tests {
         let job: Job = serde_json::from_str(legacy).unwrap();
         assert_eq!(job.attempts, 0);
         assert_eq!(job.last_error, None);
+        // It was queued when every job re-encoded, so that is what it still is.
+        assert_eq!(job.operation, Operation::Reencode);
     }
 
     #[test]
@@ -1213,6 +1220,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("show.mkv"),
             MediaFileType::Mkv,
+            Operation::Reencode,
             QualitySettings::default(),
             PostProcessingSettings::default(),
             temp_dir.path(),
@@ -1449,6 +1457,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("test.webm"),
             MediaFileType::WebM,
+            Operation::Reencode,
             quality,
             post_processing,
             media_root,
@@ -1490,6 +1499,7 @@ mod tests {
                     "Breaking Bad S01E03 Gray Matter.mkv",
                 ),
                 MediaFileType::Mkv,
+                Operation::Reencode,
                 quality.clone(),
                 post_processing.clone(),
                 media_root,
@@ -1502,6 +1512,7 @@ mod tests {
                     "Breaking Bad S01E01 Pilot.mkv",
                 ),
                 MediaFileType::Mkv,
+                Operation::Reencode,
                 quality.clone(),
                 post_processing.clone(),
                 media_root,
@@ -1515,6 +1526,7 @@ mod tests {
                     "Better Call Saul S01E02 Mijo.mkv",
                 ),
                 MediaFileType::Mkv,
+                Operation::Reencode,
                 quality.clone(),
                 post_processing.clone(),
                 media_root,
@@ -1527,6 +1539,7 @@ mod tests {
                     "Better Call Saul S01E01 Uno.mkv",
                 ),
                 MediaFileType::Mkv,
+                Operation::Reencode,
                 quality.clone(),
                 post_processing.clone(),
                 media_root,
@@ -1537,6 +1550,7 @@ mod tests {
                     .join("The Matrix (1999)")
                     .join("The Matrix (1999).mkv"),
                 MediaFileType::Mkv,
+                Operation::Reencode,
                 quality.clone(),
                 post_processing.clone(),
                 media_root,
@@ -1593,6 +1607,7 @@ mod tests {
                     "Breaking Bad S01E03 Gray Matter.mkv",
                 ),
                 MediaFileType::Mkv,
+                Operation::Reencode,
                 quality.clone(),
                 post_processing.clone(),
                 media_root,
@@ -1605,6 +1620,7 @@ mod tests {
                     "Breaking Bad S01E01 Pilot.mkv",
                 ),
                 MediaFileType::Mkv,
+                Operation::Reencode,
                 quality.clone(),
                 post_processing.clone(),
                 media_root,
@@ -1646,6 +1662,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("show.mkv"),
             MediaFileType::Mkv,
+            Operation::Reencode,
             QualitySettings::default(),
             PostProcessingSettings::default(),
             temp_dir.path(),

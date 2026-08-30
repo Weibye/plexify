@@ -315,7 +315,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_job_whose_output_already_exists_is_completed_without_transcoding() {
-        use crate::job::{Job, MediaFileType, PostProcessingSettings, QualitySettings};
+        use crate::job::{Job, MediaFileType, Operation, PostProcessingSettings, QualitySettings};
 
         let temp_dir = TempDir::new().unwrap();
         let media_root = temp_dir.path();
@@ -329,6 +329,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("show.mkv"),
             MediaFileType::Mkv,
+            Operation::Reencode,
             QualitySettings::default(),
             PostProcessingSettings::default(),
             media_root,

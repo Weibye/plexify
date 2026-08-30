@@ -6,7 +6,7 @@ use tracing::{debug, error, info, warn};
 
 use uuid::Uuid;
 
-use crate::job::{Job, MediaFileType, QualitySettings};
+use crate::job::{AudioAction, Job, MediaFileType, Operation, QualitySettings};
 use crate::paths::to_forward_slashes;
 
 /// Builder for constructing FFmpeg commands with a fluent API.
@@ -199,14 +199,43 @@ impl FFmpegCommandBuilder {
         self
     }
 
+    /// Copy the video bitstream through untouched.
+    pub fn with_video_copy(mut self) -> Self {
+        self.output_options
+            .extend_from_slice(&["-c:v".to_string(), "copy".to_string()]);
+        self
+    }
+
+    /// Copy the audio through untouched.
+    pub fn with_audio_copy(mut self) -> Self {
+        self.output_options
+            .extend_from_slice(&["-c:a".to_string(), "copy".to_string()]);
+        self
+    }
+
     /// Copy video and audio through untouched.
-    pub fn with_video_and_audio_copy(mut self) -> Self {
-        self.output_options.extend_from_slice(&[
-            "-c:v".to_string(),
-            "copy".to_string(),
-            "-c:a".to_string(),
-            "copy".to_string(),
-        ]);
+    pub fn with_video_and_audio_copy(self) -> Self {
+        self.with_video_copy().with_audio_copy()
+    }
+
+    /// Mix the audio down to this many channels.
+    ///
+    /// A layout the client cannot render is a reason to touch the audio all on
+    /// its own: a 5.1 AAC track is in a codec the Chromecast decodes and a
+    /// layout its receiver does not.
+    pub fn with_audio_channels(mut self, channels: u32) -> Self {
+        self.output_options
+            .extend_from_slice(&["-ac".to_string(), channels.to_string()]);
+        self
+    }
+
+    /// Put the MP4 index in front of the media data.
+    ///
+    /// The muxer writes it last either way; this rewrites the finished file to
+    /// move it, so it costs one extra pass over the output.
+    pub fn with_faststart(mut self) -> Self {
+        self.output_options
+            .extend_from_slice(&["-movflags".to_string(), "+faststart".to_string()]);
         self
     }
 
@@ -564,6 +593,34 @@ fn media_and_subtitle_mappings(
     mappings
 }
 
+/// The codec options a job's operation asks for.
+///
+/// Whether the output carries subtitles at all is decided by the caller, which
+/// has to leave them out of the stream mappings as well as out of the codecs.
+fn with_operation(builder: FFmpegCommandBuilder, job: &Job) -> FFmpegCommandBuilder {
+    match job.operation {
+        // The index goes to the front only on this path. A remux exists because
+        // the container is what the player choked on, and leaving the new one
+        // indexed from the end would answer the wrong half of the question.
+        Operation::Remux { audio, .. } => {
+            let builder = builder.with_video_copy().with_faststart();
+            match audio {
+                AudioAction::Copy => builder.with_audio_copy(),
+                AudioAction::Transcode { channels } => {
+                    let builder = builder.with_audio_encoding(&job.quality_settings);
+                    match channels {
+                        Some(channels) => builder.with_audio_channels(channels),
+                        None => builder,
+                    }
+                }
+            }
+        }
+        Operation::Reencode => builder
+            .with_video_encoding(&job.quality_settings)
+            .with_audio_encoding(&job.quality_settings),
+    }
+}
+
 /// How a source is divided up for a resumable encode.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Chunking {
@@ -690,23 +747,27 @@ impl FFmpegProcessor {
         // A WebM job exists to attach an external subtitle, so a missing one is
         // an error rather than something to encode around. An MKV carries its
         // own subtitle streams, and may carry none.
-        let subtitles = match job.file_type {
-            MediaFileType::WebM => {
+        //
+        // Decided once, here, rather than in each encode path: a source over
+        // the chunking threshold must carry the same subtitles as one under it,
+        // and the surest way to keep that true is for both to be handed the
+        // same answer. `None` is that answer too - an operation that drops the
+        // tracks does not probe for them, which is one FFprobe per file saved
+        // across a library.
+        let subtitles = match (job.operation.keeps_subtitles(), &job.file_type) {
+            (false, _) => None,
+            (true, MediaFileType::WebM) => {
                 let vtt_path = job
                     .full_subtitle_path(media_root)
                     .ok_or_else(|| anyhow!("WebM job missing subtitle path"))?;
                 if !vtt_path.exists() {
                     return Err(anyhow!("Required subtitle file not found: {vtt_path:?}"));
                 }
-                SubtitleSource::External(vtt_path)
+                Some(SubtitleSource::External(vtt_path))
             }
-            // Decided once, here, rather than in each encode path: a source
-            // over the chunking threshold must carry the same subtitles as one
-            // under it, and the surest way to keep that true is for both to be
-            // handed the same answer.
-            MediaFileType::Mkv => {
-                SubtitleSource::Embedded(self.select_subtitles(&input_path).await)
-            }
+            (true, MediaFileType::Mkv | MediaFileType::Avi) => Some(SubtitleSource::Embedded(
+                self.select_subtitles(&input_path).await,
+            )),
         };
 
         // A long source is encoded a piece at a time, so that a worker which is
@@ -714,14 +775,19 @@ impl FFmpegProcessor {
         // rather than hours of work that has to be done again. That needs
         // somewhere to keep the pieces, and a duration to divide up: without
         // either, fall back to encoding the file in one pass.
-        if let Some(work_folder) = work_folder {
+        //
+        // Only a re-encode is chunked. A remux copies the bitstream and runs at
+        // disk speed, so there is no work worth protecting - and the chunk path
+        // re-encodes the video, which would throw away the copy that is the
+        // whole point of the operation.
+        if let (Some(work_folder), Operation::Reencode) = (work_folder, job.operation) {
             if let Some(duration) = self.probe_duration(&input_path).await {
                 if duration >= self.chunking.min_source_seconds {
                     return self
                         .process_in_chunks(
                             job,
                             &input_path,
-                            &subtitles,
+                            subtitles.as_ref(),
                             &output_path,
                             work_folder,
                             duration,
@@ -731,7 +797,7 @@ impl FFmpegProcessor {
             }
         }
 
-        self.process_in_one_pass(job, &input_path, &subtitles, &output_path)
+        self.process_in_one_pass(job, &input_path, subtitles.as_ref(), &output_path)
             .await
     }
 
@@ -752,27 +818,30 @@ impl FFmpegProcessor {
         selection
     }
 
-    /// Encode the whole source in a single FFmpeg run.
+    /// Convert the whole source in a single FFmpeg run.
     async fn process_in_one_pass(
         &self,
         job: &Job,
         input_path: &Path,
-        subtitles: &SubtitleSource,
+        subtitles: Option<&SubtitleSource>,
         output_path: &Path,
     ) -> Result<()> {
-        let ffmpeg_builder = FFmpegCommandBuilder::new()
-            .with_generated_pts()
-            .with_video_encoding(&job.quality_settings)
-            .with_audio_encoding(&job.quality_settings)
-            .with_subtitle_encoding()
+        let ffmpeg_builder = with_operation(FFmpegCommandBuilder::new().with_generated_pts(), job)
             .with_overwrite()
             .with_output(output_path);
 
         // Add format-specific flags, inputs, and mappings
         let ffmpeg_builder = match subtitles {
+            // A track the target burns into the picture is left out of the
+            // codecs and the mappings both. Half of that is not enough: a
+            // mapped subtitle stream with no subtitle codec fails the mux.
+            None => ffmpeg_builder
+                .with_input(input_path)
+                .with_stream_mapping(&["0:v", "0:a"]),
             // The subtitle is the whole reason the second input is here, so it
             // is not optional.
-            SubtitleSource::External(vtt_path) => ffmpeg_builder
+            Some(SubtitleSource::External(vtt_path)) => ffmpeg_builder
+                .with_subtitle_encoding()
                 .with_inputs(&[input_path, vtt_path.as_path()])
                 .with_stream_mapping(&["0:v", "0:a", "1:s"]),
             // Every stream, not the first of each: a second audio track is
@@ -780,7 +849,8 @@ impl FFmpegProcessor {
             // renaming the source to `.disabled` loses it for good. The
             // subtitle streams are named one by one because the source may
             // carry one MP4 cannot hold, and `0:s?` would take that one too.
-            SubtitleSource::Embedded(selection) => ffmpeg_builder
+            Some(SubtitleSource::Embedded(selection)) => ffmpeg_builder
+                .with_subtitle_encoding()
                 .with_input(input_path)
                 .with_stream_mapping(&media_and_subtitle_mappings(0, selection)),
         };
@@ -810,11 +880,19 @@ impl FFmpegProcessor {
         &self,
         job: &Job,
         input_path: &Path,
-        subtitles: &SubtitleSource,
+        subtitles: Option<&SubtitleSource>,
         output_path: &Path,
         work_folder: &Path,
         duration: f64,
     ) -> Result<()> {
+        // `encode_chunks` re-encodes the video, so reaching here with a remux
+        // would silently throw away the copy the operation exists for. The
+        // caller checks; this says so where the code that depends on it lives.
+        debug_assert!(
+            job.operation == Operation::Reencode,
+            "only a re-encode is chunked"
+        );
+
         let chunk_dir = chunk_dir_for(job, work_folder);
         self.prepare_chunk_dir(job, &chunk_dir).await?;
 
@@ -841,11 +919,12 @@ impl FFmpegProcessor {
             .with_overwrite()
             .with_concat_list(&list_path)
             .with_video_and_audio_copy()
-            .with_subtitle_encoding()
             .with_output(output_path);
 
         let mux_builder = match subtitles {
-            SubtitleSource::External(vtt_path) => mux_builder
+            None => mux_builder.with_stream_mapping(&["0:v", "0:a"]),
+            Some(SubtitleSource::External(vtt_path)) => mux_builder
+                .with_subtitle_encoding()
                 .with_input(vtt_path.as_path())
                 .with_stream_mapping(&["0:v", "0:a", "1:s"]),
             // The same selection the one-pass encode was handed, read from the
@@ -853,7 +932,8 @@ impl FFmpegProcessor {
             // because a subtitle event straddling a boundary would have been
             // cut in half by it. Video and audio still come from the chunk
             // list, input 0; the subtitles come from input 1.
-            SubtitleSource::Embedded(selection) => mux_builder
+            Some(SubtitleSource::Embedded(selection)) => mux_builder
+                .with_subtitle_encoding()
                 .with_input(input_path)
                 .with_stream_mapping(&media_and_subtitle_mappings(1, selection)),
         };
@@ -1281,7 +1361,9 @@ impl FFmpegProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::{Job, MediaFileType, PostProcessingSettings, QualitySettings};
+    use crate::job::{
+        AudioAction, Job, MediaFileType, PostProcessingSettings, QualitySettings, SubtitleAction,
+    };
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -1488,6 +1570,117 @@ mod tests {
         assert!(joined.contains("-c:v copy -c:a copy"));
         assert!(joined.contains("-c:s mov_text"));
         assert!(joined.ends_with("/work/film.mp4"));
+    }
+
+    /// A job for one path, carrying the operation the caller chose.
+    fn job_for(path: &str, file_type: MediaFileType, operation: Operation) -> Job {
+        Job::new(
+            PathBuf::from(path),
+            file_type,
+            operation,
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            Path::new("/media"),
+        )
+    }
+
+    /// The operation an `.avi` is queued with today.
+    fn avi_remux() -> Operation {
+        Operation::Remux {
+            audio: AudioAction::Copy,
+            subtitles: SubtitleAction::Keep,
+        }
+    }
+
+    #[test]
+    fn a_remux_copies_the_video_and_puts_the_index_in_front() {
+        let job = job_for("/media/show.avi", MediaFileType::Avi, avi_remux());
+        let joined = with_operation(FFmpegCommandBuilder::new(), &job)
+            .with_output("/work/show.mp4")
+            .build()
+            .join(" ");
+
+        assert!(joined.contains("-c:v copy"), "{joined}");
+        assert!(joined.contains("-c:a copy"), "{joined}");
+        assert!(joined.contains("-movflags +faststart"), "{joined}");
+        assert!(
+            !joined.contains("libx264"),
+            "a remux that re-encodes is not a remux: {joined}"
+        );
+    }
+
+    #[test]
+    fn a_remux_whose_audio_the_target_cannot_play_still_copies_the_video() {
+        let job = job_for(
+            "/media/show.mkv",
+            MediaFileType::Mkv,
+            Operation::Remux {
+                audio: AudioAction::Transcode { channels: Some(2) },
+                subtitles: SubtitleAction::Keep,
+            },
+        );
+
+        let joined = with_operation(FFmpegCommandBuilder::new(), &job)
+            .with_output("/work/show.mp4")
+            .build()
+            .join(" ");
+
+        assert!(joined.contains("-c:v copy"), "{joined}");
+        // A 5.1 track in a codec the client decodes fails on its layout, and
+        // the fix for that is a downmix, not a codec swap.
+        assert!(joined.contains("-c:a aac -b:a 128k -ac 2"), "{joined}");
+    }
+
+    #[test]
+    fn a_remux_that_keeps_its_audio_asks_for_no_channel_count() {
+        let job = job_for(
+            "/media/show.mkv",
+            MediaFileType::Mkv,
+            Operation::Remux {
+                audio: AudioAction::Transcode { channels: None },
+                subtitles: SubtitleAction::Keep,
+            },
+        );
+
+        let joined = with_operation(FFmpegCommandBuilder::new(), &job)
+            .with_output("/work/show.mp4")
+            .build()
+            .join(" ");
+
+        assert!(joined.contains("-c:a aac"), "{joined}");
+        assert!(!joined.contains("-ac"), "{joined}");
+    }
+
+    /// The measured LG fact: its Plex app burns `mov_text` into the picture
+    /// and re-encodes the video to do it. A remux that carried the track would
+    /// cost the transcode it exists to avoid.
+    #[test]
+    fn dropping_subtitles_leaves_out_both_the_codec_and_the_mapping() {
+        let dropped = Operation::Remux {
+            audio: AudioAction::Copy,
+            subtitles: SubtitleAction::Drop,
+        };
+
+        assert!(!dropped.keeps_subtitles());
+        assert!(avi_remux().keeps_subtitles());
+        assert!(Operation::Reencode.keeps_subtitles());
+    }
+
+    #[test]
+    fn a_re_encode_is_left_exactly_as_it_was() {
+        let job = job_for("/media/show.mkv", MediaFileType::Mkv, Operation::Reencode);
+        let joined = with_operation(FFmpegCommandBuilder::new(), &job)
+            .with_output("/work/show.mp4")
+            .build()
+            .join(" ");
+
+        assert!(
+            joined.contains("-c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k"),
+            "{joined}"
+        );
+        // Rewriting the file to move the index costs a pass over the output,
+        // and nothing has measured that a re-encode needs it.
+        assert!(!joined.contains("faststart"), "{joined}");
     }
 
     #[tokio::test]
@@ -1861,6 +2054,7 @@ mod tests {
         Job::new(
             input.to_path_buf(),
             MediaFileType::Mkv,
+            Operation::Reencode,
             QualitySettings {
                 ffmpeg_preset: "ultrafast".to_string(),
                 ffmpeg_crf: "30".to_string(),
@@ -3180,6 +3374,7 @@ mod tests {
         let job = Job::new(
             input.to_path_buf(),
             MediaFileType::Mkv,
+            Operation::Reencode,
             QualitySettings::default(),
             PostProcessingSettings::default(),
             input.parent().expect("input has a parent"),
@@ -3350,6 +3545,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("test.mkv"),
             MediaFileType::Mkv,
+            Operation::Reencode,
             quality,
             post_processing,
             media_root,
@@ -3389,6 +3585,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("test.mkv"),
             MediaFileType::Mkv,
+            Operation::Reencode,
             quality,
             post_processing,
             &media_folder,
@@ -3428,6 +3625,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("film.mkv"),
             MediaFileType::Mkv,
+            Operation::Reencode,
             QualitySettings::default(),
             PostProcessingSettings {
                 disable_source_files: false,
@@ -3559,6 +3757,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("film.mkv"),
             MediaFileType::Mkv,
+            Operation::Reencode,
             QualitySettings::default(),
             PostProcessingSettings {
                 disable_source_files: false,
@@ -3612,5 +3811,137 @@ mod tests {
                 .to_string()],
             "each worker takes its own staging file with it"
         );
+    }
+
+    /// An AVI carrying what this library's AVIs carry: MPEG-4 Part 2 video and
+    /// AC-3 audio.
+    fn build_avi_source(path: &Path) {
+        let built = std::process::Command::new("ffmpeg")
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=2:size=160x120:rate=10",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=2",
+                "-c:v",
+                "mpeg4",
+                "-c:a",
+                "ac3",
+                "-y",
+            ])
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(built.success(), "could not build the test source");
+    }
+
+    /// The codec name FFprobe reports for a file's first stream of `kind`.
+    fn codec_of(path: &Path, kind: &str) -> String {
+        let output = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                kind,
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(path)
+            .output()
+            .expect("ffprobe should run");
+
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .trim_end_matches(',')
+            .to_string()
+    }
+
+    #[test]
+    fn an_avi_becomes_an_mp4_without_the_video_being_touched() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let input = temp_dir.path().join("show.avi");
+        build_avi_source(&input);
+
+        let job = Job::new(
+            input.clone(),
+            MediaFileType::Avi,
+            avi_remux(),
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            temp_dir.path(),
+        );
+
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(FFmpegProcessor::new(false).process_job(&job, None, None))
+            .expect("remux should succeed");
+
+        let output = &job.output_path;
+        assert_eq!(output.extension().unwrap(), "mp4");
+
+        // The bitstream came through as it was. Anything else here means the
+        // Pi was asked to spend days re-encoding a picture that already plays.
+        assert_eq!(codec_of(output, "v"), "mpeg4");
+        assert_eq!(codec_of(output, "a"), "ac3");
+
+        // And the index is in front of the media, which is the whole reason
+        // this file is being rewritten: the measured stall was a client waiting
+        // on an index the container did not carry up front.
+        let head = std::fs::read(output).unwrap();
+        let position = |atom: &[u8]| {
+            head.windows(4)
+                .position(|window| window == atom)
+                .unwrap_or_else(|| {
+                    panic!("no {} atom in the output", String::from_utf8_lossy(atom))
+                })
+        };
+        assert!(position(b"moov") < position(b"mdat"));
+    }
+
+    /// The LG's app burns `mov_text` in and re-encodes the video to do it, so
+    /// a remux that carried the track would cost the transcode it exists to
+    /// avoid. Dropping it has to leave the picture alone.
+    #[test]
+    fn a_remux_that_drops_subtitles_produces_a_file_with_none() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let input = temp_dir.path().join("show.mkv");
+        build_source(&input, 2, "1\n00:00:00,000 --> 00:00:01,000\nhello\n\n");
+
+        let job = Job::new(
+            input.clone(),
+            MediaFileType::Mkv,
+            Operation::Remux {
+                audio: AudioAction::Copy,
+                subtitles: SubtitleAction::Drop,
+            },
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            temp_dir.path(),
+        );
+
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(FFmpegProcessor::new(false).process_job(&job, None, None))
+            .expect("remux should succeed");
+
+        let output = &job.output_path;
+        assert_eq!(codec_of(output, "s"), "", "the track has to be gone");
+        assert_eq!(codec_of(output, "v"), "h264", "and the picture untouched");
+        assert_eq!(codec_of(output, "a"), "aac");
     }
 }
