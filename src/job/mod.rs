@@ -129,14 +129,23 @@ pub enum SubtitleAction {
 impl SubtitleAction {
     /// The action that satisfies both of two targets' answers.
     ///
-    /// Dropping wins, and it is a real loss rather than a free choice: a
-    /// device that renders the track perfectly well loses it because another
-    /// one burns it in. Carrying it is what #162 exists to fix, by writing the
-    /// track beside the file where Plex can hand it to either device without
-    /// touching the video.
+    /// Read each as what one client *requires*, which is what makes the order
+    /// fall out rather than being chosen. `Keep` requires nothing: that client
+    /// is content with the track where it is. `Extract` requires the track to
+    /// leave the container. `Drop` requires the same and adds that no sidecar
+    /// can hold it - which is a fact about the track rather than about the
+    /// client, so two targets cannot disagree about it.
+    ///
+    /// So `Drop` beats `Extract` beats `Keep`, and the middle case is the one
+    /// that changed: extracting to satisfy a client that burns the track in
+    /// costs the other client nothing, because the server hands a sidecar to
+    /// any of them and converts it without touching the picture. Combining
+    /// used to mean a device that rendered the track perfectly well lost it
+    /// because another one burned it in. It no longer does.
     fn hardest(self, other: Self) -> Self {
         match (self, other) {
             (Self::Drop, _) | (_, Self::Drop) => Self::Drop,
+            (Self::Extract, _) | (_, Self::Extract) => Self::Extract,
             (Self::Keep, Self::Keep) => Self::Keep,
         }
     }
@@ -684,6 +693,48 @@ mod tests {
         assert_eq!(
             job.subtitle_path,
             Some(PathBuf::from("/test/media/video.vtt"))
+        );
+    }
+
+    #[test]
+    fn combining_two_targets_keeps_the_subtitles_rather_than_losing_them() {
+        use SubtitleAction::{Drop, Extract, Keep};
+
+        // The case the two shipped envelopes produce: the LG burns `mov_text`
+        // in, the Chromecast overlays it. Extracting satisfies the first and
+        // costs the second nothing, because the server hands a sidecar to
+        // either of them without touching the picture.
+        assert_eq!(Keep.hardest(Extract), Extract);
+        assert_eq!(Extract.hardest(Keep), Extract);
+
+        assert_eq!(Keep.hardest(Keep), Keep);
+        assert_eq!(Extract.hardest(Extract), Extract);
+
+        // A track no sidecar can hold is a fact about the track, not about the
+        // client, so it cannot be argued away by a target that would have kept
+        // it.
+        assert_eq!(Keep.hardest(Drop), Drop);
+        assert_eq!(Extract.hardest(Drop), Drop);
+    }
+
+    #[test]
+    fn combining_audio_takes_the_cap_that_is_inside_both() {
+        use AudioAction::{Copy, Transcode};
+
+        assert_eq!(Copy.hardest(Copy), Copy);
+        assert_eq!(
+            Copy.hardest(Transcode { channels: Some(2) }),
+            Transcode { channels: Some(2) }
+        );
+        // Re-encoding at six channels does not satisfy the device that will
+        // only take two.
+        assert_eq!(
+            Transcode { channels: None }.hardest(Transcode { channels: Some(2) }),
+            Transcode { channels: Some(2) }
+        );
+        assert_eq!(
+            Transcode { channels: Some(6) }.hardest(Transcode { channels: Some(2) }),
+            Transcode { channels: Some(2) }
         );
     }
 
