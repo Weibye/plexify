@@ -62,7 +62,7 @@ pub enum JobProcessResult {
 ///   So copying the audio and keeping a track list that is always empty costs
 ///   nothing measurable today - and both answers become the target's to give
 ///   the moment #158 lands.
-fn operation_for(file_type: &MediaFileType) -> Operation {
+pub(crate) fn operation_for(file_type: &MediaFileType) -> Operation {
     match file_type {
         MediaFileType::Avi => Operation::Remux {
             audio: AudioAction::Copy,
@@ -93,12 +93,13 @@ impl<'a> JobProcessor<'a> {
         &self,
         relative_path: &Path,
         file_type: MediaFileType,
+        operation: Operation,
     ) -> Result<JobProcessResult> {
         // Create the job
         let job = Job::new(
             relative_path.to_path_buf(),
             file_type.clone(),
-            operation_for(&file_type),
+            operation,
             self.config.quality_settings.clone(),
             self.config.post_processing.clone(),
             self.media_root,
@@ -269,7 +270,7 @@ mod tests {
 
         let relative_path = std::path::Path::new("video.mkv");
         let result = processor
-            .process_media_file(relative_path, MediaFileType::Mkv)
+            .process_media_file(relative_path, MediaFileType::Mkv, Operation::Reencode)
             .await
             .unwrap();
 
@@ -295,7 +296,7 @@ mod tests {
 
         let relative_path = std::path::Path::new("video.webm");
         let result = processor
-            .process_media_file(relative_path, MediaFileType::WebM)
+            .process_media_file(relative_path, MediaFileType::WebM, Operation::Reencode)
             .await
             .unwrap();
 
@@ -319,7 +320,7 @@ mod tests {
 
         let relative_path = std::path::Path::new("video.webm");
         let result = processor
-            .process_media_file(relative_path, MediaFileType::WebM)
+            .process_media_file(relative_path, MediaFileType::WebM, Operation::Reencode)
             .await
             .unwrap();
 

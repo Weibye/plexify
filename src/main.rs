@@ -96,6 +96,13 @@ enum Commands {
         /// Quality preset for encoding. Available: fast, balanced, quality, ultrafast, archive
         #[arg(long, short = 'p')]
         preset: Option<String>,
+        /// A client every queued file has to play on: a built-in envelope's
+        /// name, or the path to a TOML one. Repeat it to name more than one,
+        /// and each file is queued with the most expensive work any of them
+        /// needs - that is the only answer that satisfies all of them. Naming
+        /// none probes nothing and queues by extension, as before.
+        #[arg(long, short = 't')]
+        target: Vec<String>,
     },
     /// Process jobs from the queue
     Work {
@@ -202,13 +209,16 @@ async fn main() -> Result<()> {
             path,
             work_dir,
             preset,
+            target,
         } => {
             let work_root = work_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
             info!(
-                "Starting scan command for path: {:?}, work: {:?}, preset: {:?}",
-                path, work_root, preset
+                "Starting scan command for path: {:?}, work: {:?}, preset: {:?}, targets: {:?}",
+                path, work_root, preset, target
             );
-            ScanCommand::new(path, work_root, preset).execute().await
+            ScanCommand::new(path, work_root, preset, &target)?
+                .execute()
+                .await
         }
         Commands::Work {
             path,

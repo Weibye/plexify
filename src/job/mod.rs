@@ -67,6 +67,27 @@ pub enum AudioAction {
     Transcode { channels: Option<u32> },
 }
 
+impl AudioAction {
+    /// The action that satisfies both of two targets' answers.
+    fn hardest(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Copy, action) | (action, Self::Copy) => action,
+            (Self::Transcode { channels: one }, Self::Transcode { channels: other }) => {
+                Self::Transcode {
+                    // Two caps: the lower one is inside both. A cap and no cap
+                    // is the cap - re-encoding at six channels does not satisfy
+                    // the device that will only take two.
+                    channels: match (one, other) {
+                        (Some(one), Some(other)) => Some(one.min(other)),
+                        (Some(cap), None) | (None, Some(cap)) => Some(cap),
+                        (None, None) => None,
+                    },
+                }
+            }
+        }
+    }
+}
+
 /// What a remux does with the source's subtitle tracks.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 pub enum SubtitleAction {
@@ -103,6 +124,22 @@ pub enum SubtitleAction {
     /// does, and the only copy of the track is then the source file, which
     /// `work` keeps beside the output as `.disabled` rather than deleting.
     Extract,
+}
+
+impl SubtitleAction {
+    /// The action that satisfies both of two targets' answers.
+    ///
+    /// Dropping wins, and it is a real loss rather than a free choice: a
+    /// device that renders the track perfectly well loses it because another
+    /// one burns it in. Carrying it is what #162 exists to fix, by writing the
+    /// track beside the file where Plex can hand it to either device without
+    /// touching the video.
+    fn hardest(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Drop, _) | (_, Self::Drop) => Self::Drop,
+            (Self::Keep, Self::Keep) => Self::Keep,
+        }
+    }
 }
 
 impl Operation {
@@ -146,6 +183,36 @@ impl Operation {
         };
 
         Some(Self::Remux { audio, subtitles })
+    }
+
+    /// The work that leaves a file playable on every target that asked for
+    /// some, where each of `self` and `other` is one target's answer.
+    ///
+    /// The expensive answer wins, because it is the only one that satisfies
+    /// both. This is the rule that decides a quarter of this library: the two
+    /// shipped envelopes disagree about 586 MPEG-4 AVIs, which the LG decodes
+    /// and the Chromecast does not, so a remux against one is a re-encode
+    /// against the pair.
+    ///
+    /// Going the other way is not a cheaper version of the same thing. A file
+    /// left conforming on only one device is one the Pi is asked to transcode
+    /// the moment it is played on the other, and the Pi cannot transcode video
+    /// at all - the playback does not degrade, it collapses. Days of encoding
+    /// bought once is the lesser cost.
+    pub fn hardest(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Reencode, _) | (_, Self::Reencode) => Self::Reencode,
+            (
+                Self::Remux { audio, subtitles },
+                Self::Remux {
+                    audio: other_audio,
+                    subtitles: other_subtitles,
+                },
+            ) => Self::Remux {
+                audio: audio.hardest(other_audio),
+                subtitles: subtitles.hardest(other_subtitles),
+            },
+        }
     }
 
     /// Whether the output carries the source's subtitle tracks.
