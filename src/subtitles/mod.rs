@@ -26,8 +26,17 @@ use crate::ffmpeg::{is_bitmap_subtitle, SubtitleStream};
 /// The tags a track carrying English is labelled with in this library.
 const ENGLISH_TAGS: [&str; 4] = ["en", "eng", "english", "en-us"];
 
-/// Formats whose events carry more than SRT can express.
-const STYLED_CODECS: [&str; 3] = ["ass", "ssa", "mov_text"];
+/// Formats whose events carry more than SRT can express, *and* which
+/// [`carries_styling`] can read to find out whether a given track does.
+///
+/// Exactly those two things, which is why `mov_text` is not here despite
+/// carrying styling of its own. FFmpeg has no muxer that will write a bare
+/// `mov_text` track to a file, so proposing one fails the whole job after the
+/// media file is already written - and `carries_styling` reads `Dialogue:`
+/// lines, which such a file would not have, so the copy would be deleted again
+/// even where it could be made. Adding a codec here without both halves is how
+/// that happens again.
+const STYLED_CODECS: [&str; 2] = ["ass", "ssa"];
 
 /// What a sidecar file holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,10 +205,11 @@ fn normalise_language(tag: &str) -> String {
     tag.trim().to_ascii_lowercase()
 }
 
+/// Only ever called for a codec in [`STYLED_CODECS`], which is the only set an
+/// original is proposed for.
 fn subtitle_extension(codec: &str) -> &'static str {
     match codec {
         "ssa" => "ssa",
-        "mov_text" => "ttxt",
         _ => "ass",
     }
 }
@@ -356,6 +366,46 @@ mod tests {
         assert_eq!(plan.sidecars[0].format, SidecarFormat::Srt);
         assert_eq!(plan.sidecars[1].format, SidecarFormat::Original);
         assert!(names(&plan)[1].ends_with(".eng.ass"));
+    }
+
+    /// FFmpeg has no muxer that writes a bare `mov_text` track to a file, so
+    /// proposing one failed the job *after* the media file was written - and
+    /// with no work folder, after it was already at its destination. The 136
+    /// `mov_text` MP4s this project produced itself are exactly what a later
+    /// pass over the library hits.
+    #[test]
+    fn a_mov_text_track_proposes_only_a_file_that_can_be_written() {
+        let plan = plan(&[stream("mov_text", Some("eng"), false)], &output());
+
+        assert_eq!(plan.sidecars.len(), 1);
+        assert_eq!(plan.sidecars[0].format, SidecarFormat::Srt);
+    }
+
+    /// The two halves have to stay together: a codec is only worth preserving
+    /// as an original if `carries_styling` can read it to decide.
+    #[test]
+    fn every_codec_that_proposes_an_original_can_be_read_for_styling() {
+        for codec in STYLED_CODECS {
+            let plan = plan(&[stream(codec, None, false)], &output());
+            let original = plan
+                .sidecars
+                .iter()
+                .find(|sidecar| sidecar.format == SidecarFormat::Original)
+                .unwrap_or_else(|| panic!("{codec} proposes no original"));
+
+            // ASS and SSA share the one event syntax `carries_styling` parses.
+            assert!(carries_styling(
+                "[Events]\nDialogue: 0,0:00:01.00,0:00:03.00,S,,0,0,0,,{\\an8}x\n"
+            ));
+            assert!(["ass", "ssa"].contains(
+                &original
+                    .path
+                    .extension()
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_ref()
+            ));
+        }
     }
 
     #[test]

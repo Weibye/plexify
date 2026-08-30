@@ -4103,6 +4103,107 @@ mod tests {
         assert!(srt.contains("Hello there."), "{srt}");
     }
 
+    /// The population this whole issue is about: an MP4 this project produced
+    /// itself, carrying `mov_text`. Proposing an original for it asked FFmpeg
+    /// for a muxer that does not exist, and the job failed *after* the media
+    /// file had been written - at its destination, with no work folder to hold
+    /// it back, and an error naming no subtitle.
+    #[test]
+    fn a_mov_text_source_extracts_instead_of_failing_the_job() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let source = temp_dir.path().join("sources");
+        std::fs::create_dir_all(&source).unwrap();
+
+        let english = source.join("english.srt");
+        std::fs::write(
+            &english,
+            "1\n00:00:00,100 --> 00:00:01,500\nAlready ours.\n\n",
+        )
+        .unwrap();
+
+        // mov_text is an MP4 codec; Matroska will not carry it. The output
+        // therefore lands on the input's own path, so this runs through a work
+        // folder - which is the realistic route anyway.
+        let input = source.join("past-output.mp4");
+        let built = std::process::Command::new("ffmpeg")
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=2:size=160x120:rate=10",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=duration=2",
+            ])
+            .arg("-i")
+            .arg(&english)
+            .args([
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
+                "-map",
+                "2:s",
+                "-c:v",
+                "libx264",
+                "-c:a",
+                "aac",
+                "-c:s",
+                "mov_text",
+                "-metadata:s:s:0",
+                "language=eng",
+                "-y",
+            ])
+            .arg(&input)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(built.success(), "could not build the mov_text source");
+        assert!(
+            stream_codecs(&input)
+                .iter()
+                .any(|codec| codec == "mov_text"),
+            "the fixture must actually carry mov_text: {:?}",
+            stream_codecs(&input)
+        );
+
+        let job = Job::new(
+            input,
+            MediaFileType::Mkv,
+            Operation::Remux {
+                audio: AudioAction::Copy,
+                subtitles: SubtitleAction::Extract,
+            },
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            temp_dir.path(),
+        );
+
+        let work_folder = temp_dir.path().join("work");
+        std::fs::create_dir_all(&work_folder).unwrap();
+
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(FFmpegProcessor::new(false).process_job(&job, None, Some(&work_folder)))
+            .expect("a mov_text source must not fail the job");
+
+        let names = sidecar_names(&work_folder);
+        assert!(
+            names.iter().any(|name| name.ends_with(".eng.srt")),
+            "the track should have been extracted: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.ends_with(".ttxt")),
+            "nothing should propose a file FFmpeg cannot write: {names:?}"
+        );
+    }
+
     /// The unstyled original is deleted again: two files with the same words is
     /// clutter, and only the events could say which case this was.
     #[test]
