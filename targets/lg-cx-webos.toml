@@ -1,0 +1,52 @@
+# LG OLED65CX, webOS 5, alpha9 Gen3, running the Plex webOS app.
+# No AV1: that arrived with the C1.
+#
+# `observed` was confirmed against a live Plex playback decision on this
+# device. `assumed` is the specification, and is a belief that has never been
+# tested. Do not promote a value from one to the other without a measurement.
+
+name = "lg-cx-webos"
+device = "LG CX OLED, Plex webOS app, Plex Media Server on a Pi 4"
+
+[video]
+max_bit_depth = { value = 10, source = "observed" }
+max_height = { value = 2160, source = "assumed" }
+max_ref_frames = { value = 16, source = "assumed" }
+
+[video.codecs.accepts]
+observed = ["h264", "hevc", "mpeg4"]
+assumed = ["vp8", "vp9", "mpeg2video"]
+
+[video.pixel_formats.accepts]
+observed = ["yuv420p", "yuv420p10le"]
+assumed = ["yuvj420p"]
+
+[video.profiles]
+h264.observed = ["baseline", "main", "high"]
+h264.assumed = ["constrained baseline"]
+hevc.observed = ["main", "main 10"]
+vp9.assumed = ["profile 0", "profile 2"]
+
+[video.max_level]
+h264 = { value = 51, source = "assumed" }
+
+[audio]
+max_channels = { value = 6, source = "assumed" }
+
+[audio.codecs.accepts]
+observed = ["aac"]
+# AC3 is the open question on this device: the Chromecast was measured
+# rejecting it, and nobody has checked here.
+assumed = ["mp3", "ac3", "eac3", "flac"]
+
+[audio.codecs.rejects]
+observed = ["opus"]
+# LG dropped DTS decoding across the 2020 line.
+assumed = ["dts", "truehd"]
+
+[subtitles]
+# Measured: the app burns mov_text in rather than overlaying it, which forces
+# a full video transcode and a downscale with it. This is what plexify's own
+# transcoder currently writes into every .mp4 it produces.
+burns_in.observed = ["mov_text"]
+burns_in.assumed = ["hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle"]

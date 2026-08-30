@@ -1,0 +1,50 @@
+# Chromecast 2nd/3rd generation: the disc with micro-USB power, 1080p output.
+# Not the Ultra, which has USB-C and decodes HEVC.
+#
+# `observed` was confirmed against a live Plex playback decision on this
+# device. `assumed` is the specification, and is a belief that has never been
+# tested. Do not promote a value from one to the other without a measurement.
+
+name = "chromecast-gen2-3"
+device = "Chromecast gen 2/3, Plex receiver app, Plex Media Server on a Pi 4"
+
+[video]
+max_bit_depth = { value = 8, source = "observed" }
+max_height = { value = 1080, source = "assumed", note = "the device's output resolution; no downscale-on-decode has been tested" }
+max_ref_frames = { value = 8, source = "assumed", observed_up_to = 5, note = "a 720p file with refs=5 direct-streamed; 8 is the decoder spec. A cap of 4 taken from the spec table produced false failures" }
+
+[video.codecs.accepts]
+observed = ["h264"]
+assumed = ["vp8", "vp9"]
+
+[video.pixel_formats.accepts]
+observed = ["yuv420p"]
+# yuvj420p is full-range 8-bit. Believed fine, never watched.
+assumed = ["yuvj420p"]
+
+[video.profiles]
+h264.observed = ["baseline", "main", "high"]
+h264.assumed = ["constrained baseline"]
+vp9.assumed = ["profile 0"]
+# vp8 has no profile concept, so it gets no entry rather than an empty one.
+
+[video.max_level]
+h264 = { value = 41, source = "observed" }
+
+[audio]
+max_channels = { value = 2, source = "assumed", note = "the receiver mixes to stereo; multichannel passthrough has not been tried" }
+
+[audio.codecs.accepts]
+observed = ["aac"]
+assumed = ["mp3", "opus", "vorbis", "flac"]
+
+[audio.codecs.rejects]
+# Measured, and the single most expensive assumption this project got wrong:
+# AC3 is transcoded in every channel layout, stereo included.
+observed = ["ac3"]
+assumed = ["eac3", "dts", "truehd"]
+
+[subtitles]
+# The receiver renders text subtitles as an overlay. Image formats it cannot,
+# so the server burns them in and re-encodes the video to do it.
+burns_in.assumed = ["hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle"]
