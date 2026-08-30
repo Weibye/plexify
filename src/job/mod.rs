@@ -40,18 +40,63 @@ pub struct Job {
 /// so which of the two a job is stays a property of the job, decided once when
 /// it is queued.
 ///
-/// Resolved from the file type for now. Issue #158 replaces that with the
-/// conformance check, which asks what the source and the target hold rather
-/// than what the extension is.
+/// The caller resolves it; issue #158 makes that the conformance check, which
+/// asks what the source and the target hold rather than what the extension is.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 pub enum Operation {
-    /// Copy the video bitstream into MP4. The audio is copied too unless
-    /// `reencode_audio`, which is what a target that cannot play the source's
-    /// audio codec asks for.
-    Remux { reencode_audio: bool },
+    /// Copy the video bitstream into MP4, doing to the other tracks only what
+    /// the target needs.
+    Remux {
+        audio: AudioAction,
+        subtitles: SubtitleAction,
+    },
     /// Re-encode video and audio to `quality_settings`.
     #[default]
     Reencode,
+}
+
+/// What a remux does with the source's audio.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub enum AudioAction {
+    #[default]
+    Copy,
+    /// Re-encode, downmixing to `channels` where the target takes fewer than
+    /// the source carries. A layout the client cannot handle is not the same
+    /// problem as a codec it cannot decode, and one flag could not say both.
+    Transcode { channels: Option<u32> },
+}
+
+/// What a remux does with the source's subtitle tracks.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub enum SubtitleAction {
+    /// Carry them into the output as `mov_text`.
+    #[default]
+    Keep,
+    /// Leave them out.
+    ///
+    /// Measured: the LG's Plex app burns `mov_text` into the picture rather
+    /// than overlaying it, and re-encodes the video to do it. Carrying a track
+    /// the client cannot overlay would cost the transcode a remux exists to
+    /// avoid, so on that target the track has to go.
+    Drop,
+}
+
+impl Operation {
+    /// Whether the output carries the source's subtitle tracks.
+    ///
+    /// A re-encode always does. The 136 `.mp4` files this project has already
+    /// produced carry `mov_text` and fail on the LG for it, so that answer is
+    /// wrong too - but fixing it is a re-encode's decision to make, and it
+    /// belongs with the conformance check rather than here.
+    pub fn keeps_subtitles(&self) -> bool {
+        !matches!(
+            self,
+            Operation::Remux {
+                subtitles: SubtitleAction::Drop,
+                ..
+            }
+        )
+    }
 }
 
 /// Quality settings for video encoding
@@ -131,9 +176,14 @@ impl Job {
     }
 
     /// Create a new job for a media file with configuration, converting relative paths to absolute
+    ///
+    /// The operation is the caller's to decide, not this constructor's: a job
+    /// is a snapshot of what was resolved at scan time, and once the
+    /// conformance check answers that question, an extension is not evidence.
     pub fn new(
         input_path: PathBuf,
         file_type: MediaFileType,
+        operation: Operation,
         quality_settings: QualitySettings,
         post_processing: PostProcessingSettings,
         media_root: &Path,
@@ -151,18 +201,6 @@ impl Job {
             MediaFileType::WebM => Some(absolute_input_path.with_extension("vtt")),
             // MKV and AVI carry their subtitles themselves.
             MediaFileType::Mkv | MediaFileType::Avi => None,
-        };
-
-        // Every MPEG-4 file in this library is in an AVI, and the LG plays that
-        // video fine - measured: a ~48s mid-episode stall with the server at
-        // 0.5% CPU and nothing in flight either way, which is the client waiting
-        // on an index AVI does not carry. The container is the whole problem, so
-        // the video is copied.
-        let operation = match file_type {
-            MediaFileType::Avi => Operation::Remux {
-                reencode_audio: false,
-            },
-            MediaFileType::WebM | MediaFileType::Mkv => Operation::Reencode,
         };
 
         Self {
@@ -490,6 +528,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("video.webm"),
             MediaFileType::WebM,
+            Operation::Reencode,
             quality,
             post_processing,
             &media_root,
@@ -504,10 +543,15 @@ mod tests {
     }
 
     #[test]
-    fn an_avi_is_queued_as_a_remux_into_mp4() {
+    fn an_avi_becomes_an_mp4_beside_itself_and_carries_the_given_operation() {
+        let remux = Operation::Remux {
+            audio: AudioAction::Copy,
+            subtitles: SubtitleAction::Drop,
+        };
         let job = Job::new(
             PathBuf::from("video.avi"),
             MediaFileType::Avi,
+            remux,
             QualitySettings::default(),
             PostProcessingSettings::default(),
             &PathBuf::from("/test/media"),
@@ -515,12 +559,8 @@ mod tests {
 
         assert_eq!(job.output_path, PathBuf::from("/test/media/video.mp4"));
         assert_eq!(job.subtitle_path, None);
-        assert_eq!(
-            job.operation,
-            Operation::Remux {
-                reencode_audio: false
-            }
-        );
+        // Taken from the caller, not guessed from the extension.
+        assert_eq!(job.operation, remux);
     }
 
     #[test]
@@ -531,6 +571,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("video.mkv"),
             MediaFileType::Mkv,
+            Operation::Reencode,
             quality,
             post_processing,
             &media_root,
@@ -566,6 +607,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("/absolute/path/video.webm"),
             MediaFileType::WebM,
+            Operation::Reencode,
             quality,
             post_processing,
             &media_root,
@@ -605,6 +647,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("relative/video.mkv"),
             MediaFileType::Mkv,
+            Operation::Reencode,
             quality,
             post_processing,
             &media_root,
@@ -728,6 +771,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("test.webm"),
             MediaFileType::WebM,
+            Operation::Reencode,
             quality.clone(),
             post_processing.clone(),
             &media_root,
@@ -759,6 +803,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("videos/movie.mkv"),
             MediaFileType::Mkv,
+            Operation::Reencode,
             quality,
             post_processing,
             &media_root,
@@ -799,6 +844,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("Series/Breaking Bad/Season 01/Breaking Bad - s01e03 - Gray Matter.mkv"),
             MediaFileType::Mkv,
+            Operation::Reencode,
             quality.clone(),
             post_processing.clone(),
             &media_root,
@@ -822,6 +868,7 @@ mod tests {
                 "Series/Breaking Bad (2008) {tvdb-296861}/Season 01/Breaking Bad S01E01 Pilot.mkv",
             ),
             MediaFileType::Mkv,
+            Operation::Reencode,
             quality.clone(),
             post_processing.clone(),
             &media_root,
@@ -845,6 +892,7 @@ mod tests {
                 "Anime/Attack on Titan/Season 01/Attack on Titan S01E05 First Battle.mkv",
             ),
             MediaFileType::Mkv,
+            Operation::Reencode,
             quality.clone(),
             post_processing.clone(),
             &media_root,
@@ -866,6 +914,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("Series/Critical Role (2015) {tvdb-296861}/Season 01 - Vox Machina/Critical Role S01E12 Arrival at Kraghammer.mkv"),
             MediaFileType::Mkv,
+            Operation::Reencode,
             quality.clone(),
             post_processing.clone(),
             &media_root,
@@ -887,6 +936,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("Movies/The Dark Knight (2008)/The Dark Knight (2008).mkv"),
             MediaFileType::Mkv,
+            Operation::Reencode,
             quality.clone(),
             post_processing.clone(),
             &media_root,
@@ -910,6 +960,7 @@ mod tests {
         Job::new(
             relative_path,
             MediaFileType::Mkv,
+            Operation::Reencode,
             QualitySettings::default(),
             PostProcessingSettings::default(),
             media_root,
@@ -1145,6 +1196,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("Random/Path/file.mkv"),
             MediaFileType::Mkv,
+            Operation::Reencode,
             quality.clone(),
             post_processing.clone(),
             &media_root,
@@ -1161,6 +1213,7 @@ mod tests {
             Job::new(
                 PathBuf::from(name),
                 MediaFileType::Mkv,
+                Operation::Reencode,
                 QualitySettings::default(),
                 PostProcessingSettings::default(),
                 media_root,
@@ -1188,6 +1241,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("show.mkv"),
             MediaFileType::Mkv,
+            Operation::Reencode,
             QualitySettings::default(),
             PostProcessingSettings::default(),
             Path::new("/media"),

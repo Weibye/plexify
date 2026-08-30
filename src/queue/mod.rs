@@ -795,6 +795,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("show.mkv"),
             MediaFileType::Mkv,
+            Operation::Reencode,
             QualitySettings::default(),
             PostProcessingSettings::default(),
             temp_dir.path(),
@@ -824,6 +825,7 @@ mod tests {
         Job::new(
             PathBuf::from(format!("{}.mkv", "l".repeat(64 * 1024))),
             MediaFileType::Mkv,
+            Operation::Reencode,
             QualitySettings::default(),
             PostProcessingSettings::default(),
             media_root,
@@ -955,6 +957,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("waited.mkv"),
             MediaFileType::Mkv,
+            Operation::Reencode,
             QualitySettings::default(),
             PostProcessingSettings::default(),
             temp_dir.path(),
@@ -992,6 +995,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("long-film.mkv"),
             MediaFileType::Mkv,
+            Operation::Reencode,
             QualitySettings::default(),
             PostProcessingSettings::default(),
             temp_dir.path(),
@@ -1138,6 +1142,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("corrupt.mkv"),
             MediaFileType::Mkv,
+            Operation::Reencode,
             QualitySettings::default(),
             PostProcessingSettings::default(),
             temp_dir.path(),
@@ -1215,6 +1220,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("show.mkv"),
             MediaFileType::Mkv,
+            Operation::Reencode,
             QualitySettings::default(),
             PostProcessingSettings::default(),
             temp_dir.path(),
@@ -1451,6 +1457,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("test.webm"),
             MediaFileType::WebM,
+            Operation::Reencode,
             quality,
             post_processing,
             media_root,
@@ -1492,6 +1499,7 @@ mod tests {
                     "Breaking Bad S01E03 Gray Matter.mkv",
                 ),
                 MediaFileType::Mkv,
+                Operation::Reencode,
                 quality.clone(),
                 post_processing.clone(),
                 media_root,
@@ -1504,6 +1512,7 @@ mod tests {
                     "Breaking Bad S01E01 Pilot.mkv",
                 ),
                 MediaFileType::Mkv,
+                Operation::Reencode,
                 quality.clone(),
                 post_processing.clone(),
                 media_root,
@@ -1517,6 +1526,7 @@ mod tests {
                     "Better Call Saul S01E02 Mijo.mkv",
                 ),
                 MediaFileType::Mkv,
+                Operation::Reencode,
                 quality.clone(),
                 post_processing.clone(),
                 media_root,
@@ -1529,6 +1539,7 @@ mod tests {
                     "Better Call Saul S01E01 Uno.mkv",
                 ),
                 MediaFileType::Mkv,
+                Operation::Reencode,
                 quality.clone(),
                 post_processing.clone(),
                 media_root,
@@ -1539,6 +1550,7 @@ mod tests {
                     .join("The Matrix (1999)")
                     .join("The Matrix (1999).mkv"),
                 MediaFileType::Mkv,
+                Operation::Reencode,
                 quality.clone(),
                 post_processing.clone(),
                 media_root,
@@ -1595,6 +1607,7 @@ mod tests {
                     "Breaking Bad S01E03 Gray Matter.mkv",
                 ),
                 MediaFileType::Mkv,
+                Operation::Reencode,
                 quality.clone(),
                 post_processing.clone(),
                 media_root,
@@ -1607,6 +1620,7 @@ mod tests {
                     "Breaking Bad S01E01 Pilot.mkv",
                 ),
                 MediaFileType::Mkv,
+                Operation::Reencode,
                 quality.clone(),
                 post_processing.clone(),
                 media_root,
@@ -1648,6 +1662,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("show.mkv"),
             MediaFileType::Mkv,
+            Operation::Reencode,
             QualitySettings::default(),
             PostProcessingSettings::default(),
             temp_dir.path(),

@@ -2,7 +2,10 @@ use anyhow::Result;
 use std::path::Path;
 use tracing::{debug, info, warn};
 
-use crate::job::{Job, MediaFileType, PostProcessingSettings, QualitySettings};
+use crate::job::{
+    AudioAction, Job, MediaFileType, Operation, PostProcessingSettings, QualitySettings,
+    SubtitleAction,
+};
 use crate::queue::JobQueue;
 
 /// Shared job processing configuration
@@ -46,6 +49,29 @@ pub enum JobProcessResult {
     MissingSubtitle,
 }
 
+/// What to do to a file, decided from its extension.
+///
+/// A placeholder for the conformance check (#158), which decides it from what
+/// the file and the target actually hold. Everything here is measured, but the
+/// extension is not what makes it true:
+///
+/// - All 598 `.avi` files carry MPEG-4 or H.264 video both targets decode, and
+///   MP3 or AC-3 audio. Only the container is wrong, so the video is copied.
+/// - No `.avi` in this library carries a subtitle stream, and 586 of the 598
+///   need a full re-encode for the Chromecast whatever happens to the audio.
+///   So copying the audio and keeping a track list that is always empty costs
+///   nothing measurable today - and both answers become the target's to give
+///   the moment #158 lands.
+fn operation_for(file_type: &MediaFileType) -> Operation {
+    match file_type {
+        MediaFileType::Avi => Operation::Remux {
+            audio: AudioAction::Copy,
+            subtitles: SubtitleAction::Keep,
+        },
+        MediaFileType::WebM | MediaFileType::Mkv => Operation::Reencode,
+    }
+}
+
 /// Shared job processor that handles the common logic between add and scan commands
 pub struct JobProcessor<'a> {
     pub queue: &'a JobQueue,
@@ -72,6 +98,7 @@ impl<'a> JobProcessor<'a> {
         let job = Job::new(
             relative_path.to_path_buf(),
             file_type.clone(),
+            operation_for(&file_type),
             self.config.quality_settings.clone(),
             self.config.post_processing.clone(),
             self.media_root,
@@ -191,6 +218,19 @@ mod tests {
         let config = JobProcessorConfig::from_preset(None).unwrap();
         // Just verify it doesn't panic and creates a config with defaults
         assert_eq!(config.quality_settings.ffmpeg_preset, "veryfast");
+    }
+
+    #[test]
+    fn an_avi_is_queued_as_a_remux_and_everything_else_as_a_re_encode() {
+        assert_eq!(
+            operation_for(&MediaFileType::Avi),
+            Operation::Remux {
+                audio: AudioAction::Copy,
+                subtitles: SubtitleAction::Keep,
+            }
+        );
+        assert_eq!(operation_for(&MediaFileType::Mkv), Operation::Reencode);
+        assert_eq!(operation_for(&MediaFileType::WebM), Operation::Reencode);
     }
 
     #[test]

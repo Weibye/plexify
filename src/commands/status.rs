@@ -547,7 +547,7 @@ pub fn render(status: &QueueStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::{MediaFileType, PostProcessingSettings, QualitySettings};
+    use crate::job::{MediaFileType, Operation, PostProcessingSettings, QualitySettings};
     use crate::queue::{JobQueue, HEARTBEAT_INTERVAL};
     use tempfile::TempDir;
 
@@ -555,6 +555,7 @@ mod tests {
         Job::new(
             PathBuf::from(input),
             MediaFileType::Mkv,
+            Operation::Reencode,
             QualitySettings::default(),
             PostProcessingSettings::default(),
             media_root,
