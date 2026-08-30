@@ -8,6 +8,16 @@
 name = "chromecast-gen2-3"
 device = "Chromecast gen 2/3, Plex receiver app, Plex Media Server on a Pi 4"
 
+[containers.accepts]
+observed = ["mov", "mp4", "m4a"]
+# The receiver app is fed by the server, and nobody has watched it take either
+# of these directly.
+assumed = ["matroska", "webm"]
+
+# AVI is left unlisted rather than rejected: it was measured stalling on the
+# LG, and nothing has been tried here. An unlisted container is refused on an
+# assumption, which is what that is.
+
 [video]
 max_bit_depth = { value = 8, source = "observed" }
 max_height = { value = 1080, source = "assumed", note = "the device's output resolution; no downscale-on-decode has been tested" }

@@ -8,6 +8,19 @@
 name = "lg-cx-webos"
 device = "LG CX OLED, Plex webOS app, Plex Media Server on a Pi 4"
 
+[containers.accepts]
+observed = ["mov", "mp4", "m4a", "matroska"]
+assumed = ["webm"]
+
+[containers.rejects]
+# Measured, and not a decode failure: the app plays this video fine and then
+# stalls ~48s mid-episode with the server at 0.5% CPU and nothing in flight,
+# which is the client waiting on an index AVI does not carry up front. It is
+# recorded as a rejection because that is what it costs to fix - a copy into
+# MP4 - and a verdict the reader acts on cannot distinguish "refused" from
+# "played badly".
+observed = ["avi"]
+
 [video]
 max_bit_depth = { value = 10, source = "observed" }
 max_height = { value = 2160, source = "assumed" }

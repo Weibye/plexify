@@ -151,14 +151,36 @@ fn audio_stream(stream: &Value) -> AudioStream {
 }
 
 /// The depth a pixel format names, for the files that do not state it outright.
+///
+/// FFmpeg names a depth above 8 as a digit group immediately before the byte
+/// order suffix: `yuv420p10le`, `p010le`, `gray12be`. Everything else is 8-bit.
+/// Searching the whole name for those digits instead reads `nv12` as 12-bit and
+/// `yuv410p` as 10-bit, where the digits are the chroma subsampling.
 fn depth_from_pixel_format(pixel_format: Option<&str>) -> Option<u32> {
     let format = pixel_format?;
-    for depth in [16, 14, 12, 10, 9] {
-        if format.contains(&depth.to_string()) {
-            return Some(depth);
-        }
+    let Some(head) = format
+        .strip_suffix("le")
+        .or_else(|| format.strip_suffix("be"))
+    else {
+        return Some(8);
+    };
+
+    let digits: String = head
+        .chars()
+        .rev()
+        .take_while(char::is_ascii_digit)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    // Only depths a delivery format actually carries. Packed RGB names a total
+    // across components - `bgr48le` is 16-bit each - and reading that as a
+    // per-component depth would be worse than falling back.
+    match digits.parse::<u32>() {
+        Ok(depth @ 9..=16) => Some(depth),
+        _ => Some(8),
     }
-    Some(8)
 }
 
 fn codec_name(stream: &Value) -> String {
@@ -238,6 +260,27 @@ mod tests {
 
         assert_eq!(video.bit_depth, Some(10));
         assert_eq!(video.profile.as_deref(), Some("main 10"));
+    }
+
+    /// The digits in `nv12` and `yuv410p` are chroma subsampling, not depth.
+    #[test]
+    fn does_not_read_subsampling_digits_as_a_bit_depth() {
+        for (pixel_format, depth) in [
+            ("nv12", 8),
+            ("yuv410p", 8),
+            ("yuv420p", 8),
+            ("yuvj420p", 8),
+            ("yuv420p10le", 10),
+            ("yuv422p12be", 12),
+            ("p010le", 10),
+            ("gray9le", 9),
+        ] {
+            assert_eq!(
+                depth_from_pixel_format(Some(pixel_format)),
+                Some(depth),
+                "{pixel_format}"
+            );
+        }
     }
 
     #[test]

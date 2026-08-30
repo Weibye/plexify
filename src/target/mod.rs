@@ -150,6 +150,11 @@ pub struct PlaybackTarget {
     /// near relative that behaves differently.
     #[serde(default)]
     pub device: Option<String>,
+    /// Containers the client can index and play. A container it decodes but
+    /// stalls on is a rejection like any other: what the reader needs is the
+    /// operation, and for both the operation is a copy into a container that
+    /// works.
+    pub containers: Support,
     pub video: VideoEnvelope,
     pub audio: AudioEnvelope,
     #[serde(default)]

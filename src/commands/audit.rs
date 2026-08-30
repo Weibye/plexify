@@ -15,6 +15,7 @@ use crate::commands::validate::MEDIA_EXTENSIONS;
 use crate::ignore::IgnoreFilter;
 use crate::paths::to_forward_slashes;
 use crate::probe::probe;
+use crate::queue::QueueDirectory;
 use crate::target::{evaluate, Conformance, Cost, Finding, PlaybackTarget, Provenance};
 
 /// One file's verdict.
@@ -172,6 +173,14 @@ impl AuditCommand {
                 let path = entry.path();
                 if path == self.scan_path || !path.is_dir() {
                     return true;
+                }
+
+                // A work root inside the media root is the mistake people make
+                // constantly, and its half-written outputs are not library
+                // files. Auditing them reports the queue's own scratch space.
+                if is_queue_directory(path) {
+                    debug!("🚫 Skipping queue directory: {:?}", path);
+                    return false;
                 }
 
                 match &filter {
@@ -353,6 +362,17 @@ impl AuditCommand {
     }
 }
 
+/// One of the four directories a work root is made of.
+fn is_queue_directory(path: &Path) -> bool {
+    path.file_name()
+        .map(|name| {
+            QueueDirectory::ALL
+                .iter()
+                .any(|directory| name == directory.on_disk_name())
+        })
+        .unwrap_or(false)
+}
+
 fn percent(part: usize, whole: usize) -> f64 {
     if whole == 0 {
         0.0
@@ -514,6 +534,58 @@ mod tests {
 
         // Every file has a size, and the buckets are reported in GB from it.
         assert!(report.entries.iter().all(|entry| entry.size_bytes > 0));
+    }
+
+    /// The one playback failure this project has actually watched: an AVI the
+    /// LG plays and then stalls on. Auditing it against the Chromecast hides
+    /// the container behind the video codec, which is how this was missed.
+    #[tokio::test]
+    async fn an_avi_is_not_reported_as_fine_on_the_lg() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        // No audio track: the container is then the only thing that can fail,
+        // which is exactly the claim under test.
+        build(&dir.path().join("stalls.avi"), &["-c:v", "mpeg4", "-an"]);
+
+        let command = AuditCommand::new(dir.path().to_path_buf(), "lg-cx-webos").unwrap();
+        let report = command.execute().await.unwrap();
+
+        assert_eq!(
+            report.bucket(None).count(),
+            0,
+            "an AVI is not 'already fine'"
+        );
+        assert_eq!(report.bucket(Some(Cost::Remux)).count(), 1);
+        assert!(
+            command.render_report(&report).contains("container: avi"),
+            "{}",
+            command.render_report(&report)
+        );
+    }
+
+    /// A work root inside the media root is the mistake CLAUDE.md says people
+    /// make constantly, and its contents are not library files.
+    #[tokio::test]
+    async fn the_queues_own_directories_are_never_audited() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        for queue_dir in ["_queue", "_in_progress", "_completed", "_failed"] {
+            std::fs::create_dir_all(dir.path().join(queue_dir)).unwrap();
+            build(
+                &dir.path().join(queue_dir).join("half-written.mp4"),
+                &["-c:v", "libx264", "-c:a", "aac"],
+            );
+        }
+
+        let command = AuditCommand::new(dir.path().to_path_buf(), "chromecast-gen2-3").unwrap();
+
+        assert!(command.execute().await.unwrap().entries.is_empty());
     }
 
     #[tokio::test]

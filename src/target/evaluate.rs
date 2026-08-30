@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{PlaybackTarget, Provenance};
+use super::{Limit, PlaybackTarget, Provenance};
 use crate::probe::{AudioStream, MediaProbe};
 
 /// What fixing a file costs. The two are not comparable: re-encoding video on
@@ -21,6 +21,7 @@ pub enum Cost {
 /// The property a check was about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Field {
+    Container,
     NoVideoStream,
     VideoCodec,
     VideoProfile,
@@ -50,12 +51,17 @@ impl Field {
             | Field::PixelFormat
             | Field::Resolution
             | Field::RefFrames => Cost::Reencode,
-            Field::AudioCodec | Field::AudioChannels | Field::Subtitles => Cost::Remux,
+            // The container is the cheapest thing that can be wrong: the
+            // bitstream is copied into a new one untouched.
+            Field::Container | Field::AudioCodec | Field::AudioChannels | Field::Subtitles => {
+                Cost::Remux
+            }
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
+            Field::Container => "container",
             Field::NoVideoStream => "no video stream",
             Field::VideoCodec => "video codec",
             Field::VideoProfile => "video profile",
@@ -182,12 +188,42 @@ impl Findings {
             self.unverified.push(finding);
         }
     }
+
+    /// A property the probe could not read. Nothing follows from an absent
+    /// value, so it passes - but as an assumption, never in silence. A field
+    /// skipped by an `if let Some(..)` is an unverified pass wearing the
+    /// clothes of a conformance.
+    fn unread(&mut self, field: Field, claim: Option<String>) {
+        self.check(
+            (true, Provenance::Assumed),
+            field,
+            "not reported".to_string(),
+            claim,
+        );
+    }
+
+    /// One value against one ceiling, recording an absent value rather than
+    /// stepping over it.
+    fn within(
+        &mut self,
+        value: Option<u32>,
+        limit: &Limit,
+        field: Field,
+        show: impl Fn(u32) -> String,
+        claim: String,
+    ) {
+        match value {
+            Some(value) => self.check(limit.verdict(value), field, show(value), Some(claim)),
+            None => self.unread(field, Some(claim)),
+        }
+    }
 }
 
 /// What `target` needs done to the file `probe` describes.
 pub fn evaluate(probe: &MediaProbe, target: &PlaybackTarget) -> Conformance {
     let mut findings = Findings::default();
 
+    container(probe, target, &mut findings);
     video(probe, target, &mut findings);
     audio(probe, target, &mut findings);
     subtitles(probe, target, &mut findings);
@@ -208,6 +244,47 @@ pub fn evaluate(probe: &MediaProbe, target: &PlaybackTarget) -> Conformance {
         Conformance::Remux {
             reasons,
             unverified,
+        }
+    }
+}
+
+/// The container a client cannot index is as unplayable as a codec it cannot
+/// decode, and costs a copy into a different one to fix.
+///
+/// FFprobe reports every format a demuxer answers to, so one MP4 arrives as
+/// `mov,mp4,m4a,3gp,3g2,mj2`. The file conforms if any of those names does.
+fn container(probe: &MediaProbe, target: &PlaybackTarget, findings: &mut Findings) {
+    let Some(container) = &probe.container else {
+        findings.unread(Field::Container, None);
+        return;
+    };
+
+    let names: Vec<&str> = container
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .collect();
+
+    let accepted = names
+        .iter()
+        .filter_map(|name| {
+            let (plays, source) = target.containers.verdict(name);
+            plays.then_some((source, *name))
+        })
+        .min();
+
+    match accepted {
+        Some((source, name)) => {
+            findings.check((true, source), Field::Container, name.to_string(), None)
+        }
+        None => {
+            let source = names
+                .iter()
+                .map(|name| target.containers.verdict(name).1)
+                .min()
+                .unwrap_or(Provenance::Assumed);
+
+            findings.check((false, source), Field::Container, container.clone(), None);
         }
     }
 }
@@ -237,64 +314,68 @@ fn video(probe: &MediaProbe, target: &PlaybackTarget, findings: &mut Findings) {
 
     // Profile and level only mean something once the codec is one the client
     // decodes; "High profile AV1" is not a second reason, it is the same one.
+    // A codec the target does not constrain is not an unread field: there is
+    // no claim to be unsure about.
     if plays {
-        if let (Some(accepted), Some(profile)) =
-            (envelope.profiles.get(&video.codec), video.profile.as_ref())
-        {
-            let source = accepted.provenance_of(profile);
-            findings.check(
-                (source.is_some(), source.unwrap_or(Provenance::Assumed)),
-                Field::VideoProfile,
-                format!("{} {profile}", video.codec),
-                None,
-            );
+        if let Some(accepted) = envelope.profiles.get(&video.codec) {
+            match &video.profile {
+                Some(profile) => {
+                    let source = accepted.provenance_of(profile);
+                    findings.check(
+                        (source.is_some(), source.unwrap_or(Provenance::Assumed)),
+                        Field::VideoProfile,
+                        format!("{} {profile}", video.codec),
+                        None,
+                    );
+                }
+                None => findings.unread(Field::VideoProfile, None),
+            }
         }
 
-        if let (Some(limit), Some(level)) = (envelope.max_level.get(&video.codec), video.level) {
-            findings.check(
-                limit.verdict(level.max(0) as u32),
+        if let Some(limit) = envelope.max_level.get(&video.codec) {
+            findings.within(
+                video.level.map(|level| level.max(0) as u32),
+                limit,
                 Field::VideoLevel,
-                tenths(level.max(0) as u32),
-                Some(format!("up to {}", tenths(limit.value))),
+                tenths,
+                format!("up to {}", tenths(limit.value)),
             );
         }
     }
 
-    if let Some(depth) = video.bit_depth {
-        findings.check(
-            envelope.max_bit_depth.verdict(depth),
-            Field::BitDepth,
-            format!("{depth}-bit"),
-            Some(format!("up to {}-bit", envelope.max_bit_depth.value)),
-        );
-    }
+    findings.within(
+        video.bit_depth,
+        &envelope.max_bit_depth,
+        Field::BitDepth,
+        |depth| format!("{depth}-bit"),
+        format!("up to {}-bit", envelope.max_bit_depth.value),
+    );
 
-    if let Some(pixel_format) = &video.pixel_format {
-        findings.check(
+    match &video.pixel_format {
+        Some(pixel_format) => findings.check(
             envelope.pixel_formats.verdict(pixel_format),
             Field::PixelFormat,
             pixel_format.clone(),
             None,
-        );
+        ),
+        None => findings.unread(Field::PixelFormat, None),
     }
 
-    if let Some(height) = video.height {
-        findings.check(
-            envelope.max_height.verdict(height),
-            Field::Resolution,
-            format!("{height}p"),
-            Some(format!("up to {}p", envelope.max_height.value)),
-        );
-    }
+    findings.within(
+        video.height,
+        &envelope.max_height,
+        Field::Resolution,
+        |height| format!("{height}p"),
+        format!("up to {}p", envelope.max_height.value),
+    );
 
-    if let Some(refs) = video.ref_frames {
-        findings.check(
-            envelope.max_ref_frames.verdict(refs),
-            Field::RefFrames,
-            refs.to_string(),
-            Some(format!("up to {}", envelope.max_ref_frames.value)),
-        );
-    }
+    findings.within(
+        video.ref_frames,
+        &envelope.max_ref_frames,
+        Field::RefFrames,
+        |refs| refs.to_string(),
+        format!("up to {}", envelope.max_ref_frames.value),
+    );
 }
 
 /// A file conforms on audio when *one* of its tracks plays; the client picks
@@ -327,14 +408,13 @@ fn audio(probe: &MediaProbe, target: &PlaybackTarget, findings: &mut Findings) {
             stream.codec.clone(),
             None,
         );
-        if let Some(count) = stream.channels {
-            findings.check(
-                channels(stream, target),
-                Field::AudioChannels,
-                count.to_string(),
-                Some(format!("up to {}", envelope.max_channels.value)),
-            );
-        }
+        findings.within(
+            stream.channels,
+            &envelope.max_channels,
+            Field::AudioChannels,
+            |count| count.to_string(),
+            format!("up to {}", envelope.max_channels.value),
+        );
         return;
     }
 
@@ -462,6 +542,111 @@ mod tests {
         let verdict = evaluate(&plexify_output(), &chromecast());
 
         assert_eq!(verdict.cost(), None, "{:?}", claims(&verdict));
+    }
+
+    /// What 598 files in this library are, and the one playback failure we have
+    /// watched happen. Before the container was checked this returned Conforms
+    /// with an empty `unverified` - a false conform, stated as a fact.
+    fn library_avi() -> MediaProbe {
+        MediaProbe {
+            container: Some("avi".to_string()),
+            video: Some(VideoStream {
+                codec: "mpeg4".to_string(),
+                profile: Some("simple profile".to_string()),
+                level: Some(1),
+                pixel_format: Some("yuv420p".to_string()),
+                bit_depth: Some(8),
+                ref_frames: Some(1),
+                width: Some(640),
+                height: Some(480),
+            }),
+            audio: vec![AudioStream {
+                codec: "mp3".to_string(),
+                channels: Some(2),
+                language: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_avi_the_lg_stalls_on_needs_a_remux_not_nothing() {
+        let verdict = evaluate(&library_avi(), &lg());
+
+        assert_eq!(verdict.cost(), Some(Cost::Remux), "{:?}", claims(&verdict));
+        let container = verdict
+            .reasons()
+            .iter()
+            .find(|reason| reason.field == Field::Container)
+            .expect("the container is the reason");
+        // Watched stalling on this hardware. Not inferred from the format.
+        assert_eq!(container.source, Provenance::Observed);
+    }
+
+    /// Nobody has tried an AVI on the Chromecast, so the container is refused
+    /// on an assumption - while the video codec fails on its own account.
+    #[test]
+    fn the_same_avi_needs_a_reencode_for_the_chromecast() {
+        let verdict = evaluate(&library_avi(), &chromecast());
+
+        assert_eq!(verdict.cost(), Some(Cost::Reencode));
+        let container = verdict
+            .reasons()
+            .iter()
+            .find(|reason| reason.field == Field::Container)
+            .expect("an unlisted container is still refused");
+        assert_eq!(container.source, Provenance::Assumed);
+    }
+
+    /// FFprobe reports every format a demuxer answers to, so a match on any
+    /// one of them is a match.
+    #[test]
+    fn a_container_is_accepted_on_any_name_its_demuxer_answers_to() {
+        let mut probe = plexify_output();
+        probe.container = Some("mov,mp4,m4a,3gp,3g2,mj2".to_string());
+        assert_eq!(evaluate(&probe, &chromecast()).cost(), None);
+
+        probe.container = Some("matroska,webm".to_string());
+        assert_eq!(evaluate(&probe, &lg()).cost(), None);
+    }
+
+    /// A field the probe could not read is the definition of an unverified
+    /// pass. Skipping it silently is how a guess becomes a conformance.
+    #[test]
+    fn fields_the_probe_could_not_read_are_marked_rather_than_skipped() {
+        let mut probe = plexify_output();
+        let video = probe.video.as_mut().unwrap();
+        video.profile = None;
+        video.level = None;
+        video.bit_depth = None;
+        video.pixel_format = None;
+        video.height = None;
+        video.ref_frames = None;
+        probe.container = None;
+        probe.audio[0].channels = None;
+
+        let verdict = evaluate(&probe, &chromecast());
+
+        assert_eq!(verdict.cost(), None, "an absent value fails nothing");
+        for field in [
+            Field::Container,
+            Field::VideoProfile,
+            Field::VideoLevel,
+            Field::BitDepth,
+            Field::PixelFormat,
+            Field::Resolution,
+            Field::RefFrames,
+            Field::AudioChannels,
+        ] {
+            assert!(
+                verdict
+                    .unverified()
+                    .iter()
+                    .any(|finding| finding.field == field && finding.value == "not reported"),
+                "{field:?} passed in silence: {:?}",
+                verdict.unverified()
+            );
+        }
     }
 
     /// The measured Chromecast fact: AC3 is refused in every layout, stereo
