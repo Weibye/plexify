@@ -6,6 +6,7 @@ pub mod ignore;
 pub mod job;
 pub mod naming;
 pub mod paths;
+pub mod probe;
 pub mod queue;
 pub mod undo;
 
