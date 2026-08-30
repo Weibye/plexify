@@ -24,8 +24,14 @@
 //! # Ask the queue what state it is in
 //! plexify status
 //!
-//! # Clean up temporary files
+//! # Report what emptying the queue would delete, then ask
 //! plexify clean /path/to/media
+//!
+//! # Report it and delete nothing
+//! plexify clean /path/to/media --dry-run
+//!
+//! # Empty one directory without being asked
+//! plexify clean /path/to/media --only completed --yes
 //!
 //! # Report what in the library is not in canonical form
 //! plexify validate /path/to/media
@@ -47,6 +53,7 @@ use plexify::commands::{
     add::AddCommand, clean::CleanCommand, scan::ScanCommand, status::StatusCommand,
     validate::ValidateCommand, work::WorkCommand,
 };
+use plexify::queue::QueueDirectory;
 use plexify::JobPriority;
 
 /// Plexify - A simple, distributed media transcoding CLI
@@ -107,13 +114,28 @@ enum Commands {
         #[arg(long, short = 'w')]
         work_dir: Option<PathBuf>,
     },
-    /// Remove all temporary files and directories
+    /// Delete a work root's queue directories, after reporting what is in them
     Clean {
         /// Path to the media directory
         path: PathBuf,
         /// Path to the work directory (defaults to current working directory)
         #[arg(long, short = 'w')]
         work_dir: Option<PathBuf>,
+        /// Empty only these queue directories, instead of all four and the
+        /// worker log. Comma-separated: queue, in-progress, completed, failed
+        #[arg(long, value_delimiter = ',', value_enum)]
+        only: Vec<QueueDirectory>,
+        /// Report what would be deleted and delete nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Answer the confirmation in advance, for scripted use
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Also delete a claim whose worker is still checking in. `--yes` does
+        /// not cover this: it is the one case where cleaning corrupts a run
+        /// that is still going.
+        #[arg(long)]
+        force: bool,
     },
     /// Put a library back the way a fix run found it
     Undo {
@@ -206,13 +228,26 @@ async fn main() -> Result<()> {
                 Err(e) => Err(e),
             }
         }
-        Commands::Clean { path, work_dir } => {
+        Commands::Clean {
+            path,
+            work_dir,
+            only,
+            dry_run,
+            yes,
+            force,
+        } => {
             let work_root = work_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
             info!(
                 "Starting clean command for path: {:?}, work: {:?}",
                 path, work_root
             );
-            CleanCommand::new(path, work_root).execute().await
+            CleanCommand::new(path, work_root)
+                .only(&only)
+                .dry_run(dry_run)
+                .assume_yes(yes)
+                .force(force)
+                .execute()
+                .await
         }
         Commands::Undo { plan, apply } => {
             info!("Starting undo for plan: {:?}, apply: {}", plan, apply);

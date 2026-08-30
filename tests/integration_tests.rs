@@ -88,6 +88,9 @@ fn test_scan_and_clean_workflow() {
             temp_path.to_str().unwrap(),
             "--work-dir",
             temp_path.to_str().unwrap(),
+            // Scripted: there is no terminal to answer the confirmation, and
+            // without this the command refuses rather than blocking on it.
+            "--yes",
         ])
         .output()
         .expect("Failed to execute clean command");
@@ -546,6 +549,9 @@ fn test_hierarchical_directory_scanning() {
             temp_path.to_str().unwrap(),
             "--work-dir",
             temp_path.to_str().unwrap(),
+            // Scripted: there is no terminal to answer the confirmation, and
+            // without this the command refuses rather than blocking on it.
+            "--yes",
         ])
         .output()
         .expect("Failed to execute clean command");
@@ -1471,4 +1477,134 @@ fn test_failing_command_writes_nothing_to_stdout_when_stderr_is_discarded() {
         "a command that produced no output must leave stdout empty: stdout='{}'",
         String::from_utf8_lossy(&output.stdout)
     );
+}
+
+/// A `clean` with nobody to answer its prompt must refuse, not block.
+///
+/// This is the one property that cannot be proved from inside the process. The
+/// child is given a real pipe for stdin that is never written to, so a
+/// `read_line` on the confirmation would wait forever; the test then polls for
+/// the exit rather than calling `output()`, so a regression fails after the
+/// timeout instead of hanging the whole suite.
+#[test]
+fn clean_refuses_rather_than_blocking_when_there_is_no_terminal() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+
+    fs::write(temp_path.join("video1.mkv"), "").unwrap();
+
+    let scan = Command::new(PLEXIFY_BIN)
+        .args([
+            "scan",
+            temp_path.to_str().unwrap(),
+            "--work-dir",
+            temp_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute scan command");
+    assert!(scan.status.success(), "Scan command failed");
+
+    let mut child = Command::new(PLEXIFY_BIN)
+        .args([
+            "clean",
+            temp_path.to_str().unwrap(),
+            "--work-dir",
+            temp_path.to_str().unwrap(),
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn clean command");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        match child.try_wait().expect("Failed to poll clean command") {
+            Some(status) => break Some(status),
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    };
+
+    let status = status.expect("clean blocked waiting for a confirmation nobody could give");
+    assert!(
+        !status.success(),
+        "clean should refuse when it cannot ask for confirmation"
+    );
+
+    let output = child
+        .wait_with_output()
+        .expect("Failed to read clean command output");
+    // The refusal is an error, so it is `main` that prints it, and which stream
+    // that lands on is `main`'s business (#148 moves it to stderr). What this
+    // test is about is that the reason reaches the user at all.
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        said.contains("stdin is not a terminal"),
+        "clean should say why it refused, got: {said}"
+    );
+    // The report is the command's own output, and goes to stderr either way.
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("clean will permanently delete:"),
+        "clean should show what it was refusing to delete, got: {said}"
+    );
+
+    // And it must have refused before deleting anything.
+    assert!(temp_path.join("_queue").exists());
+}
+
+/// A `--dry-run` reports and removes nothing, with no terminal in sight.
+#[test]
+fn clean_dry_run_reports_without_deleting() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path();
+
+    fs::write(temp_path.join("video1.mkv"), "").unwrap();
+
+    let scan = Command::new(PLEXIFY_BIN)
+        .args([
+            "scan",
+            temp_path.to_str().unwrap(),
+            "--work-dir",
+            temp_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute scan command");
+    assert!(scan.status.success(), "Scan command failed");
+
+    let output = Command::new(PLEXIFY_BIN)
+        .args([
+            "clean",
+            temp_path.to_str().unwrap(),
+            "--work-dir",
+            temp_path.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .output()
+        .expect("Failed to execute clean command");
+
+    assert!(output.status.success(), "A dry run should not be an error");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("_queue"), "got: {stderr}");
+    assert!(stderr.contains("1 job"), "got: {stderr}");
+    assert!(
+        stderr.contains("--dry-run: nothing was deleted."),
+        "got: {stderr}"
+    );
+
+    for directory in ["_queue", "_in_progress", "_completed", "_failed"] {
+        assert!(
+            temp_path.join(directory).exists(),
+            "a dry run removed {directory}"
+        );
+    }
 }
