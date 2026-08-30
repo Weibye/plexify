@@ -717,6 +717,63 @@ mod tests {
         assert_eq!(Extract.hardest(Drop), Drop);
     }
 
+    /// The channel count in a `Transcode` is a ceiling to mix down to, not a
+    /// layout to produce. Both directions, because getting one right by
+    /// assuming the other has been wrong twice here.
+    #[test]
+    fn a_replacement_track_is_capped_without_being_widened() {
+        use crate::probe::{AudioStream, MediaProbe, VideoStream};
+        use crate::target::evaluate;
+
+        let chromecast = PlaybackTarget::builtin("chromecast-gen2-3")
+            .unwrap()
+            .unwrap();
+        let lg = PlaybackTarget::builtin("lg-cx-webos").unwrap().unwrap();
+
+        let with_audio = |codec: &str, channels: u32| MediaProbe {
+            container: Some("mov,mp4,m4a".to_string()),
+            video: Some(VideoStream {
+                codec: "h264".to_string(),
+                profile: Some("high".to_string()),
+                level: Some(41),
+                pixel_format: Some("yuv420p".to_string()),
+                bit_depth: Some(8),
+                ref_frames: Some(4),
+                width: Some(1920),
+                height: Some(1080),
+            }),
+            audio: vec![AudioStream {
+                codec: codec.to_string(),
+                channels: Some(channels),
+                language: None,
+            }],
+            ..Default::default()
+        };
+
+        // Above the cap: mix down to it. A 5.1 AAC track is a codec the
+        // Chromecast decodes at a layout it refuses.
+        let surround = with_audio("ac3", 6);
+        assert_eq!(
+            Operation::for_conformance(&evaluate(&surround, &chromecast), &chromecast),
+            Some(Operation::Remux {
+                audio: AudioAction::Transcode { channels: Some(2) },
+                subtitles: SubtitleAction::Keep,
+            })
+        );
+
+        // Below the cap: leave the layout alone. The LG takes six channels and
+        // every one of this library's 342 Opus tracks is stereo or mono, so
+        // reaching for the cap would invent surround out of stereo.
+        let stereo = with_audio("opus", 2);
+        assert_eq!(
+            Operation::for_conformance(&evaluate(&stereo, &lg), &lg),
+            Some(Operation::Remux {
+                audio: AudioAction::Transcode { channels: None },
+                subtitles: SubtitleAction::Keep,
+            })
+        );
+    }
+
     #[test]
     fn combining_audio_takes_the_cap_that_is_inside_both() {
         use AudioAction::{Copy, Transcode};
