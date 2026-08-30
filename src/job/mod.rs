@@ -59,32 +59,84 @@ pub enum Operation {
 /// What a remux does with the source's audio.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 pub enum AudioAction {
+    /// Every client plays one of the tracks the file already has.
     #[default]
     Copy,
-    /// Re-encode, downmixing to `channels` where the target takes fewer than
-    /// the source carries. A layout the client cannot handle is not the same
-    /// problem as a codec it cannot decode, and one flag could not say both.
+    /// Keep every track the file has and add one more that the clients the
+    /// originals do not serve can play.
+    ///
+    /// Never the answer for a single client - it is what *disagreement*
+    /// resolves to. The Chromecast is measured refusing AC3 in every layout
+    /// and the LG refusing Opus, so 235 files play on one and not the other.
+    /// Replacing the track would fix that by taking 5.1 away from the device
+    /// that was managing perfectly well; adding one lets the server hand each
+    /// client the track it can decode.
+    Add { channels: Option<u32> },
+    /// Replace the audio.
+    ///
+    /// For when *no* named client plays any track the file has, which makes
+    /// keeping one bytes nobody can decode. The original is still in the
+    /// source, which `work` renames rather than deletes.
     Transcode { channels: Option<u32> },
 }
 
 impl AudioAction {
     /// The action that satisfies both of two targets' answers.
+    ///
+    /// `Add` is not produced for any single client; it is what this function
+    /// makes of a disagreement. `Copy` from one target means that target plays
+    /// a track the file already has, so that track has to survive; `Transcode`
+    /// from another means no existing track serves it, so a new one is needed.
+    /// Both at once is exactly "keep what is there and add one", which is why
+    /// adding is the answer to two clients rather than a preference.
+    ///
+    /// Where every target says `Transcode`, nothing the file carries serves
+    /// anybody and replacing is right.
     fn hardest(self, other: Self) -> Self {
         match (self, other) {
-            (Self::Copy, action) | (action, Self::Copy) => action,
+            (Self::Copy, Self::Copy) => Self::Copy,
+
+            // One client is served by a track that is already there, another
+            // is not. Keeping both is the only answer that serves both.
+            (Self::Copy, Self::Transcode { channels })
+            | (Self::Transcode { channels }, Self::Copy) => Self::Add { channels },
+            (Self::Copy, added @ Self::Add { .. }) | (added @ Self::Add { .. }, Self::Copy) => {
+                added
+            }
+
+            // Once anything has to be added, adding covers a client that would
+            // have settled for a replacement too: it can play the new track.
+            (Self::Add { channels: one }, Self::Add { channels: other })
+            | (Self::Add { channels: one }, Self::Transcode { channels: other })
+            | (Self::Transcode { channels: one }, Self::Add { channels: other }) => Self::Add {
+                channels: narrower(one, other),
+            },
+
             (Self::Transcode { channels: one }, Self::Transcode { channels: other }) => {
                 Self::Transcode {
-                    // Two caps: the lower one is inside both. A cap and no cap
-                    // is the cap - re-encoding at six channels does not satisfy
-                    // the device that will only take two.
-                    channels: match (one, other) {
-                        (Some(one), Some(other)) => Some(one.min(other)),
-                        (Some(cap), None) | (None, Some(cap)) => Some(cap),
-                        (None, None) => None,
-                    },
+                    channels: narrower(one, other),
                 }
             }
         }
+    }
+
+    /// The channel count the new track is given, or `None` to leave the
+    /// source's layout alone.
+    pub fn channels(self) -> Option<u32> {
+        match self {
+            Self::Copy => None,
+            Self::Add { channels } | Self::Transcode { channels } => channels,
+        }
+    }
+}
+
+/// The cap that is inside both. A cap and no cap is the cap - re-encoding at
+/// six channels does not satisfy the device that will only take two.
+fn narrower(one: Option<u32>, other: Option<u32>) -> Option<u32> {
+    match (one, other) {
+        (Some(one), Some(other)) => Some(one.min(other)),
+        (Some(cap), None) | (None, Some(cap)) => Some(cap),
+        (None, None) => None,
     }
 }
 
@@ -171,15 +223,18 @@ impl Operation {
 
         let has = |field: Field| reasons.iter().any(|reason| reason.field == field);
 
-        // A layout the client will not take is fixed by mixing down to the cap
-        // it states; a codec it cannot decode is fixed by re-encoding at
-        // whatever layout the source has.
-        let audio = match (has(Field::AudioChannels), has(Field::AudioCodec)) {
-            (true, _) => AudioAction::Transcode {
+        // Either fault produces a track this client can play, and that track
+        // has to be inside the cap whichever fault it was: a 5.1 AC3 track
+        // re-encoded to 5.1 AAC for a device that decodes AAC and takes two
+        // channels is a file that still does not play. One target, so this is
+        // a replacement; `hardest` turns it into an addition where another
+        // target was happy with what was already there.
+        let audio = if has(Field::AudioChannels) || has(Field::AudioCodec) {
+            AudioAction::Transcode {
                 channels: Some(target.audio.max_channels.value),
-            },
-            (false, true) => AudioAction::Transcode { channels: None },
-            (false, false) => AudioAction::Copy,
+            }
+        } else {
+            AudioAction::Copy
         };
 
         // The track is why the client would burn the picture, but it is also
@@ -222,6 +277,20 @@ impl Operation {
                 subtitles: subtitles.hardest(other_subtitles),
             },
         }
+    }
+
+    /// Whether the output gains an audio track the source did not have.
+    ///
+    /// The command that does it needs the source's audio stream count, so this
+    /// is what decides whether that probe is worth running.
+    pub fn adds_an_audio_track(&self) -> bool {
+        matches!(
+            self,
+            Operation::Remux {
+                audio: AudioAction::Add { .. },
+                ..
+            }
+        )
     }
 
     /// Whether the output carries the source's subtitle tracks.
@@ -719,15 +788,24 @@ mod tests {
 
     #[test]
     fn combining_audio_takes_the_cap_that_is_inside_both() {
-        use AudioAction::{Copy, Transcode};
+        use AudioAction::{Add, Copy, Transcode};
 
         assert_eq!(Copy.hardest(Copy), Copy);
+
+        // The case that matters, and the whole of #161: one target plays a
+        // track the file already has, the other cannot. Replacing would take
+        // 5.1 away from the device that was managing; adding serves both.
         assert_eq!(
             Copy.hardest(Transcode { channels: Some(2) }),
-            Transcode { channels: Some(2) }
+            Add { channels: Some(2) }
         );
-        // Re-encoding at six channels does not satisfy the device that will
-        // only take two.
+        assert_eq!(
+            Transcode { channels: Some(2) }.hardest(Copy),
+            Add { channels: Some(2) }
+        );
+
+        // Nothing the file carries serves anybody, so keeping a track would be
+        // bytes no client can decode.
         assert_eq!(
             Transcode { channels: None }.hardest(Transcode { channels: Some(2) }),
             Transcode { channels: Some(2) }
@@ -735,6 +813,121 @@ mod tests {
         assert_eq!(
             Transcode { channels: Some(6) }.hardest(Transcode { channels: Some(2) }),
             Transcode { channels: Some(2) }
+        );
+
+        // Folding a third target onto an addition keeps it an addition: the
+        // track that was added is one the newcomer can play too.
+        assert_eq!(
+            Add { channels: Some(2) }.hardest(Transcode { channels: Some(6) }),
+            Add { channels: Some(2) }
+        );
+        assert_eq!(
+            Add { channels: Some(2) }.hardest(Copy),
+            Add { channels: Some(2) }
+        );
+    }
+
+    /// Confirmed rather than assumed: 932 files already carry AAC, and a file
+    /// whose AAC stereo track already serves a client must never reach the
+    /// track-adding path, because there is nothing to add.
+    ///
+    /// `evaluate` picks whichever track plays, so the AC3 5.1 beside it is not
+    /// a fault - it is the surround the LG is welcome to.
+    #[test]
+    fn a_file_that_already_carries_a_playable_track_conforms_and_is_never_queued() {
+        use crate::probe::{AudioStream, MediaProbe, VideoStream};
+        use crate::target::evaluate;
+
+        let chromecast = PlaybackTarget::builtin("chromecast-gen2-3")
+            .unwrap()
+            .unwrap();
+        let lg = PlaybackTarget::builtin("lg-cx-webos").unwrap().unwrap();
+
+        let probe = MediaProbe {
+            container: Some("mov,mp4,m4a".to_string()),
+            video: Some(VideoStream {
+                codec: "h264".to_string(),
+                profile: Some("high".to_string()),
+                level: Some(41),
+                pixel_format: Some("yuv420p".to_string()),
+                bit_depth: Some(8),
+                ref_frames: Some(4),
+                width: Some(1920),
+                height: Some(1080),
+            }),
+            audio: vec![
+                AudioStream {
+                    codec: "ac3".to_string(),
+                    channels: Some(6),
+                    language: Some("eng".to_string()),
+                },
+                AudioStream {
+                    codec: "aac".to_string(),
+                    channels: Some(2),
+                    language: Some("eng".to_string()),
+                },
+            ],
+            ..Default::default()
+        };
+
+        for target in [&chromecast, &lg] {
+            assert_eq!(
+                Operation::for_conformance(&evaluate(&probe, target), target),
+                None,
+                "{} should need nothing done to this file",
+                target.name
+            );
+        }
+
+        // And the two together, which is the fold `scan --target` performs.
+        let combined = [&chromecast, &lg]
+            .into_iter()
+            .filter_map(|target| Operation::for_conformance(&evaluate(&probe, target), target))
+            .reduce(Operation::hardest);
+        assert_eq!(combined, None, "no job at all, so #161 never sees it");
+    }
+
+    /// A track produced for a client has to be one that client can play, and
+    /// that is both halves at once: the codec it decodes *and* a layout inside
+    /// its cap. 5.1 AC3 re-encoded to 5.1 AAC for a device that takes two
+    /// channels is a file that still does not play.
+    #[test]
+    fn a_track_made_for_a_client_is_inside_that_client_s_channel_cap() {
+        use crate::probe::{AudioStream, MediaProbe, VideoStream};
+        use crate::target::evaluate;
+
+        let chromecast = PlaybackTarget::builtin("chromecast-gen2-3")
+            .unwrap()
+            .unwrap();
+
+        let probe = MediaProbe {
+            container: Some("mov,mp4,m4a".to_string()),
+            video: Some(VideoStream {
+                codec: "h264".to_string(),
+                profile: Some("high".to_string()),
+                level: Some(41),
+                pixel_format: Some("yuv420p".to_string()),
+                bit_depth: Some(8),
+                ref_frames: Some(4),
+                width: Some(1920),
+                height: Some(1080),
+            }),
+            // The measured population: AC3, which the Chromecast refuses in
+            // every layout, carrying more channels than it will take.
+            audio: vec![AudioStream {
+                codec: "ac3".to_string(),
+                channels: Some(6),
+                language: None,
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            Operation::for_conformance(&evaluate(&probe, &chromecast), &chromecast),
+            Some(Operation::Remux {
+                audio: AudioAction::Transcode { channels: Some(2) },
+                subtitles: SubtitleAction::Keep,
+            })
         );
     }
 
@@ -783,14 +976,15 @@ mod tests {
             ..Default::default()
         };
 
-        // A codec the client cannot decode: re-encode the audio, leave the
-        // layout as the source has it.
+        // A codec the client cannot decode: produce one it can, inside the
+        // layout it takes. Both halves, because a track that fixes only the
+        // codec is a track that still does not play.
         let mut wrong_codec = conforming();
         wrong_codec.audio[0].codec = "ac3".to_string();
         assert_eq!(
             Operation::for_conformance(&evaluate(&wrong_codec, &chromecast), &chromecast),
             Some(Operation::Remux {
-                audio: AudioAction::Transcode { channels: None },
+                audio: AudioAction::Transcode { channels: Some(2) },
                 subtitles: SubtitleAction::Keep,
             })
         );

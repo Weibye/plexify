@@ -230,6 +230,43 @@ impl FFmpegCommandBuilder {
         self
     }
 
+    /// Keep every audio track the source has and encode one more beside them.
+    ///
+    /// `originals` is how many audio streams the source carries, which is the
+    /// output index the new track lands on - the copies occupy everything
+    /// below it.
+    ///
+    /// The disposition is cleared explicitly, and that is not tidiness.
+    /// Measured: a track mapped from a default one inherits `default`, so
+    /// leaving it alone produces a file with two default audio tracks and no
+    /// answer to which one a client picks. The original keeps the flag; the
+    /// track we invented does not ask to be chosen.
+    pub fn with_added_audio_track(
+        mut self,
+        originals: usize,
+        channels: Option<u32>,
+        quality_settings: &QualitySettings,
+    ) -> Self {
+        self.output_options.extend_from_slice(&[
+            "-c:a".to_string(),
+            "copy".to_string(),
+            format!("-c:a:{originals}"),
+            "aac".to_string(),
+            format!("-b:a:{originals}"),
+            quality_settings.ffmpeg_audio_bitrate.clone(),
+        ]);
+
+        if let Some(channels) = channels {
+            self.output_options
+                .extend_from_slice(&[format!("-ac:a:{originals}"), channels.to_string()]);
+        }
+
+        self.output_options
+            .extend_from_slice(&[format!("-disposition:a:{originals}"), "0".to_string()]);
+
+        self
+    }
+
     /// Put the MP4 index in front of the media data.
     ///
     /// The muxer writes it last either way; this rewrites the finished file to
@@ -606,7 +643,11 @@ fn media_and_subtitle_mappings(
 ///
 /// Whether the output carries subtitles at all is decided by the caller, which
 /// has to leave them out of the stream mappings as well as out of the codecs.
-fn with_operation(builder: FFmpegCommandBuilder, job: &Job) -> FFmpegCommandBuilder {
+fn with_operation(
+    builder: FFmpegCommandBuilder,
+    job: &Job,
+    audio_tracks: usize,
+) -> FFmpegCommandBuilder {
     match job.operation {
         // The index goes to the front only on this path. A remux exists because
         // the container is what the player choked on, and leaving the new one
@@ -615,6 +656,12 @@ fn with_operation(builder: FFmpegCommandBuilder, job: &Job) -> FFmpegCommandBuil
             let builder = builder.with_video_copy().with_faststart();
             match audio {
                 AudioAction::Copy => builder.with_audio_copy(),
+                // A file with no audio has nothing to add a track beside, and
+                // nothing to derive one from.
+                AudioAction::Add { .. } if audio_tracks == 0 => builder.with_audio_copy(),
+                AudioAction::Add { channels } => {
+                    builder.with_added_audio_track(audio_tracks, channels, &job.quality_settings)
+                }
                 AudioAction::Transcode { channels } => {
                     let builder = builder.with_audio_encoding(&job.quality_settings);
                     match channels {
@@ -628,6 +675,20 @@ fn with_operation(builder: FFmpegCommandBuilder, job: &Job) -> FFmpegCommandBuil
             .with_video_encoding(&job.quality_settings)
             .with_audio_encoding(&job.quality_settings),
     }
+}
+
+/// Every stream an output takes when a track is being added beside the
+/// originals: the picture, every audio track the source has, and the one the
+/// new track is derived from.
+///
+/// The derived track is mapped last so it lands after the copies, which is what
+/// makes `-c:a:{originals}` name it. First rather than loudest or longest,
+/// because the first audio track is the one a container conventionally leads
+/// with, and nothing here has measured a better rule.
+fn added_track_mappings(subtitle_input: usize, selection: &SubtitleSelection) -> Vec<String> {
+    let mut mappings = vec!["0:v".to_string(), "0:a".to_string(), "0:a:0".to_string()];
+    mappings.extend(selection.mappings(subtitle_input));
+    mappings
 }
 
 /// How a source is divided up for a resumable encode.
@@ -917,15 +978,43 @@ impl FFmpegProcessor {
         subtitles: Option<&SubtitleSource>,
         output_path: &Path,
     ) -> Result<()> {
-        let ffmpeg_builder = with_operation(FFmpegCommandBuilder::new().with_generated_pts(), job)
-            .with_overwrite()
-            .with_output(output_path);
+        // How many audio tracks the source has decides where the added one
+        // lands, so a command that adds one cannot be built without the count.
+        // Failing here is the only safe answer: guessing low overwrites a copy
+        // with the encode, and falling back to a plain copy would quietly hand
+        // back a file that still does not play.
+        let audio_tracks = if job.operation.adds_an_audio_track() {
+            match self.probe_audio_stream_count(input_path).await {
+                Some(count) => count,
+                None => {
+                    return Err(anyhow!(
+                        "FFprobe could not count the audio tracks of {input_path:?}, and a track \
+                         cannot be added beside tracks that have not been counted"
+                    ))
+                }
+            }
+        } else {
+            0
+        };
+
+        let ffmpeg_builder = with_operation(
+            FFmpegCommandBuilder::new().with_generated_pts(),
+            job,
+            audio_tracks,
+        )
+        .with_overwrite()
+        .with_output(output_path);
+
+        let adds_a_track = job.operation.adds_an_audio_track() && audio_tracks > 0;
 
         // Add format-specific flags, inputs, and mappings
         let ffmpeg_builder = match subtitles {
             // A track the target burns into the picture is left out of the
             // codecs and the mappings both. Half of that is not enough: a
             // mapped subtitle stream with no subtitle codec fails the mux.
+            None if adds_a_track => ffmpeg_builder
+                .with_input(input_path)
+                .with_stream_mapping(&["0:v", "0:a", "0:a:0"]),
             None => ffmpeg_builder
                 .with_input(input_path)
                 .with_stream_mapping(&["0:v", "0:a"]),
@@ -940,6 +1029,10 @@ impl FFmpegProcessor {
             // renaming the source to `.disabled` loses it for good. The
             // subtitle streams are named one by one because the source may
             // carry one MP4 cannot hold, and `0:s?` would take that one too.
+            Some(SubtitleSource::Embedded(selection)) if adds_a_track => ffmpeg_builder
+                .with_subtitle_encoding()
+                .with_input(input_path)
+                .with_stream_mapping(&added_track_mappings(0, selection)),
             Some(SubtitleSource::Embedded(selection)) => ffmpeg_builder
                 .with_subtitle_encoding()
                 .with_input(input_path)
@@ -1195,6 +1288,42 @@ impl FFmpegProcessor {
             .output()
             .await
             .ok()?;
+
+        Some(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count(),
+        )
+    }
+
+    /// How many audio streams the source declares.
+    ///
+    /// The count decides the output index of an added track, so unlike the
+    /// video count this is read as a number rather than only compared to zero.
+    async fn probe_audio_stream_count(&self, path: &Path) -> Option<usize> {
+        let output = self
+            .probe_command()
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=index",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
 
         Some(
             String::from_utf8_lossy(&output.stdout)
@@ -1752,7 +1881,7 @@ mod tests {
     #[test]
     fn a_remux_copies_the_video_and_puts_the_index_in_front() {
         let job = job_for("/media/show.avi", MediaFileType::Avi, avi_remux());
-        let joined = with_operation(FFmpegCommandBuilder::new(), &job)
+        let joined = with_operation(FFmpegCommandBuilder::new(), &job, 0)
             .with_output("/work/show.mp4")
             .build()
             .join(" ");
@@ -1777,7 +1906,7 @@ mod tests {
             },
         );
 
-        let joined = with_operation(FFmpegCommandBuilder::new(), &job)
+        let joined = with_operation(FFmpegCommandBuilder::new(), &job, 0)
             .with_output("/work/show.mp4")
             .build()
             .join(" ");
@@ -1799,7 +1928,7 @@ mod tests {
             },
         );
 
-        let joined = with_operation(FFmpegCommandBuilder::new(), &job)
+        let joined = with_operation(FFmpegCommandBuilder::new(), &job, 0)
             .with_output("/work/show.mp4")
             .build()
             .join(" ");
@@ -1826,7 +1955,7 @@ mod tests {
     #[test]
     fn a_re_encode_is_left_exactly_as_it_was() {
         let job = job_for("/media/show.mkv", MediaFileType::Mkv, Operation::Reencode);
-        let joined = with_operation(FFmpegCommandBuilder::new(), &job)
+        let joined = with_operation(FFmpegCommandBuilder::new(), &job, 0)
             .with_output("/work/show.mp4")
             .build()
             .join(" ");
@@ -4426,6 +4555,106 @@ mod tests {
                 })
         };
         assert!(position(b"moov") < position(b"mdat"));
+    }
+
+    /// The whole of #161, end to end: the original survives with its layout
+    /// and its default flag, and the added track is stereo AAC, not default,
+    /// and carries the language it inherited rather than one we chose.
+    #[test]
+    fn adding_a_track_keeps_the_original_and_leaves_the_new_one_unchosen() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let input = temp_dir.path().join("show.mkv");
+
+        // AC3 5.1, which the Chromecast is measured to refuse in every layout
+        // and the LG plays. Tagged, so inheritance can be checked.
+        let built = std::process::Command::new("ffmpeg")
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=1:size=160x120:rate=10",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=duration=1",
+                "-c:v",
+                "libx264",
+                "-c:a",
+                "ac3",
+                "-ac",
+                "6",
+                "-metadata:s:a:0",
+                "language=eng",
+                "-y",
+            ])
+            .arg(&input)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(built.success(), "could not build the test source");
+
+        let job = Job::new(
+            input.clone(),
+            MediaFileType::Mkv,
+            Operation::Remux {
+                audio: AudioAction::Add { channels: Some(2) },
+                subtitles: SubtitleAction::Keep,
+            },
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            temp_dir.path(),
+        );
+
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(FFmpegProcessor::new(false).process_job(&job, None, None))
+            .expect("adding a track should succeed");
+
+        let tracks = audio_tracks_of(&job.output_path);
+        assert_eq!(
+            tracks,
+            vec![
+                // Untouched, still the one a client is pointed at first.
+                "ac3,6,1,eng".to_string(),
+                // Ours: stereo, and explicitly not asking to be chosen.
+                // Measured: without clearing this, it inherits `default` from
+                // the track it was derived from and the file has two.
+                "aac,2,0,eng".to_string(),
+            ]
+        );
+
+        // The picture was never touched, which is the point of doing this as a
+        // remux rather than a re-encode.
+        assert_eq!(codec_of(&job.output_path, "v"), "h264");
+    }
+
+    /// Codec, channels, default flag and language of every audio track.
+    fn audio_tracks_of(path: &Path) -> Vec<String> {
+        let output = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "a",
+                "-show_entries",
+                "stream=codec_name,channels:stream_disposition=default:stream_tags=language",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(path)
+            .output()
+            .expect("ffprobe should run");
+
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|line| line.trim().trim_end_matches(',').to_string())
+            .filter(|line| !line.is_empty())
+            .collect()
     }
 
     /// The LG's app burns `mov_text` in and re-encodes the video to do it, so
