@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::naming::{self, LibraryRoot, MediaName};
 use crate::paths::to_forward_slashes;
+use crate::target::{Conformance, Field, PlaybackTarget};
 
 /// Represents a media file that needs to be transcoded
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -82,6 +83,45 @@ pub enum SubtitleAction {
 }
 
 impl Operation {
+    /// What to do to a file a client was asked about, or `None` where the
+    /// answer is to leave it alone.
+    ///
+    /// `None` is the interesting case and the reason this returns an option
+    /// rather than a third variant: most of this library already Direct Plays,
+    /// and a file that conforms should produce no job at all. An `Operation`
+    /// describes work; "no work" is the absence of one.
+    ///
+    /// A remux's reasons say which tracks are wrong, and only those are
+    /// touched. A wrong container alone changes nothing but the container.
+    pub fn for_conformance(conformance: &Conformance, target: &PlaybackTarget) -> Option<Self> {
+        let reasons = match conformance {
+            Conformance::Conforms { .. } => return None,
+            Conformance::Reencode { .. } => return Some(Self::Reencode),
+            Conformance::Remux { reasons, .. } => reasons,
+        };
+
+        let has = |field: Field| reasons.iter().any(|reason| reason.field == field);
+
+        // A layout the client will not take is fixed by mixing down to the cap
+        // it states; a codec it cannot decode is fixed by re-encoding at
+        // whatever layout the source has.
+        let audio = match (has(Field::AudioChannels), has(Field::AudioCodec)) {
+            (true, _) => AudioAction::Transcode {
+                channels: Some(target.audio.max_channels.value),
+            },
+            (false, true) => AudioAction::Transcode { channels: None },
+            (false, false) => AudioAction::Copy,
+        };
+
+        let subtitles = if has(Field::Subtitles) {
+            SubtitleAction::Drop
+        } else {
+            SubtitleAction::Keep
+        };
+
+        Some(Self::Remux { audio, subtitles })
+    }
+
     /// Whether the output carries the source's subtitle tracks.
     ///
     /// A re-encode always does. The 136 `.mp4` files this project has already
@@ -539,6 +579,105 @@ mod tests {
         assert_eq!(
             job.subtitle_path,
             Some(PathBuf::from("/test/media/video.vtt"))
+        );
+    }
+
+    #[test]
+    fn a_file_that_direct_plays_produces_no_operation_at_all() {
+        // The whole point of asking: roughly 1500 of 2421 files need nothing,
+        // and a job for one of them is work invented out of an extension.
+        let conforms = Conformance::Conforms {
+            unverified: Vec::new(),
+        };
+        let target = PlaybackTarget::builtin("lg-cx-webos").unwrap().unwrap();
+
+        assert_eq!(Operation::for_conformance(&conforms, &target), None);
+    }
+
+    /// The three remux shapes the two envelopes actually produce, taken from
+    /// `evaluate` rather than assembled by hand - a mapping tested against
+    /// findings nothing generates is a mapping of nothing.
+    #[test]
+    fn each_remux_reason_asks_for_exactly_the_track_it_is_about() {
+        use crate::probe::{AudioStream, MediaProbe, SubtitleStream, VideoStream};
+        use crate::target::evaluate;
+
+        let chromecast = PlaybackTarget::builtin("chromecast-gen2-3")
+            .unwrap()
+            .unwrap();
+        let lg = PlaybackTarget::builtin("lg-cx-webos").unwrap().unwrap();
+
+        let conforming = || MediaProbe {
+            container: Some("mov,mp4,m4a".to_string()),
+            video: Some(VideoStream {
+                codec: "h264".to_string(),
+                profile: Some("high".to_string()),
+                level: Some(41),
+                pixel_format: Some("yuv420p".to_string()),
+                bit_depth: Some(8),
+                ref_frames: Some(4),
+                width: Some(1920),
+                height: Some(1080),
+            }),
+            audio: vec![AudioStream {
+                codec: "aac".to_string(),
+                channels: Some(2),
+                language: None,
+            }],
+            ..Default::default()
+        };
+
+        // A codec the client cannot decode: re-encode the audio, leave the
+        // layout as the source has it.
+        let mut wrong_codec = conforming();
+        wrong_codec.audio[0].codec = "ac3".to_string();
+        assert_eq!(
+            Operation::for_conformance(&evaluate(&wrong_codec, &chromecast), &chromecast),
+            Some(Operation::Remux {
+                audio: AudioAction::Transcode { channels: None },
+                subtitles: SubtitleAction::Keep,
+            })
+        );
+
+        // A layout it will not take: mix down to the cap the target states.
+        let mut too_many_channels = conforming();
+        too_many_channels.audio[0].channels = Some(6);
+        assert_eq!(
+            Operation::for_conformance(&evaluate(&too_many_channels, &chromecast), &chromecast),
+            Some(Operation::Remux {
+                audio: AudioAction::Transcode { channels: Some(2) },
+                subtitles: SubtitleAction::Keep,
+            })
+        );
+
+        // A track the client burns in: drop it, and do not touch the audio.
+        let mut burned_in = conforming();
+        burned_in.subtitles = vec![SubtitleStream {
+            codec: "mov_text".to_string(),
+            language: None,
+        }];
+        assert_eq!(
+            Operation::for_conformance(&evaluate(&burned_in, &lg), &lg),
+            Some(Operation::Remux {
+                audio: AudioAction::Copy,
+                subtitles: SubtitleAction::Drop,
+            })
+        );
+
+        // The measured AVI case: only the container is wrong, so only the
+        // container changes.
+        let mut avi = conforming();
+        avi.container = Some("avi".to_string());
+        avi.video.as_mut().unwrap().codec = "mpeg4".to_string();
+        avi.video.as_mut().unwrap().profile = None;
+        avi.video.as_mut().unwrap().level = None;
+        assert_eq!(
+            Operation::for_conformance(&evaluate(&avi, &lg), &lg),
+            Some(Operation::Remux {
+                audio: AudioAction::Copy,
+                subtitles: SubtitleAction::Keep,
+            }),
+            "an AVI that needs only its container copies every track"
         );
     }
 
