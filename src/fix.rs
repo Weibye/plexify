@@ -753,6 +753,42 @@ mod tests {
         assert!(absolute(root, "Series/Show/Season 01/Show - S01E01 - Pilot.nfo").exists());
     }
 
+    /// Every shape `src/subtitles` writes, including the multi-part suffixes.
+    /// A rename that took `.eng.srt` and left `.eng.forced.srt` behind would
+    /// break the pairing extraction exists to create.
+    #[test]
+    fn every_sidecar_an_extraction_writes_moves_with_its_file() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let season = "Series/Show/Season 1";
+        touch(root, &format!("{season}/Show - S01E01 Pilot.mkv"));
+        for suffix in ["eng.srt", "eng.forced.srt", "eng.2.srt", "eng.ass", "srt"] {
+            touch(root, &format!("{season}/Show - S01E01 Pilot.{suffix}"));
+        }
+
+        let report = report(
+            root,
+            vec![rename_issue(
+                &format!("{season}/Show - S01E01 Pilot.mkv"),
+                "Series/Show/Season 01/Show - S01E01 - Pilot.mkv",
+            )],
+        );
+
+        let outcome = apply(&plan(&report), &temp.path().join("plan.json")).unwrap();
+
+        assert_eq!(outcome.applied.len(), 6, "the video and its five subtitles");
+        for suffix in ["eng.srt", "eng.forced.srt", "eng.2.srt", "eng.ass", "srt"] {
+            assert!(
+                absolute(
+                    root,
+                    &format!("Series/Show/Season 01/Show - S01E01 - Pilot.{suffix}")
+                )
+                .exists(),
+                "{suffix} was left behind"
+            );
+        }
+    }
+
     #[test]
     fn another_video_sharing_a_stem_is_not_dragged_along() {
         let temp = TempDir::new().unwrap();

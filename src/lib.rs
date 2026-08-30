@@ -8,6 +8,7 @@ pub mod naming;
 pub mod paths;
 pub mod probe;
 pub mod queue;
+pub mod subtitles;
 pub mod target;
 pub mod undo;
 

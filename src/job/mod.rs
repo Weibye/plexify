@@ -79,7 +79,18 @@ pub enum SubtitleAction {
     /// than overlaying it, and re-encodes the video to do it. Carrying a track
     /// the client cannot overlay would cost the transcode a remux exists to
     /// avoid, so on that target the track has to go.
+    ///
+    /// Reserved for tracks no sidecar can hold. Anything text-based should be
+    /// extracted instead: `work` disables the source, so a dropped track is
+    /// gone rather than moved.
     Drop,
+    /// Take them out of the container and write them beside it as sidecar
+    /// files.
+    ///
+    /// The container then carries no subtitle stream, so nothing is burned in,
+    /// and the server converts a sidecar for whatever the client asks for
+    /// without touching the picture.
+    Extract,
 }
 
 impl Operation {
@@ -113,8 +124,11 @@ impl Operation {
             (false, false) => AudioAction::Copy,
         };
 
+        // The track is why the client would burn the picture, but it is also
+        // the subtitles the viewer turned on. It leaves the container and lands
+        // beside it rather than being lost.
         let subtitles = if has(Field::Subtitles) {
-            SubtitleAction::Drop
+            SubtitleAction::Extract
         } else {
             SubtitleAction::Keep
         };
@@ -132,7 +146,19 @@ impl Operation {
         !matches!(
             self,
             Operation::Remux {
-                subtitles: SubtitleAction::Drop,
+                subtitles: SubtitleAction::Drop | SubtitleAction::Extract,
+                ..
+            }
+        )
+    }
+
+    /// Whether the source's subtitle tracks are written beside the output
+    /// instead of into it.
+    pub fn extracts_subtitles(&self) -> bool {
+        matches!(
+            self,
+            Operation::Remux {
+                subtitles: SubtitleAction::Extract,
                 ..
             }
         )
@@ -650,7 +676,9 @@ mod tests {
             })
         );
 
-        // A track the client burns in: drop it, and do not touch the audio.
+        // A track the client burns in: take it out of the container and write
+        // it beside the file, and do not touch the audio. It is the subtitles
+        // the viewer turned on, so losing it is not a fix.
         let mut burned_in = conforming();
         burned_in.subtitles = vec![SubtitleStream {
             codec: "mov_text".to_string(),
@@ -660,7 +688,7 @@ mod tests {
             Operation::for_conformance(&evaluate(&burned_in, &lg), &lg),
             Some(Operation::Remux {
                 audio: AudioAction::Copy,
-                subtitles: SubtitleAction::Drop,
+                subtitles: SubtitleAction::Extract,
             })
         );
 
