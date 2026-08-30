@@ -279,6 +279,18 @@ impl Operation {
         }
     }
 
+    /// Whether the operation encodes any audio, and so needs to know what the
+    /// source's layout is before it can decide what to ask for.
+    pub fn touches_audio(&self) -> bool {
+        matches!(
+            self,
+            Operation::Remux {
+                audio: AudioAction::Add { .. } | AudioAction::Transcode { .. },
+                ..
+            }
+        )
+    }
+
     /// Whether the output gains an audio track the source did not have.
     ///
     /// The command that does it needs the source's audio stream count, so this

@@ -244,7 +244,6 @@ impl FFmpegCommandBuilder {
     pub fn with_added_audio_track(
         mut self,
         originals: usize,
-        channels: Option<u32>,
         quality_settings: &QualitySettings,
     ) -> Self {
         self.output_options.extend_from_slice(&[
@@ -256,14 +255,21 @@ impl FFmpegCommandBuilder {
             quality_settings.ffmpeg_audio_bitrate.clone(),
         ]);
 
-        if let Some(channels) = channels {
-            self.output_options
-                .extend_from_slice(&[format!("-ac:a:{originals}"), channels.to_string()]);
-        }
-
         self.output_options
             .extend_from_slice(&[format!("-disposition:a:{originals}"), "0".to_string()]);
 
+        self
+    }
+
+    /// Mix one output audio stream down to `cap`.
+    ///
+    /// Emitted per stream and only where the source is above the cap, because
+    /// `-ac` sets a channel count rather than limiting one: applied to a track
+    /// already inside the cap it upmixes, inventing channels nothing recorded.
+    /// A cap is a maximum, so a source below it is left exactly as it is.
+    pub fn with_audio_channel_cap(mut self, stream: usize, cap: u32) -> Self {
+        self.output_options
+            .extend_from_slice(&[format!("-ac:a:{stream}"), cap.to_string()]);
         self
     }
 
@@ -641,12 +647,13 @@ fn media_and_subtitle_mappings(
 
 /// The codec options a job's operation asks for.
 ///
-/// Whether the output carries subtitles at all is decided by the caller, which
-/// has to leave them out of the stream mappings as well as out of the codecs.
+/// `source_channels` is how many channels each of the source's audio streams
+/// carries. A cap is only ever applied to a stream that exceeds it, which is
+/// what makes `channels` a maximum rather than an instruction.
 fn with_operation(
     builder: FFmpegCommandBuilder,
     job: &Job,
-    audio_tracks: usize,
+    source_channels: &[u32],
 ) -> FFmpegCommandBuilder {
     match job.operation {
         // The index goes to the front only on this path. A remux exists because
@@ -658,16 +665,28 @@ fn with_operation(
                 AudioAction::Copy => builder.with_audio_copy(),
                 // A file with no audio has nothing to add a track beside, and
                 // nothing to derive one from.
-                AudioAction::Add { .. } if audio_tracks == 0 => builder.with_audio_copy(),
+                AudioAction::Add { .. } if source_channels.is_empty() => builder.with_audio_copy(),
                 AudioAction::Add { channels } => {
-                    builder.with_added_audio_track(audio_tracks, channels, &job.quality_settings)
+                    let originals = source_channels.len();
+                    let builder = builder.with_added_audio_track(originals, &job.quality_settings);
+                    // The new track is derived from the first, so the first is
+                    // the layout the cap has to bind against.
+                    match capped(channels, source_channels[0]) {
+                        Some(cap) => builder.with_audio_channel_cap(originals, cap),
+                        None => builder,
+                    }
                 }
                 AudioAction::Transcode { channels } => {
                     let builder = builder.with_audio_encoding(&job.quality_settings);
-                    match channels {
-                        Some(channels) => builder.with_audio_channels(channels),
-                        None => builder,
-                    }
+                    // Per stream, because a commentary track in mono beside a
+                    // 5.1 feature is not a reason to upmix the commentary.
+                    source_channels.iter().enumerate().fold(
+                        builder,
+                        |builder, (stream, &carried)| match capped(channels, carried) {
+                            Some(cap) => builder.with_audio_channel_cap(stream, cap),
+                            None => builder,
+                        },
+                    )
                 }
             }
         }
@@ -675,6 +694,12 @@ fn with_operation(
             .with_video_encoding(&job.quality_settings)
             .with_audio_encoding(&job.quality_settings),
     }
+}
+
+/// The cap to apply to a stream carrying `carried` channels, or `None` where it
+/// is already inside the cap and nothing should be said about it.
+fn capped(cap: Option<u32>, carried: u32) -> Option<u32> {
+    cap.filter(|cap| carried > *cap)
 }
 
 /// Every stream an output takes when a track is being added beside the
@@ -978,34 +1003,34 @@ impl FFmpegProcessor {
         subtitles: Option<&SubtitleSource>,
         output_path: &Path,
     ) -> Result<()> {
-        // How many audio tracks the source has decides where the added one
-        // lands, so a command that adds one cannot be built without the count.
-        // Failing here is the only safe answer: guessing low overwrites a copy
-        // with the encode, and falling back to a plain copy would quietly hand
-        // back a file that still does not play.
-        let audio_tracks = if job.operation.adds_an_audio_track() {
-            match self.probe_audio_stream_count(input_path).await {
-                Some(count) => count,
+        // Two things need the source's audio layout, and one probe answers
+        // both: where an added track lands, and whether a channel cap binds at
+        // all. Failing here is the only safe answer - guessing the count low
+        // overwrites a copy with the encode, and guessing the layout high
+        // invents channels nothing recorded.
+        let source_channels = if job.operation.touches_audio() {
+            match self.probe_audio_channels(input_path).await {
+                Some(channels) => channels,
                 None => {
                     return Err(anyhow!(
-                        "FFprobe could not count the audio tracks of {input_path:?}, and a track \
-                         cannot be added beside tracks that have not been counted"
+                        "FFprobe could not read the audio layout of {input_path:?}, and a track \
+                         cannot be made to fit a client without knowing what the source carries"
                     ))
                 }
             }
         } else {
-            0
+            Vec::new()
         };
 
         let ffmpeg_builder = with_operation(
             FFmpegCommandBuilder::new().with_generated_pts(),
             job,
-            audio_tracks,
+            &source_channels,
         )
         .with_overwrite()
         .with_output(output_path);
 
-        let adds_a_track = job.operation.adds_an_audio_track() && audio_tracks > 0;
+        let adds_a_track = job.operation.adds_an_audio_track() && !source_channels.is_empty();
 
         // Add format-specific flags, inputs, and mappings
         let ffmpeg_builder = match subtitles {
@@ -1297,11 +1322,14 @@ impl FFmpegProcessor {
         )
     }
 
-    /// How many audio streams the source declares.
+    /// How many channels each of the source's audio streams carries, in order.
     ///
-    /// The count decides the output index of an added track, so unlike the
-    /// video count this is read as a number rather than only compared to zero.
-    async fn probe_audio_stream_count(&self, path: &Path) -> Option<usize> {
+    /// Two things are read off this. The length is the output index an added
+    /// track lands on, and each count is what stops a downmix becoming an
+    /// upmix: `-ac` *sets* the channel count rather than capping it, so asking
+    /// for six on a stereo source invents four channels that were never
+    /// recorded. Only the source can say whether a cap binds.
+    async fn probe_audio_channels(&self, path: &Path) -> Option<Vec<u32>> {
         let output = self
             .probe_command()
             .args([
@@ -1310,7 +1338,7 @@ impl FFmpegProcessor {
                 "-select_streams",
                 "a",
                 "-show_entries",
-                "stream=index",
+                "stream=channels",
                 "-of",
                 "csv=p=0",
             ])
@@ -1325,11 +1353,16 @@ impl FFmpegProcessor {
             return None;
         }
 
+        // A stream whose channel count FFprobe will not state reads as 0, which
+        // is below every cap and so is never capped. Guessing a layout for it
+        // is the one thing that could invent channels.
         Some(
             String::from_utf8_lossy(&output.stdout)
                 .lines()
-                .filter(|line| !line.trim().is_empty())
-                .count(),
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(|line| line.parse().unwrap_or(0))
+                .collect(),
         )
     }
 
@@ -1881,7 +1914,7 @@ mod tests {
     #[test]
     fn a_remux_copies_the_video_and_puts_the_index_in_front() {
         let job = job_for("/media/show.avi", MediaFileType::Avi, avi_remux());
-        let joined = with_operation(FFmpegCommandBuilder::new(), &job, 0)
+        let joined = with_operation(FFmpegCommandBuilder::new(), &job, &[])
             .with_output("/work/show.mp4")
             .build()
             .join(" ");
@@ -1906,7 +1939,7 @@ mod tests {
             },
         );
 
-        let joined = with_operation(FFmpegCommandBuilder::new(), &job, 0)
+        let joined = with_operation(FFmpegCommandBuilder::new(), &job, &[6])
             .with_output("/work/show.mp4")
             .build()
             .join(" ");
@@ -1914,7 +1947,78 @@ mod tests {
         assert!(joined.contains("-c:v copy"), "{joined}");
         // A 5.1 track in a codec the client decodes fails on its layout, and
         // the fix for that is a downmix, not a codec swap.
-        assert!(joined.contains("-c:a aac -b:a 128k -ac 2"), "{joined}");
+        assert!(joined.contains("-c:a aac -b:a 128k"), "{joined}");
+        assert!(joined.contains("-ac:a:0 2"), "{joined}");
+    }
+
+    /// `-ac` sets a channel count rather than limiting one, so a cap applied
+    /// to a source already inside it invents channels nothing recorded.
+    ///
+    /// Measured on the shape this used to build: a stereo Opus source folded
+    /// to a cap of six came out `opus,2` plus `aac,6`. Every Opus file in this
+    /// library is stereo or mono, and the LG's cap is six, so that was the
+    /// whole population.
+    #[test]
+    fn a_cap_the_source_is_already_inside_changes_nothing() {
+        let transcode = job_for(
+            "/media/show.mkv",
+            MediaFileType::Mkv,
+            Operation::Remux {
+                audio: AudioAction::Transcode { channels: Some(6) },
+                subtitles: SubtitleAction::Keep,
+            },
+        );
+
+        let joined = with_operation(FFmpegCommandBuilder::new(), &transcode, &[2])
+            .with_output("/work/show.mp4")
+            .build()
+            .join(" ");
+        assert!(!joined.contains("-ac"), "stereo must stay stereo: {joined}");
+
+        let added = job_for(
+            "/media/show.mkv",
+            MediaFileType::Mkv,
+            Operation::Remux {
+                audio: AudioAction::Add { channels: Some(6) },
+                subtitles: SubtitleAction::Keep,
+            },
+        );
+
+        let joined = with_operation(FFmpegCommandBuilder::new(), &added, &[2])
+            .with_output("/work/show.mp4")
+            .build()
+            .join(" ");
+        assert!(joined.contains("-c:a:1 aac"), "{joined}");
+        assert!(
+            !joined.contains("-ac"),
+            "a track derived from stereo is stereo: {joined}"
+        );
+    }
+
+    /// A cap binds one stream and not another, so it is stated per stream.
+    #[test]
+    fn a_cap_binds_only_the_streams_that_exceed_it() {
+        let job = job_for(
+            "/media/show.mkv",
+            MediaFileType::Mkv,
+            Operation::Remux {
+                audio: AudioAction::Transcode { channels: Some(2) },
+                subtitles: SubtitleAction::Keep,
+            },
+        );
+
+        // A 5.1 feature, a stereo dub, and a mono commentary.
+        let joined = with_operation(FFmpegCommandBuilder::new(), &job, &[6, 2, 1])
+            .with_output("/work/show.mp4")
+            .build()
+            .join(" ");
+
+        assert!(joined.contains("-ac:a:0 2"), "{joined}");
+        assert!(!joined.contains("-ac:a:1"), "stereo is inside it: {joined}");
+        assert!(
+            !joined.contains("-ac:a:2"),
+            "and a mono commentary is not a reason to upmix it: {joined}"
+        );
     }
 
     #[test]
@@ -1928,7 +2032,7 @@ mod tests {
             },
         );
 
-        let joined = with_operation(FFmpegCommandBuilder::new(), &job, 0)
+        let joined = with_operation(FFmpegCommandBuilder::new(), &job, &[])
             .with_output("/work/show.mp4")
             .build()
             .join(" ");
@@ -1955,7 +2059,7 @@ mod tests {
     #[test]
     fn a_re_encode_is_left_exactly_as_it_was() {
         let job = job_for("/media/show.mkv", MediaFileType::Mkv, Operation::Reencode);
-        let joined = with_operation(FFmpegCommandBuilder::new(), &job, 0)
+        let joined = with_operation(FFmpegCommandBuilder::new(), &job, &[])
             .with_output("/work/show.mp4")
             .build()
             .join(" ");
@@ -4631,6 +4735,77 @@ mod tests {
         // The picture was never touched, which is the point of doing this as a
         // remux rather than a re-encode.
         assert_eq!(codec_of(&job.output_path, "v"), "h264");
+    }
+
+    /// The reported case, through the real pipeline: every Opus file in this
+    /// library is stereo or mono, and the LG's cap is six, so the fold hands
+    /// this path `Add { channels: Some(6) }` for all 342 of them. A cap above
+    /// the source must do nothing at all.
+    #[test]
+    fn a_stereo_source_never_gains_channels_it_did_not_have() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let input = temp_dir.path().join("show.mkv");
+
+        let built = std::process::Command::new("ffmpeg")
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=duration=1:size=160x120:rate=10",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=duration=1",
+                "-c:v",
+                "libx264",
+                "-c:a",
+                "libopus",
+                "-ac",
+                "2",
+                "-y",
+            ])
+            .arg(&input)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        if !built.success() {
+            eprintln!("skipping: this FFmpeg cannot encode Opus");
+            return;
+        }
+
+        let job = Job::new(
+            input.clone(),
+            MediaFileType::Mkv,
+            Operation::Remux {
+                audio: AudioAction::Add { channels: Some(6) },
+                subtitles: SubtitleAction::Keep,
+            },
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            temp_dir.path(),
+        );
+
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(FFmpegProcessor::new(false).process_job(&job, None, None))
+            .expect("adding a track should succeed");
+
+        let tracks = audio_tracks_of(&job.output_path);
+        assert_eq!(
+            tracks.len(),
+            2,
+            "the original and the one added beside it: {tracks:?}"
+        );
+        assert!(tracks[0].starts_with("opus,2"), "{tracks:?}");
+        assert!(
+            tracks[1].starts_with("aac,2"),
+            "a track derived from stereo is stereo, not 5.1 invented from it: {tracks:?}"
+        );
     }
 
     /// Codec, channels, default flag and language of every audio track.
