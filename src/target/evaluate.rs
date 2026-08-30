@@ -445,42 +445,63 @@ fn audio(probe: &MediaProbe, target: &PlaybackTarget, findings: &mut Findings) {
         return;
     }
 
-    // A 5.1 track in a codec the client decodes fails on its channel count, and
-    // saying "only aac" there would send the reader looking at the wrong thing.
-    let too_many_channels = probe
+    // Nothing plays, and the two ways that can be true are reported separately
+    // even when both hold. A verdict that stopped at the codec could not say
+    // whether the track a fix produces needs mixing down as well, and the
+    // caller then has to guess: assume it does and a stereo source is upmixed
+    // to a layout it never had, assume it does not and a 5.1 source comes back
+    // in a layout the client refuses. Both guesses have been made in this
+    // project, and each was wrong for a different half of the library.
+
+    // The codec is only the fault if it is the fault everywhere. A file whose
+    // AAC track is 5.1 and whose AC3 track is stereo needs no new codec - it
+    // needs the AAC mixed down - and "only aac/ac3" would point at the wrong
+    // property.
+    let codec_plays_somewhere = probe
         .audio
         .iter()
-        .filter(|stream| envelope.codecs.verdict(&stream.codec).0)
+        .any(|stream| envelope.codecs.verdict(&stream.codec).0);
+
+    if !codec_plays_somewhere {
+        // Rejecting on measured evidence only if every track was measured to
+        // fail.
+        let source = probe
+            .audio
+            .iter()
+            .map(|stream| envelope.codecs.verdict(&stream.codec).1)
+            .fold(Provenance::Observed, Provenance::weakest);
+
+        let mut codecs: Vec<&str> = probe.audio.iter().map(|s| s.codec.as_str()).collect();
+        codecs.sort_unstable();
+        codecs.dedup();
+
+        findings.check(
+            (false, source),
+            Field::AudioCodec,
+            format!("only {}", codecs.join("/")),
+            None,
+        );
+    }
+
+    // Independent of the codec: a re-encode maps every audio track, so a
+    // layout above the cap survives one unless the cap is asked for. Reported
+    // against the narrowest track that is still too wide, which is the closest
+    // the file comes to fitting.
+    let too_wide = probe
+        .audio
+        .iter()
+        .filter(|stream| !channels(stream, target).0)
         .filter_map(|stream| Some((stream.channels?, channels(stream, target).1)))
         .min_by_key(|(count, _)| *count);
 
-    if let Some((count, source)) = too_many_channels {
+    if let Some((count, source)) = too_wide {
         findings.check(
             (false, source),
             Field::AudioChannels,
             count.to_string(),
             Some(format!("up to {}", envelope.max_channels.value)),
         );
-        return;
     }
-
-    // Rejecting on measured evidence only if every track was measured to fail.
-    let source = probe
-        .audio
-        .iter()
-        .map(|stream| envelope.codecs.verdict(&stream.codec).1)
-        .fold(Provenance::Observed, Provenance::weakest);
-
-    let mut codecs: Vec<&str> = probe.audio.iter().map(|s| s.codec.as_str()).collect();
-    codecs.sort_unstable();
-    codecs.dedup();
-
-    findings.check(
-        (false, source),
-        Field::AudioCodec,
-        format!("only {}", codecs.join("/")),
-        None,
-    );
 }
 
 /// A track with no channel count stated is not a reason to fail a file, but
@@ -908,6 +929,95 @@ mod tests {
             verdict.reasons()[0].describe(),
             "audio channels: 6 (accepts up to 2)"
         );
+    }
+
+    fn fields_of(conformance: &Conformance) -> Vec<Field> {
+        let mut fields: Vec<Field> = conformance
+            .reasons()
+            .iter()
+            .map(|reason| reason.field)
+            .collect();
+        fields.sort();
+        fields
+    }
+
+    /// Both faults at once, because both are true. A verdict that stopped at
+    /// the codec left the caller unable to tell this file from a stereo one,
+    /// and the fix it produced was a 5.1 AAC track the Chromecast refuses.
+    #[test]
+    fn a_51_track_in_a_refused_codec_reports_the_codec_and_the_layout() {
+        let mut probe = plexify_output();
+        probe.audio = vec![AudioStream {
+            codec: "ac3".to_string(),
+            channels: Some(6),
+            ..Default::default()
+        }];
+
+        let verdict = evaluate(&probe, &chromecast());
+
+        assert_eq!(verdict.cost(), Some(Cost::Remux));
+        assert_eq!(
+            fields_of(&verdict),
+            [Field::AudioCodec, Field::AudioChannels]
+        );
+    }
+
+    /// The other half, and the one that was wrong in the opposite direction:
+    /// 342 Opus files in this library are stereo or mono, and the LG's cap is
+    /// six. Reporting a layout fault here would have the fix upmix stereo into
+    /// 5.1 to reach a ceiling the file was never near.
+    #[test]
+    fn a_stereo_track_in_a_refused_codec_reports_only_the_codec() {
+        let mut probe = plexify_output();
+        probe.audio = vec![AudioStream {
+            codec: "opus".to_string(),
+            channels: Some(2),
+            ..Default::default()
+        }];
+
+        let verdict = evaluate(&probe, &lg());
+
+        assert_eq!(verdict.cost(), Some(Cost::Remux));
+        assert_eq!(fields_of(&verdict), [Field::AudioCodec]);
+    }
+
+    /// A codec the client decodes on one track is not a codec fault, whatever
+    /// the layouts are. "only aac/ac3" would point the reader at the wrong
+    /// property when what the file needs is a mix-down.
+    #[test]
+    fn a_codec_that_plays_on_some_track_is_not_reported_as_the_fault() {
+        let mut probe = plexify_output();
+        probe.audio = vec![
+            AudioStream {
+                codec: "aac".to_string(),
+                channels: Some(6),
+                ..Default::default()
+            },
+            AudioStream {
+                codec: "ac3".to_string(),
+                channels: Some(2),
+                ..Default::default()
+            },
+        ];
+
+        let verdict = evaluate(&probe, &chromecast());
+
+        assert_eq!(fields_of(&verdict), [Field::AudioChannels]);
+    }
+
+    /// Reporting a second fault must not move a file between cost buckets:
+    /// both audio fields are remux work, and the library-wide figures this
+    /// project quotes were measured with one reason per file.
+    #[test]
+    fn reporting_both_faults_does_not_change_what_the_file_costs() {
+        let mut probe = plexify_output();
+        probe.audio = vec![AudioStream {
+            codec: "ac3".to_string(),
+            channels: Some(6),
+            ..Default::default()
+        }];
+
+        assert_eq!(evaluate(&probe, &chromecast()).cost(), Some(Cost::Remux));
     }
 
     /// The client plays whichever track suits it, so one good track is enough.
