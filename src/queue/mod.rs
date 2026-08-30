@@ -771,7 +771,7 @@ impl<'a> ClaimedJob<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::{Job, MediaFileType, PostProcessingSettings, QualitySettings};
+    use crate::job::{Job, MediaFileType, Operation, PostProcessingSettings, QualitySettings};
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -1202,6 +1202,8 @@ mod tests {
         let job: Job = serde_json::from_str(legacy).unwrap();
         assert_eq!(job.attempts, 0);
         assert_eq!(job.last_error, None);
+        // It was queued when every job re-encoded, so that is what it still is.
+        assert_eq!(job.operation, Operation::Reencode);
     }
 
     #[test]

@@ -14,6 +14,10 @@ pub struct Job {
     pub output_path: PathBuf,
     pub subtitle_path: Option<PathBuf>,
     pub file_type: MediaFileType,
+    /// What this job does to its source. Defaulted so job files written before
+    /// it existed deserialize as the re-encode they were queued as.
+    #[serde(default)]
+    pub operation: Operation,
     pub quality_settings: QualitySettings,
     pub post_processing: PostProcessingSettings,
     /// How many times a worker has tried and failed to transcode this file.
@@ -26,6 +30,28 @@ pub struct Job {
     /// `_failed` says why it is there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+}
+
+/// What a job does to its source.
+///
+/// Most of this library needs no video re-encode: the picture is already in a
+/// codec the targets Direct Play, and only the container or the audio is wrong.
+/// Copying the bitstream runs at disk speed against days of CPU for a re-encode,
+/// so which of the two a job is stays a property of the job, decided once when
+/// it is queued.
+///
+/// Resolved from the file type for now. Issue #158 replaces that with the
+/// conformance check, which asks what the source and the target hold rather
+/// than what the extension is.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub enum Operation {
+    /// Copy the video bitstream into MP4. The audio is copied too unless
+    /// `reencode_audio`, which is what a target that cannot play the source's
+    /// audio codec asks for.
+    Remux { reencode_audio: bool },
+    /// Re-encode video and audio to `quality_settings`.
+    #[default]
+    Reencode,
 }
 
 /// Quality settings for video encoding
@@ -64,6 +90,8 @@ pub enum MediaFileType {
     WebM,
     /// MKV file with embedded subtitles
     Mkv,
+    /// AVI file, remuxed into MP4 with its video copied.
+    Avi,
 }
 
 /// Episode metadata extracted from file paths for prioritization.
@@ -117,14 +145,24 @@ impl Job {
             media_root.join(&input_path)
         };
 
-        let output_path = match file_type {
-            MediaFileType::WebM => absolute_input_path.with_extension("mp4"),
-            MediaFileType::Mkv => absolute_input_path.with_extension("mp4"),
-        };
+        let output_path = absolute_input_path.with_extension("mp4");
 
         let subtitle_path = match file_type {
             MediaFileType::WebM => Some(absolute_input_path.with_extension("vtt")),
-            MediaFileType::Mkv => None, // MKV uses embedded subtitles
+            // MKV and AVI carry their subtitles themselves.
+            MediaFileType::Mkv | MediaFileType::Avi => None,
+        };
+
+        // Every MPEG-4 file in this library is in an AVI, and the LG plays that
+        // video fine - measured: a ~48s mid-episode stall with the server at
+        // 0.5% CPU and nothing in flight either way, which is the client waiting
+        // on an index AVI does not carry. The container is the whole problem, so
+        // the video is copied.
+        let operation = match file_type {
+            MediaFileType::Avi => Operation::Remux {
+                reencode_audio: false,
+            },
+            MediaFileType::WebM | MediaFileType::Mkv => Operation::Reencode,
         };
 
         Self {
@@ -133,6 +171,7 @@ impl Job {
             output_path,
             subtitle_path,
             file_type,
+            operation,
             quality_settings,
             post_processing,
             attempts: 0,
@@ -176,7 +215,8 @@ impl Job {
                     Err(anyhow!("WebM job should have subtitle path"))
                 }
             }
-            MediaFileType::Mkv => Ok(true), // MKV doesn't need external subtitles
+            // MKV and AVI carry their own subtitles.
+            MediaFileType::Mkv | MediaFileType::Avi => Ok(true),
         }
     }
 
@@ -460,6 +500,26 @@ mod tests {
         assert_eq!(
             job.subtitle_path,
             Some(PathBuf::from("/test/media/video.vtt"))
+        );
+    }
+
+    #[test]
+    fn an_avi_is_queued_as_a_remux_into_mp4() {
+        let job = Job::new(
+            PathBuf::from("video.avi"),
+            MediaFileType::Avi,
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            &PathBuf::from("/test/media"),
+        );
+
+        assert_eq!(job.output_path, PathBuf::from("/test/media/video.mp4"));
+        assert_eq!(job.subtitle_path, None);
+        assert_eq!(
+            job.operation,
+            Operation::Remux {
+                reencode_audio: false
+            }
         );
     }
 

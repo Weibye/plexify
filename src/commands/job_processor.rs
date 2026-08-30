@@ -34,6 +34,7 @@ impl JobProcessorConfig {
 }
 
 /// Result of attempting to process a job
+#[derive(PartialEq)]
 pub enum JobProcessResult {
     /// Job was successfully created and enqueued
     Created,
@@ -117,6 +118,9 @@ impl<'a> JobProcessor<'a> {
                         relative_path
                     );
                 }
+                MediaFileType::Avi => {
+                    info!("➕ Queueing remux job for: {:?}", relative_path);
+                }
             },
             JobProcessResult::OutputExists => {
                 // Only debug log for scan command, add command handles this differently
@@ -139,13 +143,14 @@ impl<'a> JobProcessor<'a> {
             Some(ext) => match ext.to_string_lossy().to_lowercase().as_str() {
                 "webm" => Ok(MediaFileType::WebM),
                 "mkv" => Ok(MediaFileType::Mkv),
+                "avi" => Ok(MediaFileType::Avi),
                 _ => Err(format!(
-                    "Unsupported file type. Only .webm and .mkv files are supported. Got: {:?}",
+                    "Unsupported file type. Only .webm, .mkv and .avi files are supported. Got: {:?}",
                     file_path
                 )),
             },
             None => Err(format!(
-                "File has no extension. Only .webm and .mkv files are supported: {:?}",
+                "File has no extension. Only .webm, .mkv and .avi files are supported: {:?}",
                 file_path
             )),
         }

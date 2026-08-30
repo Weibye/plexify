@@ -2,12 +2,12 @@
 
 [![CI](https://github.com/Weibye/plexify/workflows/CI/badge.svg)](https://github.com/Weibye/plexify/actions/workflows/ci.yml)
 
-A simple, distributed media transcoding CLI tool that converts .webm and .mkv files to .mp4 format with subtitle support, optimized for Plex media servers.
+A simple, distributed media transcoding CLI tool that converts .webm, .mkv and .avi files to .mp4 format with subtitle support, optimized for Plex media servers. An .avi is remuxed with its video copied rather than re-encoded.
 
 ## Features
 
 - **Distributed Processing**: Queue-based system allows multiple workers to process jobs concurrently
-- **Subtitle Support**: External .vtt subtitles for .webm files, and every embedded subtitle track for .mkv files
+- **Subtitle Support**: External .vtt subtitles for .webm files, and every embedded subtitle track for .mkv and .avi files
 - **Background Processing**: Run workers in low-priority background mode
 - **Configurable**: Customizable FFmpeg settings via environment variables
 - **Atomic Job Processing**: Race condition-free job claiming for multiple workers
@@ -76,7 +76,7 @@ Pre-built binaries for Linux, macOS, and Windows will be available in the GitHub
 
 ```bash
 # Scan a directory for media files and create transcoding jobs
-# Recursively scans all subdirectories for .webm and .mkv files
+# Recursively scans all subdirectories for .webm, .mkv and .avi files
 plexify scan /path/to/media
 
 # Scan with a quality preset for consistent encoding settings
@@ -299,7 +299,7 @@ FFMPEG_CRF=20 plexify scan --preset quality /path/to/media
 
 ### Typical Workflow
 
-1. **Scan**: Create jobs for all .webm and .mkv files with your preferred quality preset
+1. **Scan**: Create jobs for all .webm, .mkv and .avi files with your preferred quality preset
 ```bash
 # Scan with balanced preset (recommended)
 plexify scan --preset balanced /home/user/Videos --work-dir /home/user/plexify-queue

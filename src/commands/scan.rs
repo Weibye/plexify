@@ -53,8 +53,7 @@ impl ScanCommand {
         let queue = JobQueue::new(self.media_root.clone(), self.work_root.clone());
         queue.init().await?;
 
-        let mut webm_files = Vec::new();
-        let mut mkv_files = Vec::new();
+        let mut media_files: Vec<(PathBuf, MediaFileType)> = Vec::new();
         let mut directories_scanned = std::collections::HashSet::new();
         let mut ignored_count = 0;
         let mut files_processed = 0;
@@ -125,20 +124,9 @@ impl ScanCommand {
                     scan_pb.set_message(format!("Processed {} files...", files_processed));
                 }
 
-                if let Some(extension) = path.extension() {
-                    let ext_str = extension.to_string_lossy().to_lowercase();
-                    match ext_str.as_str() {
-                        "webm" => {
-                            if let Ok(relative_path) = path.strip_prefix(&self.media_root) {
-                                webm_files.push(relative_path.to_path_buf());
-                            }
-                        }
-                        "mkv" => {
-                            if let Ok(relative_path) = path.strip_prefix(&self.media_root) {
-                                mkv_files.push(relative_path.to_path_buf());
-                            }
-                        }
-                        _ => {}
+                if let Ok(file_type) = JobProcessor::determine_file_type(path) {
+                    if let Ok(relative_path) = path.strip_prefix(&self.media_root) {
+                        media_files.push((relative_path.to_path_buf(), file_type));
                     }
                 }
             }
@@ -147,11 +135,10 @@ impl ScanCommand {
         scan_pb.finish_and_clear();
 
         info!(
-            "📊 Scanned {} directories, processed {} files, and found {} .webm files and {} .mkv files",
+            "📊 Scanned {} directories, processed {} files, and found {} media files",
             directories_scanned.len(),
             files_processed,
-            webm_files.len(),
-            mkv_files.len()
+            media_files.len()
         );
 
         if ignored_count > 0 {
@@ -171,7 +158,7 @@ impl ScanCommand {
         info!("🔄 Now creating transcoding jobs...");
 
         let mut job_count = 0;
-        let total_files = webm_files.len() + mkv_files.len();
+        let total_files = media_files.len();
 
         let job_pb = if total_files > 0 {
             let pb = ProgressBar::new(total_files as u64);
@@ -189,55 +176,21 @@ impl ScanCommand {
         let config = JobProcessorConfig::from_preset(self.preset.as_deref())?;
         let processor = JobProcessor::new(&queue, &config, &self.media_root);
 
-        // Process WebM files (require VTT subtitles)
-        for webm_path in &webm_files {
+        for (path, file_type) in &media_files {
             if let Some(ref pb) = job_pb {
                 pb.set_message(format!(
-                    "WebM: {:?}",
-                    webm_path.file_name().unwrap_or_default()
+                    "{file_type:?}: {:?}",
+                    path.file_name().unwrap_or_default()
                 ));
             }
 
             let result = processor
-                .process_media_file(webm_path, MediaFileType::WebM)
+                .process_media_file(path, file_type.clone())
                 .await?;
+            processor.log_result(path, file_type, &result);
 
-            match result {
-                JobProcessResult::Created => {
-                    processor.log_result(webm_path, &MediaFileType::WebM, &result);
-                    job_count += 1;
-                }
-                _ => {
-                    processor.log_result(webm_path, &MediaFileType::WebM, &result);
-                }
-            }
-
-            if let Some(ref pb) = job_pb {
-                pb.inc(1);
-            }
-        }
-
-        // Process MKV files (embedded subtitles)
-        for mkv_path in &mkv_files {
-            if let Some(ref pb) = job_pb {
-                pb.set_message(format!(
-                    "MKV: {:?}",
-                    mkv_path.file_name().unwrap_or_default()
-                ));
-            }
-
-            let result = processor
-                .process_media_file(mkv_path, MediaFileType::Mkv)
-                .await?;
-
-            match result {
-                JobProcessResult::Created => {
-                    processor.log_result(mkv_path, &MediaFileType::Mkv, &result);
-                    job_count += 1;
-                }
-                _ => {
-                    processor.log_result(mkv_path, &MediaFileType::Mkv, &result);
-                }
+            if result == JobProcessResult::Created {
+                job_count += 1;
             }
 
             if let Some(ref pb) = job_pb {
@@ -441,6 +394,29 @@ mod tests {
         // Should create jobs for: 2 webm files with VTT + 3 mkv files = 5 jobs
         // (video2.webm without VTT should be skipped)
         assert_eq!(job_count, 5);
+    }
+
+    #[tokio::test]
+    async fn scan_queues_avi_files_alongside_the_rest() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+
+        fs::write(media_root.join("film.avi"), "").unwrap();
+        fs::write(media_root.join("episode.mkv"), "").unwrap();
+        // Already an MP4, so there is nothing to do to it.
+        fs::write(media_root.join("done.mp4"), "").unwrap();
+
+        ScanCommand::new(media_root.to_path_buf(), media_root.to_path_buf(), None)
+            .execute()
+            .await
+            .unwrap();
+
+        let job_count = fs::read_dir(media_root.join("_queue"))
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().path().extension() == Some("job".as_ref()))
+            .count();
+
+        assert_eq!(job_count, 2);
     }
 
     #[tokio::test]
