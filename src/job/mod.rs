@@ -223,18 +223,19 @@ impl Operation {
 
         let has = |field: Field| reasons.iter().any(|reason| reason.field == field);
 
-        // Either fault produces a track this client can play, and that track
-        // has to be inside the cap whichever fault it was: a 5.1 AC3 track
-        // re-encoded to 5.1 AAC for a device that decodes AAC and takes two
-        // channels is a file that still does not play. One target, so this is
-        // a replacement; `hardest` turns it into an addition where another
-        // target was happy with what was already there.
-        let audio = if has(Field::AudioChannels) || has(Field::AudioCodec) {
-            AudioAction::Transcode {
+        // The channel count is a ceiling to mix down to, not a layout to
+        // produce, so it is asked for only where the file is above it. A
+        // verdict now reports the codec fault and the layout fault separately
+        // even when both hold, which is what lets these three cases stay
+        // apart: reaching for the cap on every fault upmixes stereo into 5.1,
+        // and reaching for it on none leaves a 5.1 track in a codec the client
+        // decodes at a layout it refuses. Both have shipped here.
+        let audio = match (has(Field::AudioChannels), has(Field::AudioCodec)) {
+            (true, _) => AudioAction::Transcode {
                 channels: Some(target.audio.max_channels.value),
-            }
-        } else {
-            AudioAction::Copy
+            },
+            (false, true) => AudioAction::Transcode { channels: None },
+            (false, false) => AudioAction::Copy,
         };
 
         // The track is why the client would burn the picture, but it is also
@@ -1045,13 +1046,29 @@ mod tests {
             ..Default::default()
         };
 
-        // A codec the client cannot decode: produce one it can, inside the
-        // layout it takes. Both halves, because a track that fixes only the
-        // codec is a track that still does not play.
+        // A codec the client cannot decode, in a layout it takes: produce one
+        // it can and leave the layout alone. Asking for the cap here would
+        // widen a stereo track towards a ceiling it was never near.
         let mut wrong_codec = conforming();
         wrong_codec.audio[0].codec = "ac3".to_string();
         assert_eq!(
             Operation::for_conformance(&evaluate(&wrong_codec, &chromecast), &chromecast),
+            Some(Operation::Remux {
+                audio: AudioAction::Transcode { channels: None },
+                subtitles: SubtitleAction::Keep,
+            })
+        );
+
+        // Both at once, which is the case the two above are each half of: a
+        // track that fixes only the codec still does not play.
+        let mut wrong_codec_and_layout = conforming();
+        wrong_codec_and_layout.audio[0].codec = "ac3".to_string();
+        wrong_codec_and_layout.audio[0].channels = Some(6);
+        assert_eq!(
+            Operation::for_conformance(
+                &evaluate(&wrong_codec_and_layout, &chromecast),
+                &chromecast
+            ),
             Some(Operation::Remux {
                 audio: AudioAction::Transcode { channels: Some(2) },
                 subtitles: SubtitleAction::Keep,
