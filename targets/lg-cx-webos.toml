@@ -58,8 +58,27 @@ observed = ["opus"]
 assumed = ["dts", "truehd"]
 
 [subtitles]
-# Measured: the app burns mov_text in rather than overlaying it, which forces
-# a full video transcode and a downscale with it. This is what plexify's own
-# transcoder currently writes into every .mp4 it produces.
-burns_in.observed = ["mov_text"]
+# Measured: the app burns these in rather than overlaying them, which forces a
+# full video transcode and a downscale with it. mov_text is what plexify's own
+# transcoder writes into every .mp4 it produces.
+#
+# webvtt was seen burned in a Critical Role session on this app. Read what that
+# session can and cannot support: the video was ALREADY being transcoded in it
+# (a VP9 source arriving as H.264), and a server that is transcoding anyway
+# burns a text track cheaply. So "a webvtt track was burned here" is measured;
+# "webvtt forces a burn" is not, and the two are not the same claim. The file
+# also carried a `.en.vtt` sidecar, so which of the two was burned is unknown.
+#
+# Left as observed because it is the stronger of the two readings and this list
+# decides whether a track leaves the container - being wrong towards taking the
+# track out costs a sidecar nobody needed, being wrong the other way costs the
+# transcode the Pi cannot sustain. Revisit when the discriminating playback is
+# run; if it shows the burn was incidental to the video transcode, this belongs
+# in `assumed` or nowhere.
+burns_in.observed = ["mov_text", "webvtt"]
 burns_in.assumed = ["hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle"]
+
+# Deliberately absent: `ass` and `ssa`. 284 files carry them, and if a plain
+# text format burns then styled text is at least as likely to - but nothing has
+# watched it happen on this app, and adding it on the strength of the webvtt
+# session would be inferring one belief from another rather than measuring it.
