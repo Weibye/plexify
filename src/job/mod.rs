@@ -240,8 +240,7 @@ impl Operation {
         // picture does not make the audio somebody else's problem.
         if matches!(conformance, Conformance::Reencode { .. }) {
             return Some(Self::Reencode {
-                channels: has(Field::AudioChannels)
-                    .then_some(target.audio.max_channels.value),
+                channels: has(Field::AudioChannels).then_some(target.audio.max_channels.value),
             });
         }
 

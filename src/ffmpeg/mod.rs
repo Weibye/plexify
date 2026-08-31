@@ -219,17 +219,6 @@ impl FFmpegCommandBuilder {
         self.with_video_copy().with_audio_copy()
     }
 
-    /// Mix the audio down to this many channels.
-    ///
-    /// A layout the client cannot render is a reason to touch the audio all on
-    /// its own: a 5.1 AAC track is in a codec the Chromecast decodes and a
-    /// layout its receiver does not.
-    pub fn with_audio_channels(mut self, channels: u32) -> Self {
-        self.output_options
-            .extend_from_slice(&["-ac".to_string(), channels.to_string()]);
-        self
-    }
-
     /// Keep every audio track the source has and encode one more beside them.
     ///
     /// `originals` is how many audio streams the source carries, which is the
@@ -621,6 +610,22 @@ fn dropped_stream_warning(stream: &SubtitleStream, input_path: &Path) -> String 
     }
 }
 
+/// What a run has read off the source file, before either encode path is
+/// chosen.
+///
+/// Read once and handed to whichever path runs, because a source over the
+/// chunking threshold has to be treated exactly like one under it. Two of
+/// these came from probes that are not worth running twice.
+struct SourceFacts<'a> {
+    path: &'a Path,
+    /// Which of the source's subtitle streams the output carries, or `None`
+    /// where it carries none.
+    subtitles: Option<&'a SubtitleSource>,
+    /// How many channels each audio stream carries, in order. Empty when the
+    /// operation writes no audio and never needed to ask.
+    channels: &'a [u32],
+}
+
 /// Where a job's subtitles come from.
 enum SubtitleSource {
     /// A WebM's `.vtt` sidecar, which is declared as its own input.
@@ -677,23 +682,44 @@ fn with_operation(
                     }
                 }
                 AudioAction::Transcode { channels } => {
-                    let builder = builder.with_audio_encoding(&job.quality_settings);
-                    // Per stream, because a commentary track in mono beside a
-                    // 5.1 feature is not a reason to upmix the commentary.
-                    source_channels.iter().enumerate().fold(
-                        builder,
-                        |builder, (stream, &carried)| match capped(channels, carried) {
-                            Some(cap) => builder.with_audio_channel_cap(stream, cap),
-                            None => builder,
-                        },
-                    )
+                    with_encoded_audio(builder, job, channels, source_channels)
                 }
             }
         }
-        Operation::Reencode => builder
-            .with_video_encoding(&job.quality_settings)
-            .with_audio_encoding(&job.quality_settings),
+        Operation::Reencode { channels } => with_encoded_audio(
+            builder.with_video_encoding(&job.quality_settings),
+            job,
+            channels,
+            source_channels,
+        ),
     }
+}
+
+/// Encode every audio stream, capping the ones that carry more channels than
+/// the client will take.
+///
+/// Shared by the two paths that write a new audio track, because a client that
+/// refuses 5.1 refuses it whether the picture beside it was copied or encoded.
+/// Re-encoding the video does not make the audio somebody else's problem.
+fn with_encoded_audio(
+    builder: FFmpegCommandBuilder,
+    job: &Job,
+    cap: Option<u32>,
+    source_channels: &[u32],
+) -> FFmpegCommandBuilder {
+    let builder = builder.with_audio_encoding(&job.quality_settings);
+
+    // Per stream, because a commentary track in mono beside a 5.1 feature is
+    // not a reason to upmix the commentary.
+    source_channels
+        .iter()
+        .enumerate()
+        .fold(builder, |builder, (stream, &carried)| {
+            match capped(cap, carried) {
+                Some(cap) => builder.with_audio_channel_cap(stream, cap),
+                None => builder,
+            }
+        })
 }
 
 /// The cap to apply to a stream carrying `carried` channels, or `None` where it
@@ -865,6 +891,31 @@ impl FFmpegProcessor {
             )),
         };
 
+        // Read before either path is chosen, because both of them write audio
+        // and both have to keep it inside what the client will take. Two things
+        // come off one probe: where an added track lands, and whether a cap
+        // binds at all - `-ac` sets a channel count rather than limiting one,
+        // so a cap above the source would invent channels nothing recorded.
+        let source_channels = if job.operation.touches_audio() {
+            match self.probe_audio_channels(&input_path).await {
+                Some(channels) => channels,
+                None => {
+                    return Err(anyhow!(
+                        "FFprobe could not read the audio layout of {input_path:?}, and a track \
+                         cannot be made to fit a client without knowing what the source carries"
+                    ))
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        let source = SourceFacts {
+            path: &input_path,
+            subtitles: subtitles.as_ref(),
+            channels: &source_channels,
+        };
+
         // A long source is encoded a piece at a time, so that a worker which is
         // interrupted part-way leaves something the next one can carry on from
         // rather than hours of work that has to be done again. That needs
@@ -876,18 +927,11 @@ impl FFmpegProcessor {
         // re-encodes the video, which would throw away the copy that is the
         // whole point of the operation.
         let chunked = match (work_folder, job.operation) {
-            (Some(work_folder), Operation::Reencode) => {
+            (Some(work_folder), Operation::Reencode { .. }) => {
                 match self.probe_duration(&input_path).await {
                     Some(duration) if duration >= self.chunking.min_source_seconds => {
-                        self.process_in_chunks(
-                            job,
-                            &input_path,
-                            subtitles.as_ref(),
-                            &output_path,
-                            work_folder,
-                            duration,
-                        )
-                        .await?;
+                        self.process_in_chunks(job, &source, &output_path, work_folder, duration)
+                            .await?;
                         true
                     }
                     _ => false,
@@ -897,8 +941,7 @@ impl FFmpegProcessor {
         };
 
         if !chunked {
-            self.process_in_one_pass(job, &input_path, subtitles.as_ref(), &output_path)
-                .await?;
+            self.process_in_one_pass(job, &source, &output_path).await?;
         }
 
         // Only once the media file itself is written. A sidecar beside an
@@ -999,33 +1042,19 @@ impl FFmpegProcessor {
     async fn process_in_one_pass(
         &self,
         job: &Job,
-        input_path: &Path,
-        subtitles: Option<&SubtitleSource>,
+        source: &SourceFacts<'_>,
         output_path: &Path,
     ) -> Result<()> {
-        // Two things need the source's audio layout, and one probe answers
-        // both: where an added track lands, and whether a channel cap binds at
-        // all. Failing here is the only safe answer - guessing the count low
-        // overwrites a copy with the encode, and guessing the layout high
-        // invents channels nothing recorded.
-        let source_channels = if job.operation.touches_audio() {
-            match self.probe_audio_channels(input_path).await {
-                Some(channels) => channels,
-                None => {
-                    return Err(anyhow!(
-                        "FFprobe could not read the audio layout of {input_path:?}, and a track \
-                         cannot be made to fit a client without knowing what the source carries"
-                    ))
-                }
-            }
-        } else {
-            Vec::new()
-        };
+        let SourceFacts {
+            path: input_path,
+            subtitles,
+            channels: source_channels,
+        } = *source;
 
         let ffmpeg_builder = with_operation(
             FFmpegCommandBuilder::new().with_generated_pts(),
             job,
-            &source_channels,
+            source_channels,
         )
         .with_overwrite()
         .with_output(output_path);
@@ -1088,17 +1117,22 @@ impl FFmpegProcessor {
     async fn process_in_chunks(
         &self,
         job: &Job,
-        input_path: &Path,
-        subtitles: Option<&SubtitleSource>,
+        source: &SourceFacts<'_>,
         output_path: &Path,
         work_folder: &Path,
         duration: f64,
     ) -> Result<()> {
+        let SourceFacts {
+            path: input_path,
+            subtitles,
+            channels: source_channels,
+        } = *source;
+
         // `encode_chunks` re-encodes the video, so reaching here with a remux
         // would silently throw away the copy the operation exists for. The
         // caller checks; this says so where the code that depends on it lives.
         debug_assert!(
-            job.operation == Operation::Reencode,
+            matches!(job.operation, Operation::Reencode { .. }),
             "only a re-encode is chunked"
         );
 
@@ -1107,7 +1141,7 @@ impl FFmpegProcessor {
 
         let planned = plan_chunks(duration, self.chunking.chunk_seconds);
         let chunks = self
-            .encode_chunks(job, input_path, &chunk_dir, &planned)
+            .encode_chunks(job, input_path, &chunk_dir, &planned, source_channels)
             .await?;
 
         let list_path = chunk_dir.join("chunks.txt");
@@ -1172,6 +1206,7 @@ impl FFmpegProcessor {
         input_path: &Path,
         chunk_dir: &Path,
         chunks: &[Chunk],
+        source_channels: &[u32],
     ) -> Result<Vec<Chunk>> {
         let total = chunks.len();
 
@@ -1192,16 +1227,24 @@ impl FFmpegProcessor {
 
             let partial_path = chunk.partial_path(chunk_dir);
 
-            let mut builder = FFmpegCommandBuilder::new()
-                .with_generated_pts()
-                .with_overwrite()
-                .with_seek(chunk.start)
-                .with_input(input_path)
-                .with_stream_mapping(&["0:v", "0:a"])
-                .with_video_encoding(&job.quality_settings)
-                .with_audio_encoding(&job.quality_settings)
-                .with_transport_stream_output()
-                .with_output(&partial_path);
+            // The chunk carries the cap, not just the join: the join copies
+            // what the chunks hold, so a 5.1 chunk is a 5.1 output however the
+            // pieces are stitched back together. This is the path a film takes,
+            // which is where a surround track is most likely to be.
+            let mut builder = with_encoded_audio(
+                FFmpegCommandBuilder::new()
+                    .with_generated_pts()
+                    .with_overwrite()
+                    .with_seek(chunk.start)
+                    .with_input(input_path)
+                    .with_stream_mapping(&["0:v", "0:a"])
+                    .with_video_encoding(&job.quality_settings),
+                job,
+                job.operation.audio_cap(),
+                source_channels,
+            )
+            .with_transport_stream_output()
+            .with_output(&partial_path);
 
             if let Some(chunk_duration) = chunk.duration {
                 builder = builder.with_duration(chunk_duration);
@@ -1951,6 +1994,58 @@ mod tests {
         assert!(joined.contains("-ac:a:0 2"), "{joined}");
     }
 
+    /// A re-encode writes a new audio track too, so it has to keep it inside
+    /// what the client takes. 961 files are a re-encode for the Chromecast and
+    /// every 5.1 one of them came out 5.1 AAC: a codec it decodes, at a layout
+    /// it refuses.
+    #[test]
+    fn a_re_encode_caps_its_audio_the_way_a_remux_does() {
+        let job = job_for(
+            "/media/film.mkv",
+            MediaFileType::Mkv,
+            Operation::Reencode { channels: Some(2) },
+        );
+
+        let joined = with_operation(FFmpegCommandBuilder::new(), &job, &[6])
+            .with_output("/work/film.mp4")
+            .build()
+            .join(" ");
+
+        assert!(joined.contains("-c:v libx264"), "{joined}");
+        assert!(joined.contains("-c:a aac"), "{joined}");
+        assert!(joined.contains("-ac:a:0 2"), "{joined}");
+    }
+
+    /// The same rule, on the path a film actually takes. The join copies what
+    /// the chunks hold, so a chunk encoded at 5.1 is a 5.1 output however the
+    /// pieces are stitched back together - and it is the long sources, which
+    /// are the ones that get chunked, that carry surround.
+    #[test]
+    fn a_chunk_carries_the_cap_because_the_join_only_copies_what_it_finds() {
+        let job = job_for(
+            "/media/film.mkv",
+            MediaFileType::Mkv,
+            Operation::Reencode { channels: Some(2) },
+        );
+
+        let joined = with_encoded_audio(
+            FFmpegCommandBuilder::new()
+                .with_input("/media/film.mkv")
+                .with_stream_mapping(&["0:v", "0:a"])
+                .with_video_encoding(&job.quality_settings),
+            &job,
+            job.operation.audio_cap(),
+            &[6],
+        )
+        .with_transport_stream_output()
+        .with_output("/work/00000.ts.part")
+        .build()
+        .join(" ");
+
+        assert!(joined.contains("-ac:a:0 2"), "{joined}");
+        assert!(joined.contains("-f mpegts"), "{joined}");
+    }
+
     /// `-ac` sets a channel count rather than limiting one, so a cap applied
     /// to a source already inside it invents channels nothing recorded.
     ///
@@ -2053,12 +2148,16 @@ mod tests {
 
         assert!(!dropped.keeps_subtitles());
         assert!(avi_remux().keeps_subtitles());
-        assert!(Operation::Reencode.keeps_subtitles());
+        assert!(Operation::Reencode { channels: None }.keeps_subtitles());
     }
 
     #[test]
     fn a_re_encode_is_left_exactly_as_it_was() {
-        let job = job_for("/media/show.mkv", MediaFileType::Mkv, Operation::Reencode);
+        let job = job_for(
+            "/media/show.mkv",
+            MediaFileType::Mkv,
+            Operation::Reencode { channels: None },
+        );
         let joined = with_operation(FFmpegCommandBuilder::new(), &job, &[])
             .with_output("/work/show.mp4")
             .build()
@@ -2444,7 +2543,7 @@ mod tests {
         Job::new(
             input.to_path_buf(),
             MediaFileType::Mkv,
-            Operation::Reencode,
+            Operation::Reencode { channels: None },
             QualitySettings {
                 ffmpeg_preset: "ultrafast".to_string(),
                 ffmpeg_crf: "30".to_string(),
@@ -2681,7 +2780,7 @@ mod tests {
 
         // A worker gets part-way through and is killed.
         processor
-            .encode_chunks(&job, &input, &chunk_dir, &chunks[..1])
+            .encode_chunks(&job, &input, &chunk_dir, &chunks[..1], &[])
             .await
             .unwrap();
 
@@ -2690,7 +2789,7 @@ mod tests {
 
         // The next worker picks the job back up and finishes it.
         let encoded = processor
-            .encode_chunks(&job, &input, &chunk_dir, &chunks)
+            .encode_chunks(&job, &input, &chunk_dir, &chunks, &[])
             .await
             .unwrap();
 
@@ -2799,7 +2898,7 @@ mod tests {
         let chunks = plan_chunks(probed_duration(&input), TEST_CHUNKING.chunk_seconds);
         processor.prepare_chunk_dir(&job, &chunk_dir).await.unwrap();
         processor
-            .encode_chunks(&job, &input, &chunk_dir, &chunks[..1])
+            .encode_chunks(&job, &input, &chunk_dir, &chunks[..1], &[])
             .await
             .unwrap();
         assert!(chunks[0].path(&chunk_dir).exists());
@@ -2841,7 +2940,7 @@ mod tests {
         let chunks = plan_chunks(probed_duration(&input), TEST_CHUNKING.chunk_seconds);
         processor.prepare_chunk_dir(&job, &chunk_dir).await.unwrap();
         processor
-            .encode_chunks(&job, &input, &chunk_dir, &chunks[..1])
+            .encode_chunks(&job, &input, &chunk_dir, &chunks[..1], &[])
             .await
             .unwrap();
 
@@ -2873,7 +2972,7 @@ mod tests {
         let chunks = plan_chunks(probed_duration(&input), TEST_CHUNKING.chunk_seconds);
         processor.prepare_chunk_dir(&job, &chunk_dir).await.unwrap();
         processor
-            .encode_chunks(&job, &input, &chunk_dir, &chunks[..1])
+            .encode_chunks(&job, &input, &chunk_dir, &chunks[..1], &[])
             .await
             .unwrap();
         assert!(chunk_dir.exists());
@@ -3764,7 +3863,7 @@ mod tests {
         let job = Job::new(
             input.to_path_buf(),
             MediaFileType::Mkv,
-            Operation::Reencode,
+            Operation::Reencode { channels: None },
             QualitySettings::default(),
             PostProcessingSettings::default(),
             input.parent().expect("input has a parent"),
@@ -3935,7 +4034,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("test.mkv"),
             MediaFileType::Mkv,
-            Operation::Reencode,
+            Operation::Reencode { channels: None },
             quality,
             post_processing,
             media_root,
@@ -3975,7 +4074,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("test.mkv"),
             MediaFileType::Mkv,
-            Operation::Reencode,
+            Operation::Reencode { channels: None },
             quality,
             post_processing,
             &media_folder,
@@ -4015,7 +4114,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("film.mkv"),
             MediaFileType::Mkv,
-            Operation::Reencode,
+            Operation::Reencode { channels: None },
             QualitySettings::default(),
             PostProcessingSettings {
                 disable_source_files: false,
@@ -4147,7 +4246,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("film.mkv"),
             MediaFileType::Mkv,
-            Operation::Reencode,
+            Operation::Reencode { channels: None },
             QualitySettings::default(),
             PostProcessingSettings {
                 disable_source_files: false,
