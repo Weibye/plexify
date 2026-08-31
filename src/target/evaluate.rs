@@ -1020,6 +1020,68 @@ mod tests {
         assert_eq!(evaluate(&probe, &chromecast()).cost(), Some(Cost::Remux));
     }
 
+    /// The worst case in this library, and the one the owner complained about:
+    /// 120 .webm files, 500 GB, VP9 or AV1 with Opus audio and an embedded
+    /// WebVTT track. They fail the LG on audio and subtitles at once, and the
+    /// re-encode that follows is the one the Pi cannot sustain.
+    fn critical_role(video_codec: &str) -> MediaProbe {
+        MediaProbe {
+            container: Some("matroska,webm".to_string()),
+            video: Some(VideoStream {
+                codec: video_codec.to_string(),
+                profile: Some("profile 0".to_string()),
+                pixel_format: Some("yuv420p".to_string()),
+                bit_depth: Some(8),
+                width: Some(1920),
+                height: Some(1080),
+                ..Default::default()
+            }),
+            audio: vec![AudioStream {
+                codec: "opus".to_string(),
+                channels: Some(2),
+                ..Default::default()
+            }],
+            subtitles: vec![SubtitleStream {
+                codec: "webvtt".to_string(),
+                language: Some("eng".to_string()),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_webm_population_fails_the_lg_on_audio_and_subtitles_at_once() {
+        let verdict = evaluate(&critical_role("vp9"), &lg());
+
+        assert_eq!(fields_of(&verdict), [Field::AudioCodec, Field::Subtitles]);
+        // Both are remux work, so recording the WebVTT burn moves no file
+        // between cost buckets: every one of these already failed on Opus.
+        assert_eq!(verdict.cost(), Some(Cost::Remux));
+    }
+
+    /// The 22 AV1 files among them are the expensive half: no envelope claims
+    /// this device decodes AV1, and that is a re-encode whatever the audio and
+    /// subtitles do.
+    #[test]
+    fn the_av1_half_of_that_population_needs_a_reencode() {
+        let verdict = evaluate(&critical_role("av1"), &lg());
+
+        assert_eq!(verdict.cost(), Some(Cost::Reencode));
+    }
+
+    /// VP9 on this app is believed, not seen - and the Critical Role session
+    /// transcoded a VP9 source to H.264, which is evidence against it. The
+    /// marker is what tells a reader that verdict is a prediction.
+    #[test]
+    fn vp9_on_the_lg_still_reads_as_unverified() {
+        let verdict = evaluate(&critical_role("vp9"), &lg());
+
+        assert!(verdict
+            .unverified()
+            .iter()
+            .any(|finding| finding.field == Field::VideoCodec && finding.value == "vp9"));
+    }
+
     /// The client plays whichever track suits it, so one good track is enough.
     #[test]
     fn a_file_conforms_when_any_one_of_its_tracks_plays() {

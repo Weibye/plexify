@@ -270,6 +270,16 @@ mod tests {
             lg.subtitles.burns_in.provenance_of("mov_text"),
             Some(Provenance::Observed)
         );
+        // Seen burned in a Critical Role session on this app. The mechanism is
+        // unresolved - that session was transcoding the video anyway - but a
+        // text format burning at all is what #162 was built on the opposite of.
+        assert_eq!(
+            lg.subtitles.burns_in.provenance_of("webvtt"),
+            Some(Provenance::Observed)
+        );
+        // Not inferred from webvtt. 284 files carry styled text and nothing has
+        // watched one play here.
+        assert_eq!(lg.subtitles.burns_in.provenance_of("ass"), None);
     }
 
     /// VP9 and yuvj420p on the Chromecast, and AC3 on the LG, are unverified.
