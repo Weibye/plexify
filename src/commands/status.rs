@@ -555,7 +555,7 @@ mod tests {
         Job::new(
             PathBuf::from(input),
             MediaFileType::Mkv,
-            Operation::Reencode,
+            Operation::Reencode { channels: None },
             QualitySettings::default(),
             PostProcessingSettings::default(),
             media_root,

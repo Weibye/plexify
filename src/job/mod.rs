@@ -43,7 +43,7 @@ pub struct Job {
 ///
 /// The caller resolves it; issue #158 makes that the conformance check, which
 /// asks what the source and the target hold rather than what the extension is.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum Operation {
     /// Copy the video bitstream into MP4, doing to the other tracks only what
     /// the target needs.
@@ -52,8 +52,21 @@ pub enum Operation {
         subtitles: SubtitleAction,
     },
     /// Re-encode video and audio to `quality_settings`.
-    #[default]
-    Reencode,
+    ///
+    /// `channels` caps the layout of the track that comes out, for the same
+    /// reason a remux does: a client that decodes AAC and takes two channels
+    /// is not served by 5.1 AAC. Re-encoding the picture does not make the
+    /// audio somebody else's problem.
+    Reencode { channels: Option<u32> },
+}
+
+impl Default for Operation {
+    /// What a job file written before operations existed deserializes as: the
+    /// re-encode it was queued as, with no cap, because nothing had asked a
+    /// client anything when it was made.
+    fn default() -> Self {
+        Self::Reencode { channels: None }
+    }
 }
 
 /// What a remux does with the source's audio.
@@ -217,11 +230,19 @@ impl Operation {
     pub fn for_conformance(conformance: &Conformance, target: &PlaybackTarget) -> Option<Self> {
         let reasons = match conformance {
             Conformance::Conforms { .. } => return None,
-            Conformance::Reencode { .. } => return Some(Self::Reencode),
-            Conformance::Remux { reasons, .. } => reasons,
+            Conformance::Reencode { reasons, .. } | Conformance::Remux { reasons, .. } => reasons,
         };
 
         let has = |field: Field| reasons.iter().any(|reason| reason.field == field);
+
+        // A re-encode writes a new audio track whatever was wrong with the
+        // picture, so it takes the same ceiling a remux does: re-encoding a
+        // picture does not make the audio somebody else's problem.
+        if matches!(conformance, Conformance::Reencode { .. }) {
+            return Some(Self::Reencode {
+                channels: has(Field::AudioChannels).then_some(target.audio.max_channels.value),
+            });
+        }
 
         // The channel count is a ceiling to mix down to, not a layout to
         // produce, so it is asked for only where the file is above it. A
@@ -266,7 +287,19 @@ impl Operation {
     /// bought once is the lesser cost.
     pub fn hardest(self, other: Self) -> Self {
         match (self, other) {
-            (Self::Reencode, _) | (_, Self::Reencode) => Self::Reencode,
+            (Self::Reencode { channels: one }, Self::Reencode { channels: other }) => {
+                Self::Reencode {
+                    channels: narrower(one, other),
+                }
+            }
+
+            // A re-encode absorbs a remux, but not the remux's cap: the client
+            // that only wanted its audio changed still only takes two channels,
+            // and the file it gets is now the re-encoded one.
+            (Self::Reencode { channels }, Self::Remux { audio, .. })
+            | (Self::Remux { audio, .. }, Self::Reencode { channels }) => Self::Reencode {
+                channels: narrower(channels, audio.channels()),
+            },
             (
                 Self::Remux { audio, subtitles },
                 Self::Remux {
@@ -285,11 +318,20 @@ impl Operation {
     pub fn touches_audio(&self) -> bool {
         matches!(
             self,
-            Operation::Remux {
-                audio: AudioAction::Add { .. } | AudioAction::Transcode { .. },
-                ..
-            }
+            Operation::Reencode { .. }
+                | Operation::Remux {
+                    audio: AudioAction::Add { .. } | AudioAction::Transcode { .. },
+                    ..
+                }
         )
+    }
+
+    /// The most channels any track this operation writes may carry.
+    pub fn audio_cap(&self) -> Option<u32> {
+        match self {
+            Operation::Reencode { channels } => *channels,
+            Operation::Remux { audio, .. } => audio.channels(),
+        }
     }
 
     /// Whether the output gains an audio track the source did not have.
@@ -764,7 +806,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("video.webm"),
             MediaFileType::WebM,
-            Operation::Reencode,
+            Operation::Reencode { channels: None },
             quality,
             post_processing,
             &media_root,
@@ -1148,7 +1190,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("video.mkv"),
             MediaFileType::Mkv,
-            Operation::Reencode,
+            Operation::Reencode { channels: None },
             quality,
             post_processing,
             &media_root,
@@ -1184,7 +1226,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("/absolute/path/video.webm"),
             MediaFileType::WebM,
-            Operation::Reencode,
+            Operation::Reencode { channels: None },
             quality,
             post_processing,
             &media_root,
@@ -1224,7 +1266,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("relative/video.mkv"),
             MediaFileType::Mkv,
-            Operation::Reencode,
+            Operation::Reencode { channels: None },
             quality,
             post_processing,
             &media_root,
@@ -1348,7 +1390,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("test.webm"),
             MediaFileType::WebM,
-            Operation::Reencode,
+            Operation::Reencode { channels: None },
             quality.clone(),
             post_processing.clone(),
             &media_root,
@@ -1380,7 +1422,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("videos/movie.mkv"),
             MediaFileType::Mkv,
-            Operation::Reencode,
+            Operation::Reencode { channels: None },
             quality,
             post_processing,
             &media_root,
@@ -1421,7 +1463,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("Series/Breaking Bad/Season 01/Breaking Bad - s01e03 - Gray Matter.mkv"),
             MediaFileType::Mkv,
-            Operation::Reencode,
+            Operation::Reencode { channels: None },
             quality.clone(),
             post_processing.clone(),
             &media_root,
@@ -1445,7 +1487,7 @@ mod tests {
                 "Series/Breaking Bad (2008) {tvdb-296861}/Season 01/Breaking Bad S01E01 Pilot.mkv",
             ),
             MediaFileType::Mkv,
-            Operation::Reencode,
+            Operation::Reencode { channels: None },
             quality.clone(),
             post_processing.clone(),
             &media_root,
@@ -1469,7 +1511,7 @@ mod tests {
                 "Anime/Attack on Titan/Season 01/Attack on Titan S01E05 First Battle.mkv",
             ),
             MediaFileType::Mkv,
-            Operation::Reencode,
+            Operation::Reencode { channels: None },
             quality.clone(),
             post_processing.clone(),
             &media_root,
@@ -1491,7 +1533,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("Series/Critical Role (2015) {tvdb-296861}/Season 01 - Vox Machina/Critical Role S01E12 Arrival at Kraghammer.mkv"),
             MediaFileType::Mkv,
-            Operation::Reencode,
+            Operation::Reencode { channels: None },
             quality.clone(),
             post_processing.clone(),
             &media_root,
@@ -1513,7 +1555,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("Movies/The Dark Knight (2008)/The Dark Knight (2008).mkv"),
             MediaFileType::Mkv,
-            Operation::Reencode,
+            Operation::Reencode { channels: None },
             quality.clone(),
             post_processing.clone(),
             &media_root,
@@ -1537,7 +1579,7 @@ mod tests {
         Job::new(
             relative_path,
             MediaFileType::Mkv,
-            Operation::Reencode,
+            Operation::Reencode { channels: None },
             QualitySettings::default(),
             PostProcessingSettings::default(),
             media_root,
@@ -1773,7 +1815,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("Random/Path/file.mkv"),
             MediaFileType::Mkv,
-            Operation::Reencode,
+            Operation::Reencode { channels: None },
             quality.clone(),
             post_processing.clone(),
             &media_root,
@@ -1790,7 +1832,7 @@ mod tests {
             Job::new(
                 PathBuf::from(name),
                 MediaFileType::Mkv,
-                Operation::Reencode,
+                Operation::Reencode { channels: None },
                 QualitySettings::default(),
                 PostProcessingSettings::default(),
                 media_root,
@@ -1818,7 +1860,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("show.mkv"),
             MediaFileType::Mkv,
-            Operation::Reencode,
+            Operation::Reencode { channels: None },
             QualitySettings::default(),
             PostProcessingSettings::default(),
             Path::new("/media"),

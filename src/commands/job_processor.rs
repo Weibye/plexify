@@ -68,7 +68,9 @@ pub(crate) fn operation_for(file_type: &MediaFileType) -> Operation {
             audio: AudioAction::Copy,
             subtitles: SubtitleAction::Keep,
         },
-        MediaFileType::WebM | MediaFileType::Mkv => Operation::Reencode,
+        // No client was asked, so no cap is known. `scan --target` is
+        // where one comes from.
+        MediaFileType::WebM | MediaFileType::Mkv => Operation::Reencode { channels: None },
     }
 }
 
@@ -230,8 +232,14 @@ mod tests {
                 subtitles: SubtitleAction::Keep,
             }
         );
-        assert_eq!(operation_for(&MediaFileType::Mkv), Operation::Reencode);
-        assert_eq!(operation_for(&MediaFileType::WebM), Operation::Reencode);
+        assert_eq!(
+            operation_for(&MediaFileType::Mkv),
+            Operation::Reencode { channels: None }
+        );
+        assert_eq!(
+            operation_for(&MediaFileType::WebM),
+            Operation::Reencode { channels: None }
+        );
     }
 
     #[test]
@@ -270,7 +278,11 @@ mod tests {
 
         let relative_path = std::path::Path::new("video.mkv");
         let result = processor
-            .process_media_file(relative_path, MediaFileType::Mkv, Operation::Reencode)
+            .process_media_file(
+                relative_path,
+                MediaFileType::Mkv,
+                Operation::Reencode { channels: None },
+            )
             .await
             .unwrap();
 
@@ -296,7 +308,11 @@ mod tests {
 
         let relative_path = std::path::Path::new("video.webm");
         let result = processor
-            .process_media_file(relative_path, MediaFileType::WebM, Operation::Reencode)
+            .process_media_file(
+                relative_path,
+                MediaFileType::WebM,
+                Operation::Reencode { channels: None },
+            )
             .await
             .unwrap();
 
@@ -320,7 +336,11 @@ mod tests {
 
         let relative_path = std::path::Path::new("video.webm");
         let result = processor
-            .process_media_file(relative_path, MediaFileType::WebM, Operation::Reencode)
+            .process_media_file(
+                relative_path,
+                MediaFileType::WebM,
+                Operation::Reencode { channels: None },
+            )
             .await
             .unwrap();
 

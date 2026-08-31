@@ -329,7 +329,7 @@ mod tests {
         let job = Job::new(
             PathBuf::from("show.mkv"),
             MediaFileType::Mkv,
-            Operation::Reencode,
+            Operation::Reencode { channels: None },
             QualitySettings::default(),
             PostProcessingSettings::default(),
             media_root,

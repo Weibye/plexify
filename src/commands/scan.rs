@@ -725,7 +725,10 @@ mod tests {
         .await;
         assert_eq!(
             both,
-            vec![("film.avi".to_string(), Operation::Reencode)],
+            vec![(
+                "film.avi".to_string(),
+                Operation::Reencode { channels: None }
+            )],
             "the Chromecast does not, and a file that plays on only one device \
              is one the Pi is asked to transcode when it is played on the other"
         );
