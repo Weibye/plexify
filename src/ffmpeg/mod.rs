@@ -3324,6 +3324,164 @@ mod tests {
             .collect()
     }
 
+    /// Build a short WebM with the `.vtt` beside it that a WebM job exists to
+    /// attach.
+    ///
+    /// VP8 and Opus rather than H.264 and AAC, because that is what a WebM in
+    /// this library holds and the chunk path seeks it: what `-ss` lands on in a
+    /// VP8 stream is not what the MKV fixtures measure. `-deadline realtime
+    /// -cpu-used 8` is libvpx's fastest setting, which is all a few seconds of
+    /// `testsrc` needs.
+    fn build_webm_source(path: &Path, seconds: u32) {
+        let subtitles = path.with_extension("vtt");
+        std::fs::write(
+            &subtitles,
+            "WEBVTT\n\n\
+             00:00:00.500 --> 00:00:01.500\nfirst line\n\n\
+             00:00:01.600 --> 00:00:03.000\nspanning a chunk boundary\n",
+        )
+        .unwrap();
+
+        let built = std::process::Command::new("ffmpeg")
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("testsrc=duration={seconds}:size=160x120:rate=10"),
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("sine=frequency=440:duration={seconds}"),
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
+                "-c:v",
+                "libvpx",
+                "-deadline",
+                "realtime",
+                "-cpu-used",
+                "8",
+                "-b:v",
+                "200k",
+                "-c:a",
+                "libopus",
+                "-y",
+            ])
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(
+            built.success(),
+            "could not build the WebM test source; libvpx and libopus are needed"
+        );
+    }
+
+    /// A job for a WebM and its sidecar, chunked at test sizes.
+    fn webm_job(input: &Path) -> Job {
+        Job::new(
+            input.to_path_buf(),
+            MediaFileType::WebM,
+            Operation::Reencode { channels: None },
+            QualitySettings {
+                ffmpeg_preset: "ultrafast".to_string(),
+                ffmpeg_crf: "30".to_string(),
+                ffmpeg_audio_bitrate: "64k".to_string(),
+            },
+            PostProcessingSettings::default(),
+            input.parent().unwrap(),
+        )
+    }
+
+    /// Issue #111: the join treats a WebM differently from an MKV, and only the
+    /// MKV arm had ever been run.
+    ///
+    /// A WebM's subtitle is a separate file and is the reason the job exists, so
+    /// the join maps it without a `?`. If it produced no stream there the job
+    /// would fail outright rather than degrade - three attempts and then
+    /// `_failed`, for every WebM in the library over the chunking threshold.
+    /// Nothing had ever established that it does produce one: every round-trip
+    /// test built an MKV, and so did the manual verification.
+    ///
+    /// The source is VP8 and Opus rather than H.264 and AAC for the same reason.
+    /// The chunks are cut by seeking into it, and what a seek lands on is a
+    /// property of the codec, not of the container the MKV fixtures happen to
+    /// use.
+    #[tokio::test]
+    async fn a_long_webm_is_chunked_and_still_carries_its_sidecar() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("video.webm");
+        build_webm_source(&input, 6);
+
+        let work_folder = temp.path().join("work");
+        std::fs::create_dir_all(&work_folder).unwrap();
+
+        let job = webm_job(&input);
+
+        // The condition `process_job` actually branches on, asserted rather than
+        // assumed: a fixture that came in under the threshold would take the
+        // one-pass path and pass this test without touching the arm it is here
+        // for.
+        let source_duration = probed_duration(&input);
+        assert!(
+            source_duration >= TEST_CHUNKING.min_source_seconds,
+            "the fixture runs {source_duration}s, which is under the chunking threshold"
+        );
+        assert!(
+            plan_chunks(source_duration, TEST_CHUNKING.chunk_seconds).len() > 1,
+            "and it has to cross a boundary to be worth chunking"
+        );
+
+        FFmpegProcessor::new(false)
+            .with_chunking(TEST_CHUNKING)
+            .process_job(&job, None, Some(&work_folder))
+            .await
+            .unwrap();
+
+        let output = job.work_folder_output_path(&work_folder);
+        assert!(
+            output.exists(),
+            "the joined file should be in the work folder"
+        );
+
+        // The subtitle is the whole reason the job exists, so a file without one
+        // is a failure even though FFmpeg exited cleanly.
+        assert_eq!(stream_codecs(&output), vec!["h264", "aac", "mov_text"]);
+
+        let output_duration = probed_duration(&output);
+        assert!(
+            (output_duration - source_duration).abs() < 0.5,
+            "joined output runs {output_duration}s against a {source_duration}s source"
+        );
+
+        // Both events, at the times the sidecar gives them, rather than one
+        // chunk's worth. The list is not compared whole because `mov_text`
+        // writes an empty sample across each gap - at the head and between the
+        // two events here - and how a muxer fills a gap is not what this is
+        // measuring.
+        let events = subtitle_events(&subtitle_timings(&output));
+        for event in [(500, 1000), (1600, 1400)] {
+            assert!(
+                events.contains(&event),
+                "the sidecar's event at {event:?} is not in the joined output: {events:?}"
+            );
+        }
+        assert_eq!(
+            subtitle_texts(&output),
+            vec!["first line", "spanning a chunk boundary"],
+            "and it is the sidecar's text, not a gap the muxer filled"
+        );
+
+        // Nothing is left behind to be mistaken for progress on a later run.
+        assert!(!work_folder.join(format!("{}.chunks", job.id)).exists());
+    }
+
     #[tokio::test]
     async fn a_long_source_converts_its_subtitles_the_same_way_a_short_one_does() {
         if !ffmpeg_present() {
