@@ -269,6 +269,17 @@ impl WorkCommand {
                             // Sleep a bit to avoid rapid retries of problematic jobs
                             tokio::time::sleep(Duration::from_secs(10)).await;
                         }
+                        FailureDisposition::Lost => {
+                            // This worker went quiet long enough for a sweep to
+                            // decide it was gone. Whatever it left in the work
+                            // folder stays: the job belongs to another worker
+                            // now, and that is the encode that will use or
+                            // discard it.
+                            warn!(
+                                "{job_name} was taken back by a sweep while this worker was \
+                                 running it; the failure was not recorded against it."
+                            );
+                        }
                     }
                 }
             }

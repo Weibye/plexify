@@ -90,14 +90,52 @@ renaming reintroduces the race that this design exists to avoid. The same goes f
 a job in place to record an attempt: `write_job_atomically` stages and renames, so a worker
 killed mid-rewrite leaves a job file that still parses.
 
+- **Take** is how a job leaves `_in_progress`, and `take_for_move` is the only way to do it.
+  Recording an attempt means writing the job file, and a content write is not a rename: it
+  *creates* the file when it is absent and replaces it when it is not, so writing to a claim
+  path can resurrect a job somebody else now holds. A mover therefore moves the job to
+  `{uuid}.job.taken` and writes only there. `reclaim_one` and `ClaimedJob::fail` both begin
+  this way, and **nothing may write contents to a path in `_in_progress` it has not taken**.
+
+`take_for_move` **marks the job before it takes it** — `mark_attended` sets the mtime through
+a handle opened for write, which cannot create the file — and the order is the point, not an
+implementation detail. Renaming preserves timestamps, and every job a mover takes is one that
+already looked quiet, since that is what made it eligible. Take first and the `.taken` file
+carries that quiet timestamp for the length of the move, so a second sweep enumerating
+`_in_progress` judges the *move* abandoned, renames the file back, and leaves the first mover
+writing a file it no longer owns — whose write then creates a second copy. Marking first means
+a `.taken` file reads as attended from the moment it exists. A mover that dies between the two
+leaves the job looking fresh for `STALE_AFTER` and the next sweep collects it: a delay, and
+nothing worse.
+
+Taking a job says only that it moved, never that its worker is gone: a claim taken a moment
+ago renames just as willingly as one abandoned an hour ago, and the sweep reads the whole
+directory before it moves anything. So `reclaim_one` decides staleness itself, from two
+timestamps read at two different moments, and both moments matter:
+
+- the **job file's own mtime, read before the take**, because marking overwrites it. It is
+  the fallback for a job whose worker died before its first heartbeat landed, which has
+  nothing else to be judged by. Read it after the mark and that job is never reclaimed —
+  `a_job_claimed_without_a_heartbeat_is_still_reclaimed` covers this.
+- the **heartbeat, read after the take**, because a worker writes one before it is handed its
+  claim. A fresh heartbeat here is a worker that claimed the job while the sweep was still
+  reading, and its job goes straight back.
+
+The check at the top of the sweep loop only avoids disturbing obvious claims; this pair
+decides. `quiet_for`, `later_of` and `modified_at` exist so this can be said in the same terms
+`is_stale` uses; `is_stale` itself stays the shared definition `clean` and `status` rely on.
+
+A job held under `.taken` counts as queued in `job_exists`, so no scan can occupy the name it
+has to return to, and a sweep recovers a `.taken` file — judged by its own mtime alone — whose
+mover died.
+
 **What none of this rules out is two workers on one input**, so nothing downstream may assume
 it cannot happen. A scan whose `job_exists` found nothing and whose enqueue lands after a
-worker has claimed the job queues that file again while it is being encoded. The startup sweep
-can arrive at the same place from the other side: it records the attempt before it moves the
-job, and that rewrite ends in a rename that *creates* the file when it is absent, so a second
-sweeper working from a stale read can put a job back into `_in_progress` under the worker that
-has just claimed it (#132). Both windows are why the staging name a finished encode is copied
-under carries the id of the worker that copied it.
+worker has claimed the job queues that file again while it is being encoded. `ClaimedJob::fail`
+and `complete` can reach the same place from the other side: a worker swept off its job and
+then re-given it to somebody else takes that worker's claim, because nothing in a job file or
+beside it says which worker holds it. These windows are why the staging name a finished encode
+is copied under carries the id of the worker that copied it.
 
 **The work root is not the media root.** `JobQueue::new` takes both. `--work-dir`/`-w`
 controls the queue location and **defaults to the current working directory**, not to the
@@ -195,8 +233,10 @@ back.** Both are properties of the same three moves, and both are easy to undo b
   file itself risks a half-written job.
 - **`JobQueue::reclaim_stranded_jobs` runs at worker startup** and renames back to `_queue/`
   any job quiet for `STALE_AFTER`. Nothing else ever looks in `_in_progress/`, so this is the
-  only thing that recovers a job from a worker that was killed. It must stay a rename, or two
-  workers can both take one job.
+  only thing that recovers a job from a worker that was killed. Every move it makes must stay
+  a rename, and the timestamps that decide staleness must be read at the moments described
+  above — the job's before the take, the heartbeat's after it — or two workers can both take
+  one job.
 - **Every way a job can stop counts as an attempt.** `ClaimedJob::fail` counts one, and so
   does the sweep - a job that takes its worker down (an OOM on a large encode, a panic) never
   reaches `fail`, and without counting there it would cycle forever at the cost of a worker
