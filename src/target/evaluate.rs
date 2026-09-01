@@ -825,10 +825,17 @@ mod tests {
         assert_eq!(verdict.reasons()[0].source, Provenance::Observed);
     }
 
-    /// The measured LG fact. The client burns the track in and re-encodes to do
-    /// it, but what *we* have to do is drop the track, and that is a remux.
+    /// What plexify's own transcoder writes into every .mp4 it produces, and
+    /// it costs nothing on either shipped client.
+    ///
+    /// This asserted a remux on the LG until 2026-09-01. The reading behind
+    /// that was taken with the app's own quality set to 3 Mbps 720p, which
+    /// re-encodes every picture and burns the text into it as a side effect.
+    /// Measured with the setting at Original: `part decision = directplay`,
+    /// no video decision, and the selected `mov_text` track converted into an
+    /// `srt` sidecar with the picture untouched.
     #[test]
-    fn mov_text_subtitles_cost_a_remux_on_the_lg() {
+    fn a_mov_text_track_costs_nothing_on_either_target() {
         let mut probe = plexify_output();
         probe.subtitles = vec![SubtitleStream {
             codec: "mov_text".to_string(),
@@ -836,11 +843,7 @@ mod tests {
         }];
 
         let verdict = evaluate(&probe, &lg());
-
-        assert_eq!(verdict.cost(), Some(Cost::Remux));
-        assert_eq!(verdict.reasons()[0].field, Field::Subtitles);
-        assert_eq!(verdict.reasons()[0].source, Provenance::Observed);
-        // The same file is fine on the Chromecast, which renders it as text.
+        assert_eq!(verdict.cost(), None, "{:?}", claims(&verdict));
         assert_eq!(evaluate(&probe, &chromecast()).cost(), None);
     }
 
@@ -1022,8 +1025,8 @@ mod tests {
 
     /// The worst case in this library, and the one the owner complained about:
     /// 120 .webm files, 500 GB, VP9 or AV1 with Opus audio and an embedded
-    /// WebVTT track. They fail the LG on audio and subtitles at once, and the
-    /// re-encode that follows is the one the Pi cannot sustain.
+    /// WebVTT track. They fail the LG on audio, and the re-encode the AV1 half
+    /// needs is the one the Pi cannot sustain.
     fn critical_role(video_codec: &str) -> MediaProbe {
         MediaProbe {
             container: Some("matroska,webm".to_string()),
@@ -1049,13 +1052,16 @@ mod tests {
         }
     }
 
+    /// Opus, and only Opus. The WebVTT track was a second reason here until
+    /// 2026-09-01, and it was the cap's doing: the session it was read from
+    /// was re-encoding the picture because the app asked for 3 Mbps 720p, and
+    /// a re-encode burns a text track in for free. Its removal changes no
+    /// file's cost, because every one of these already fails on the audio.
     #[test]
-    fn the_webm_population_fails_the_lg_on_audio_and_subtitles_at_once() {
+    fn the_webm_population_fails_the_lg_on_its_audio() {
         let verdict = evaluate(&critical_role("vp9"), &lg());
 
-        assert_eq!(fields_of(&verdict), [Field::AudioCodec, Field::Subtitles]);
-        // Both are remux work, so recording the WebVTT burn moves no file
-        // between cost buckets: every one of these already failed on Opus.
+        assert_eq!(fields_of(&verdict), [Field::AudioCodec]);
         assert_eq!(verdict.cost(), Some(Cost::Remux));
     }
 
@@ -1069,9 +1075,12 @@ mod tests {
         assert_eq!(verdict.cost(), Some(Cost::Reencode));
     }
 
-    /// VP9 on this app is believed, not seen - and the Critical Role session
-    /// transcoded a VP9 source to H.264, which is evidence against it. The
-    /// marker is what tells a reader that verdict is a prediction.
+    /// VP9 on this app is believed, not seen. The Critical Role session was
+    /// once read as evidence against it - a VP9 source arriving as H.264 - and
+    /// that reading is withdrawn: the app was capped to 3 Mbps 720p, which
+    /// re-encodes any source whatever its codec. So VP9 is untested in both
+    /// directions, and the marker is what tells a reader the verdict is a
+    /// prediction.
     #[test]
     fn vp9_on_the_lg_still_reads_as_unverified() {
         let verdict = evaluate(&critical_role("vp9"), &lg());

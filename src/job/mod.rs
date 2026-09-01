@@ -161,10 +161,10 @@ pub enum SubtitleAction {
     Keep,
     /// Leave them out, and write nothing in their place.
     ///
-    /// Measured: the LG's Plex app burns `mov_text` into the picture rather
-    /// than overlaying it, and re-encodes the video to do it. Carrying a track
-    /// the client cannot overlay would cost the transcode a remux exists to
-    /// avoid, so on that target the track has to go.
+    /// A client that cannot overlay a subtitle format has the server burn it
+    /// into the picture, and re-encode the video to do it. Carrying such a
+    /// track would cost the transcode a remux exists to avoid, so on that
+    /// target the track has to leave the container.
     ///
     /// **Nothing produces this.** `Extract` empties the container just as
     /// thoroughly and keeps the tracks, so there is no case left where losing
@@ -813,10 +813,12 @@ mod tests {
     fn combining_two_targets_keeps_the_subtitles_rather_than_losing_them() {
         use SubtitleAction::{Drop, Extract, Keep};
 
-        // The case the two shipped envelopes produce: the LG burns `mov_text`
-        // in, the Chromecast overlays it. Extracting satisfies the first and
-        // costs the second nothing, because the server hands a sidecar to
-        // either of them without touching the picture.
+        // One client burns a format in and the other renders it - the position
+        // the two shipped envelopes are in over `hdmv_pgs_subtitle`, which the
+        // Chromecast is assumed to burn and the LG has been watched copying.
+        // Extracting satisfies the first, and for a text format it costs the
+        // second nothing: the server hands a sidecar to either of them without
+        // touching the picture.
         assert_eq!(Keep.hardest(Extract), Extract);
         assert_eq!(Extract.hardest(Keep), Extract);
 
@@ -1118,19 +1120,25 @@ mod tests {
         );
 
         // A track the client burns in: take it out of the container and write
-        // it beside the file, and do not touch the audio. It is the subtitles
-        // the viewer turned on, so losing it is not a fix.
+        // what can be written beside the file, and do not touch the audio. It
+        // is the subtitles the viewer turned on, so losing it is not a fix.
         let mut burned_in = conforming();
         burned_in.subtitles = vec![SubtitleStream {
-            codec: "mov_text".to_string(),
+            codec: "hdmv_pgs_subtitle".to_string(),
             language: None,
         }];
         assert_eq!(
-            Operation::for_conformance(&evaluate(&burned_in, &lg), &lg),
+            Operation::for_conformance(&evaluate(&burned_in, &chromecast), &chromecast),
             Some(Operation::Remux {
                 audio: AudioAction::Copy,
                 subtitles: SubtitleAction::Extract,
             })
+        );
+        // The same file on the LG, which was measured copying a PGS track for
+        // the app to render: nothing to do at all.
+        assert_eq!(
+            Operation::for_conformance(&evaluate(&burned_in, &lg), &lg),
+            None
         );
 
         // The measured AVI case: only the container is wrong, so only the
