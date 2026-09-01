@@ -399,6 +399,28 @@ saw the same file with or without the flag - which is how it sat in the join unn
 not a reason to put it back on a fourth output: a concat-fed MP4 mux is exactly where it does
 the most damage.
 
+**The edit list is where a delay is *expressed*, and it must not be the only place.** Left to
+itself the MP4 muxer answers the reorder delay with the video track's `elst` `media_time` and
+writes nothing about it into the media timeline, so the output is in sync only on a player
+that reads `elst` - and edit-list handling is inconsistent across hardware decoders and
+set-top clients. One that skips it plays the picture `has_b_frames` frame intervals behind the
+sound: measured 80ms at 25fps and 200ms at 10fps, on all three of the MP4s this project
+writes. `with_negative_composition_offsets` therefore puts `-movflags +negative_cts_offsets`
+on every one of them, which says the same thing as a signed composition offset in the sample
+table instead.
+
+It is not a second answer competing with the first, which is what separates it from
+`-avoid_negative_ts`: measured, the edit-list-honouring reading of an output is unchanged by
+it - same first video packet, same first audio packet - while the edit-list-ignoring reading
+comes back to zero. It corrects the players that were wrong and leaves the ones that were
+right alone, and `the_picture_is_in_the_timeline_and_not_only_in_the_edit_list` asserts both
+halves of that on both encode paths. Its fixture has to be built by a job asking for
+`veryfast`: `chunking_job` asks for `ultrafast`, x264 turns B-frames off there, and a source
+with no reorder delay passes this test whatever the muxer was told.
+
+`-movflags` accumulates across repeats rather than replacing, so a remux still gets its
+`+faststart` as well.
+
 That claim is about what plexify's own command line asks the muxer for, and it stops there.
 FFmpeg 6.1, which is what `apt` installs on the Ubuntu CI runs, offsets an entire input
 forward when the container declares a `start_time` before zero - as an MKV with AAC audio
