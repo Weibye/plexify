@@ -275,10 +275,17 @@ impl JobQueue {
     /// this worker could not process, and re-scanning the library must not walk
     /// it back into the queue to fail another three times. Moving the job file
     /// out of `_failed` by hand is what asks for it to be tried again.
+    ///
+    /// A job held under a `.taken` name counts as being worked on. It is one
+    /// mid-move, and that is what lets the sweep put an interrupted move back:
+    /// while the `.taken` file is there no scan re-enqueues its input, so
+    /// nothing else can occupy the name it has to return to.
     pub async fn job_exists(&self, job: &Job) -> Result<bool> {
         let job_filename = job.job_filename();
+        let in_progress = self.in_progress_dir.join(&job_filename);
         Ok(self.queue_dir.join(&job_filename).exists()
-            || self.in_progress_dir.join(&job_filename).exists()
+            || taken_path_for(&in_progress).exists()
+            || in_progress.exists()
             || self.failed_dir.join(&job_filename).exists())
     }
 
@@ -308,6 +315,7 @@ impl JobQueue {
         // that still belongs to a job from one whose job is long gone.
         let mut stranded_jobs = Vec::new();
         let mut heartbeats = Vec::new();
+        let mut taken = Vec::new();
 
         let mut entries = async_fs::read_dir(&self.in_progress_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
@@ -315,7 +323,32 @@ impl JobQueue {
             match path.extension().and_then(|ext| ext.to_str()) {
                 Some("job") => stranded_jobs.push(path),
                 Some("heartbeat") => heartbeats.push(path),
+                Some(TAKEN_EXTENSION) => taken.push(path),
                 _ => continue,
+            }
+        }
+
+        // A sweeper or a worker killed part-way through a move leaves the job
+        // under its `.taken` name, where nothing claims it. Put it back, and the
+        // pass below treats it as the stranded job it is. Only a `.taken` file
+        // that has gone quiet is touched, because a live one is a move still in
+        // progress; it is judged by its own timestamp, which the holder refreshes
+        // as it writes.
+        for path in taken {
+            if !is_stale(&path, &path, stale_after).await {
+                continue;
+            }
+
+            let job_path = path.with_extension("");
+            match async_fs::rename(&path, &job_path).await {
+                Ok(_) => {
+                    warn!("Recovered a job left mid-move: {}", file_name_of(&job_path));
+                    outcome.recovered.push(file_name_of(&job_path));
+                    stranded_jobs.push(job_path);
+                }
+                // Another sweeper recovered it first, which is the same
+                // rename and so the same single winner.
+                Err(e) => debug!("Could not recover {path:?}: {e}"),
             }
         }
 
@@ -330,7 +363,7 @@ impl JobQueue {
                 continue;
             }
 
-            let reclaimed = match self.reclaim_one(path, &job_name).await {
+            let reclaimed = match self.reclaim_one(path, &job_name, stale_after).await {
                 Ok(reclaimed) => reclaimed,
                 Err(e) => {
                     warn!("Could not reclaim {job_name}: {e}");
@@ -343,7 +376,9 @@ impl JobQueue {
             }
 
             match reclaimed {
-                Reclaimed::Lost => debug!("Another worker got to {job_name} first"),
+                Reclaimed::Lost | Reclaimed::Counted(FailureDisposition::Lost) => {
+                    debug!("Another worker got to {job_name} first")
+                }
                 Reclaimed::Counted(FailureDisposition::Requeued { .. }) => {
                     info!("♻️ Reclaimed abandoned job: {job_name}");
                     outcome.reclaimed.push(job_name);
@@ -383,14 +418,54 @@ impl JobQueue {
     /// forever, at the cost of a worker each time round rather than ten seconds.
     /// It is the same loop `_failed` exists to break, so it ends the same way.
     ///
-    /// [`Reclaimed::Lost`] means another worker got there first, which is not an
-    /// error: the move is a rename, and the loser of a race simply does nothing.
+    /// [`Reclaimed::Lost`] means the job is not this sweep's to move, which is
+    /// not an error: the loser of a race simply does nothing.
+    ///
+    /// The caller's staleness check is only a way of not disturbing claims that
+    /// are obviously live. It cannot be the decision, because the sweep reads
+    /// the whole directory before it moves anything, so by the time a job is
+    /// reached the file under its name may be a claim taken since. The decision
+    /// is the pair below: take the file, *then* ask whether it is stale, and put
+    /// it back if it is not.
     async fn reclaim_one(
         &self,
         in_progress_path: &std::path::Path,
         job_name: &str,
+        stale_after: Duration,
     ) -> Result<Reclaimed> {
-        let content = async_fs::read_to_string(in_progress_path).await?;
+        // Take the job before reading a byte of it. The count has to be written
+        // into the file before it moves on, and a write is not a rename: it
+        // creates the file when it is absent and replaces it when it is not, so
+        // a sweeper writing to the claim path can resurrect a job somebody else
+        // has since claimed and hand one input to two encoders. Renaming to a
+        // name of our own picks one winner the way every other move here does,
+        // and everything after this point runs on a file nothing else will move.
+        let taken_path = taken_path_for(in_progress_path);
+        if async_fs::rename(in_progress_path, &taken_path)
+            .await
+            .is_err()
+        {
+            return Ok(Reclaimed::Lost);
+        }
+        let taken_path = taken_path.as_path();
+
+        // Now that the file cannot move, ask again whether its worker is gone.
+        // Taking the file says nothing about that: a claim taken a moment ago
+        // renames just as willingly as one abandoned an hour ago. The heartbeat
+        // is what tells them apart, and it is still being refreshed beside the
+        // name this job came from, so a live worker's job goes straight back.
+        //
+        // Rename preserves the timestamp, so the file answers the same here as
+        // it did under its own name.
+        let heartbeat_path = heartbeat_path_for(in_progress_path);
+        if !is_stale(taken_path, &heartbeat_path, stale_after).await {
+            // Putting it back cannot land on anything: this sweep holds the only
+            // copy, and while it does, no scan re-enqueues the input.
+            async_fs::rename(taken_path, in_progress_path).await?;
+            return Ok(Reclaimed::Lost);
+        }
+
+        let content = async_fs::read_to_string(taken_path).await?;
 
         // A read that failed is worth another sweep - a network work root drops
         // out from under a worker now and then - but contents that are not a job
@@ -399,7 +474,7 @@ impl JobQueue {
             Ok(job) => job,
             Err(e) => {
                 return self
-                    .quarantine_unreadable(in_progress_path, job_name, &e.to_string())
+                    .quarantine_unreadable(taken_path, job_name, &e.to_string())
                     .await
             }
         };
@@ -415,7 +490,7 @@ impl JobQueue {
 
         // The count goes in under a staging name and is renamed over the job, so
         // a sweeper interrupted here leaves a job file that still parses.
-        write_job_atomically(in_progress_path, &job).await?;
+        write_job_atomically(taken_path, &job).await?;
 
         let destination = if park {
             self.failed_dir.join(job_name)
@@ -426,12 +501,17 @@ impl JobQueue {
             async_fs::create_dir_all(parent).await?;
         }
 
-        match async_fs::rename(in_progress_path, &destination).await {
-            Ok(_) if park => Ok(Reclaimed::Counted(FailureDisposition::Parked { attempts })),
-            Ok(_) => Ok(Reclaimed::Counted(FailureDisposition::Requeued {
+        // Nothing can be at the destination: the job is in no directory a scan
+        // consults except under the `.taken` name this holds, so it cannot have
+        // been enqueued again while the count was being written.
+        async_fs::rename(taken_path, &destination).await?;
+
+        if park {
+            Ok(Reclaimed::Counted(FailureDisposition::Parked { attempts }))
+        } else {
+            Ok(Reclaimed::Counted(FailureDisposition::Requeued {
                 attempts,
-            })),
-            Err(_) => Ok(Reclaimed::Lost),
+            }))
         }
     }
 
@@ -442,23 +522,21 @@ impl JobQueue {
     /// `job_exists` - which goes by filename - kept the media file out of the
     /// queue for just as long. `_failed` is where a person already looks for a
     /// job that needs a decision, and the parse error goes beside it.
+    ///
+    /// `taken_path` is the job under the name its sweeper took it under, so the
+    /// move out is the second half of a move already begun rather than a race
+    /// with anything.
     async fn quarantine_unreadable(
         &self,
-        in_progress_path: &std::path::Path,
+        taken_path: &std::path::Path,
         job_name: &str,
         reason: &str,
     ) -> Result<Reclaimed> {
         async_fs::create_dir_all(&self.failed_dir).await?;
         let destination = self.failed_dir.join(job_name);
 
-        // A rename, like every other move between these directories, so two
-        // sweepers cannot both take the same file.
-        if async_fs::rename(in_progress_path, &destination)
-            .await
-            .is_err()
-        {
-            return Ok(Reclaimed::Lost);
-        }
+        // A rename, like every other move between these directories.
+        async_fs::rename(taken_path, &destination).await?;
 
         let mut note = destination.into_os_string();
         note.push(".error");
@@ -546,12 +624,19 @@ pub struct SweepOutcome {
     pub parked: Vec<String>,
     /// Job files that could not be read as jobs and were moved to `_failed`.
     pub unreadable: Vec<String>,
+    /// Jobs found under a `.taken` name - a move interrupted part-way - and put
+    /// back where the sweep could finish it. These are reclaimed in the same
+    /// pass, so a name here usually appears in `reclaimed` or `parked` too.
+    pub recovered: Vec<String>,
 }
 
 impl SweepOutcome {
     /// Whether the sweep moved anything at all.
     pub fn is_empty(&self) -> bool {
-        self.reclaimed.is_empty() && self.parked.is_empty() && self.unreadable.is_empty()
+        self.reclaimed.is_empty()
+            && self.parked.is_empty()
+            && self.unreadable.is_empty()
+            && self.recovered.is_empty()
     }
 }
 
@@ -583,6 +668,35 @@ fn spawn_heartbeat(path: PathBuf) -> tokio::task::JoinHandle<()> {
             }
         }
     })
+}
+
+/// The extension a job carries while it is being moved out of `_in_progress`.
+const TAKEN_EXTENSION: &str = "taken";
+
+/// The name a mover holds a job under while it moves it out of `_in_progress`.
+///
+/// Moving a job means writing the attempt count into it and then renaming it on,
+/// and a write is not a rename: it creates the file when it is absent and
+/// replaces it when it is not. Doing that to the claim path lets a mover working
+/// from an out-of-date read put a job that somebody else has since claimed back
+/// into the queue, which is how one input reaches two encoders. Renaming to this
+/// name first makes the move begin with the same primitive every other move
+/// here uses, so exactly one mover proceeds and it owns the file it writes.
+///
+/// The name is derived, not random, so a `.taken` file left by a mover that died
+/// is replaced by the next one to take that job rather than accumulating.
+pub(crate) fn taken_path_for(in_progress_path: &std::path::Path) -> PathBuf {
+    let mut name = in_progress_path.as_os_str().to_os_string();
+    name.push(".");
+    name.push(TAKEN_EXTENSION);
+    PathBuf::from(name)
+}
+
+/// The name of a file, for a log line or a report.
+fn file_name_of(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// The heartbeat file that sits beside a claimed job.
@@ -677,6 +791,10 @@ pub enum FailureDisposition {
     Requeued { attempts: u32 },
     /// The job has failed too often and was parked in `_failed`.
     Parked { attempts: u32 },
+    /// The claim was gone before the failure could be recorded: a sweep judged
+    /// this worker stranded and gave the job to somebody else. Nothing was
+    /// written, because the job is no longer this worker's to describe.
+    Lost,
 }
 
 impl<'a> ClaimedJob<'a> {
@@ -712,6 +830,28 @@ impl<'a> ClaimedJob<'a> {
     /// handed back, so a job that can never succeed stops holding the worker up.
     pub async fn fail(mut self, error: &str) -> Result<FailureDisposition> {
         self.stop_heartbeat();
+
+        // Take the job before recording anything against it. A worker that went
+        // quiet long enough - a stalled encode, a suspended machine - may have
+        // had its job swept back to the queue, and a write to the claim path
+        // creates the file when it is absent: the failure would put a claim back
+        // in `_in_progress` from nothing, for the next sweep to hand to a second
+        // worker. The rename cannot create anything, so it says whether the job
+        // is still here to be recorded against.
+        //
+        // It does not say whether the job here is still *this* worker's. If the
+        // sweep's copy has since been claimed by somebody else, this rename
+        // takes that worker's claim, because nothing in a job file or beside it
+        // identifies which worker holds it. Telling those apart needs a claim to
+        // carry an identity, which is a larger change than this one.
+        let taken_path = taken_path_for(&self.in_progress_path);
+        if async_fs::rename(&self.in_progress_path, &taken_path)
+            .await
+            .is_err()
+        {
+            return Ok(FailureDisposition::Lost);
+        }
+
         self.job.attempts += 1;
         // Keep the tail of the message: that is where FFmpeg says what actually
         // went wrong, and a job file is no place for a megabyte of log.
@@ -720,11 +860,11 @@ impl<'a> ClaimedJob<'a> {
         let attempts = self.job.attempts;
         let park = attempts >= MAX_ATTEMPTS;
 
-        // Rewrite in place first, then move: the move stays a rename, which is
-        // what keeps two workers from both getting the job. The rewrite is
-        // itself a rename onto the job file, so a worker killed here leaves a
-        // job the next sweep can still read.
-        write_job_atomically(&self.in_progress_path, &self.job).await?;
+        // Safe now: the job is held under a name nothing else looks for, so the
+        // rewrite cannot land on anybody's claim. It is itself a rename onto
+        // that file, so a worker killed here leaves a job the next sweep can
+        // still read and put back.
+        write_job_atomically(&taken_path, &self.job).await?;
 
         let destination = if park {
             self.queue.failed_dir.join(&self.job_name)
@@ -735,7 +875,7 @@ impl<'a> ClaimedJob<'a> {
         if let Some(parent) = destination.parent() {
             async_fs::create_dir_all(parent).await?;
         }
-        async_fs::rename(&self.in_progress_path, &destination).await?;
+        async_fs::rename(&taken_path, &destination).await?;
         let _ = async_fs::remove_file(heartbeat_path_for(&self.in_progress_path)).await;
 
         if park {
@@ -932,6 +1072,171 @@ mod tests {
 
         // And a worker can pick it up again, which is the whole point.
         assert!(queue.claim_job(None).await.unwrap().is_some());
+    }
+
+    /// The sweep reads the whole of `_in_progress` before it moves anything, so
+    /// a job it judged stranded can be a fresh claim by the time it is reached:
+    /// another sweeper put the job back, and a worker took it. Deciding on the
+    /// judgement made earlier hands that worker's input to a second encoder.
+    ///
+    /// Driven straight at `reclaim_one`, because that gap is the whole subject.
+    /// Going through the sweep would test the cheap check at the top of the loop
+    /// instead, which is not what decides this.
+    #[test]
+    async fn a_job_claimed_since_the_sweep_looked_is_left_with_its_worker() {
+        let temp_dir = TempDir::new().unwrap();
+        let (queue, job_name) = queue_with_one_claimed_job(&temp_dir).await;
+
+        // What the sweep sees when it gets there: a job file that has been
+        // sitting since it was queued, and a heartbeat written moments ago by
+        // the worker that has just claimed it.
+        let in_progress_path = queue.in_progress_dir.join(&job_name);
+        age(&[&in_progress_path], Duration::from_secs(600));
+
+        let reclaimed = queue
+            .reclaim_one(&in_progress_path, &job_name, Duration::from_secs(300))
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(reclaimed, Reclaimed::Lost),
+            "a job whose worker is beating its heart is not this sweep's to take"
+        );
+        assert!(
+            in_progress_path.exists(),
+            "the claim is put back under the name its worker holds"
+        );
+        assert!(
+            heartbeat_of(&in_progress_path).exists(),
+            "and its heartbeat is left alone, or the next sweep takes it"
+        );
+        assert!(
+            !queue.queue_dir.join(&job_name).exists(),
+            "nothing is put back in the queue for a second worker to claim"
+        );
+        assert!(
+            !taken_path_for(&in_progress_path).exists(),
+            "and nothing is left behind under the name the sweep took it under"
+        );
+    }
+
+    /// A worker can go quiet long enough to be swept - a stalled encode, a
+    /// suspended machine - and only find out when its FFmpeg finally returns.
+    /// Writing the failure to the claim path would then put the job back in
+    /// `_in_progress` from nothing, where the next sweep hands it to a second
+    /// worker while this one is still holding a work folder for it.
+    #[test]
+    async fn a_worker_whose_job_was_swept_away_does_not_put_it_back() {
+        let temp_dir = TempDir::new().unwrap();
+        let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        queue.init().await.unwrap();
+
+        let job = Job::new(
+            PathBuf::from("show.mkv"),
+            MediaFileType::Mkv,
+            Operation::Reencode { channels: None },
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            temp_dir.path(),
+        );
+        queue.enqueue_job(&job).await.unwrap();
+        let claimed = queue.claim_job(None).await.unwrap().unwrap();
+        let job_name = claimed.job_name().to_string();
+        let in_progress_path = queue.in_progress_dir.join(&job_name);
+
+        // A sweep judged this worker gone and put its job back in the queue.
+        let queued_path = queue.queue_dir.join(&job_name);
+        std::fs::rename(&in_progress_path, &queued_path).unwrap();
+
+        let disposition = claimed.fail("ffmpeg gave up").await.unwrap();
+
+        assert_eq!(
+            disposition,
+            FailureDisposition::Lost,
+            "the job was not this worker's to record against"
+        );
+        assert!(
+            !in_progress_path.exists(),
+            "and no claim is conjured back onto the path the sweep emptied"
+        );
+        assert!(
+            !taken_path_for(&in_progress_path).exists(),
+            "nor left behind mid-move"
+        );
+        assert!(queued_path.exists(), "the sweep's copy is the only one");
+    }
+
+    /// A mover killed between taking a job and putting it down leaves it under
+    /// the `.taken` name, where nothing claims it. The next sweep is what brings
+    /// it back, exactly as it does for a job stranded any other way.
+    #[test]
+    async fn a_job_left_behind_by_an_interrupted_move_is_recovered() {
+        let temp_dir = TempDir::new().unwrap();
+        let (queue, job_name) = queue_with_one_claimed_job(&temp_dir).await;
+
+        let in_progress_path = queue.in_progress_dir.join(&job_name);
+        let taken_path = taken_path_for(&in_progress_path);
+        std::fs::rename(&in_progress_path, &taken_path).unwrap();
+        std::fs::remove_file(heartbeat_of(&in_progress_path)).unwrap();
+        age(&[&taken_path], Duration::from_secs(600));
+
+        let swept = queue
+            .reclaim_stranded_jobs(Duration::from_secs(300))
+            .await
+            .unwrap();
+
+        assert_eq!(swept.recovered, vec![job_name.clone()]);
+        assert_eq!(swept.reclaimed, vec![job_name.clone()]);
+        assert!(!taken_path.exists());
+        assert!(queue.queue_dir.join(&job_name).exists());
+    }
+
+    /// While a job is held under a `.taken` name it is in none of the three
+    /// directories a scan consults, and a scan that re-queued it would put a
+    /// second copy of the same input in front of a worker. It is also what makes
+    /// the recovery above safe: nothing can occupy the name it returns to.
+    #[test]
+    async fn a_job_held_mid_move_still_counts_as_queued() {
+        let temp_dir = TempDir::new().unwrap();
+        let job = Job::new(
+            PathBuf::from("show.mkv"),
+            MediaFileType::Mkv,
+            Operation::Reencode { channels: None },
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            temp_dir.path(),
+        );
+        let (queue, job_name) = queue_with_one_claimed_job_for(&temp_dir, &job).await;
+
+        let in_progress_path = queue.in_progress_dir.join(&job_name);
+        std::fs::rename(&in_progress_path, taken_path_for(&in_progress_path)).unwrap();
+
+        assert!(
+            queue.job_exists(&job).await.unwrap(),
+            "a job mid-move is still a job this library has"
+        );
+    }
+
+    /// A move that is still running is not an interrupted one. Recovering it
+    /// would put a second copy of the job back where its mover is about to
+    /// deliver the first.
+    #[test]
+    async fn a_move_still_in_progress_is_not_recovered() {
+        let temp_dir = TempDir::new().unwrap();
+        let (queue, job_name) = queue_with_one_claimed_job(&temp_dir).await;
+
+        let in_progress_path = queue.in_progress_dir.join(&job_name);
+        let taken_path = taken_path_for(&in_progress_path);
+        std::fs::rename(&in_progress_path, &taken_path).unwrap();
+
+        let swept = queue
+            .reclaim_stranded_jobs(Duration::from_secs(300))
+            .await
+            .unwrap();
+
+        assert!(swept.is_empty());
+        assert!(taken_path.exists(), "left for its mover to finish");
+        assert!(!queue.queue_dir.join(&job_name).exists());
     }
 
     #[test]
