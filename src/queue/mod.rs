@@ -330,12 +330,16 @@ impl JobQueue {
 
         // A sweeper or a worker killed part-way through a move leaves the job
         // under its `.taken` name, where nothing claims it. Put it back, and the
-        // pass below treats it as the stranded job it is. Only a `.taken` file
-        // that has gone quiet is touched, because a live one is a move still in
-        // progress; it is judged by its own timestamp, which the holder refreshes
-        // as it writes.
+        // pass below treats it as the stranded job it is.
+        //
+        // Only a `.taken` file that has gone quiet is recovered, because a live
+        // one is a move still running and taking it back would leave its mover
+        // writing a file it no longer owns. `take_for_move` marks a job before it
+        // takes it, so a `.taken` file reads as attended from the moment it
+        // exists: quiet here means the mover really is gone, not merely that the
+        // job was quiet before somebody picked it up.
         for path in taken {
-            if !is_stale(&path, &path, stale_after).await {
+            if !quiet_for(modified_at(&path).await, stale_after) {
                 continue;
             }
 
@@ -440,25 +444,33 @@ impl JobQueue {
         // has since claimed and hand one input to two encoders. Renaming to a
         // name of our own picks one winner the way every other move here does,
         // and everything after this point runs on a file nothing else will move.
-        let taken_path = taken_path_for(in_progress_path);
-        if async_fs::rename(in_progress_path, &taken_path)
-            .await
-            .is_err()
-        {
+        let heartbeat_path = heartbeat_path_for(in_progress_path);
+
+        // Read when the job itself was last written before taking it, because
+        // taking marks the file and marking overwrites that timestamp. It is
+        // only ever a fallback: a job claimed by a worker whose first heartbeat
+        // never landed has nothing else to be judged by, and without this it
+        // would sit in `_in_progress` for good.
+        let job_last_written = modified_at(in_progress_path).await;
+
+        let Some(taken_path) = take_for_move(in_progress_path).await else {
             return Ok(Reclaimed::Lost);
-        }
+        };
         let taken_path = taken_path.as_path();
 
         // Now that the file cannot move, ask again whether its worker is gone.
         // Taking the file says nothing about that: a claim taken a moment ago
-        // renames just as willingly as one abandoned an hour ago. The heartbeat
-        // is what tells them apart, and it is still being refreshed beside the
-        // name this job came from, so a live worker's job goes straight back.
+        // renames just as willingly as one abandoned an hour ago, and the sweep
+        // read this directory before it moved anything, so the file under a name
+        // it judged quiet may be a claim taken since.
         //
-        // Rename preserves the timestamp, so the file answers the same here as
-        // it did under its own name.
-        let heartbeat_path = heartbeat_path_for(in_progress_path);
-        if !is_stale(taken_path, &heartbeat_path, stale_after).await {
+        // The heartbeat is what tells them apart, and it is read *after* the
+        // take. A worker writes one before it is handed its claim, so a fresh
+        // heartbeat here is a worker that took this job while the sweep was
+        // still reading - and nothing can claim it now, because the job is in no
+        // directory a claim looks in.
+        let seen = later_of(job_last_written, modified_at(&heartbeat_path).await);
+        if !quiet_for(seen, stale_after) {
             // Putting it back cannot land on anything: this sweep holds the only
             // copy, and while it does, no scan re-enqueues the input.
             async_fs::rename(taken_path, in_progress_path).await?;
@@ -723,20 +735,77 @@ pub(crate) async fn last_activity(
     job_path: &std::path::Path,
     heartbeat_path: &std::path::Path,
 ) -> Option<SystemTime> {
-    let mut latest: Option<SystemTime> = None;
+    later_of(
+        modified_at(job_path).await,
+        modified_at(heartbeat_path).await,
+    )
+}
 
-    for candidate in [job_path, heartbeat_path] {
-        if let Ok(metadata) = async_fs::metadata(candidate).await {
-            if let Ok(modified) = metadata.modified() {
-                latest = Some(match latest {
-                    Some(current) if current > modified => current,
-                    _ => modified,
-                });
-            }
-        }
+/// When a file was last written, or `None` if that cannot be read.
+pub(crate) async fn modified_at(path: &std::path::Path) -> Option<SystemTime> {
+    async_fs::metadata(path).await.ok()?.modified().ok()
+}
+
+/// The later of two timestamps, treating an unreadable one as no evidence.
+fn later_of(a: Option<SystemTime>, b: Option<SystemTime>) -> Option<SystemTime> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (found, None) | (None, found) => found,
+    }
+}
+
+/// Whether a sign of life is old enough to call its job abandoned.
+///
+/// No timestamp at all is treated as not quiet: refusing to reclaim is always
+/// the safe answer.
+fn quiet_for(seen: Option<SystemTime>, stale_after: Duration) -> bool {
+    match seen.and_then(|t| SystemTime::now().duration_since(t).ok()) {
+        Some(age) => age >= stale_after,
+        None => false,
+    }
+}
+
+/// Mark a job as being attended to, without reading or replacing it.
+///
+/// Opening for write cannot create the file, so this fails rather than
+/// resurrecting a job that has moved on. It records nothing except that somebody
+/// was here, which is the one thing a timestamp can say honestly.
+async fn mark_attended(path: &std::path::Path) -> Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::options().write(true).open(&path)?;
+        file.set_times(std::fs::FileTimes::new().set_modified(SystemTime::now()))
+    })
+    .await??;
+    Ok(())
+}
+
+/// Take a job out of `_in_progress` so that it can be rewritten and moved on.
+///
+/// Returns the name it is now held under, or `None` if it is not there to take.
+///
+/// The mark comes *before* the take, and the order is the whole point. Renaming
+/// preserves the timestamp, so a job taken without one first would sit under its
+/// `.taken` name still carrying the quiet timestamp that made it eligible - and
+/// a second sweep enumerating `_in_progress` just then would judge the move
+/// abandoned and recover the file out from under the mover that is holding it.
+/// The mover would then write the file back into existence, and the job would be
+/// in `_queue` and `_in_progress` at once, which is the whole thing this avoids.
+///
+/// Marking first closes that: from the moment a job is takeable it already reads
+/// as attended, so the `.taken` file is never quiet while a mover lives. A mover
+/// that dies between the two leaves the job looking fresh for `stale_after` and
+/// the sweep after that collects it, which costs a delay and nothing else.
+async fn take_for_move(in_progress_path: &std::path::Path) -> Option<PathBuf> {
+    if mark_attended(in_progress_path).await.is_err() {
+        return None;
     }
 
-    latest
+    let taken_path = taken_path_for(in_progress_path);
+    match async_fs::rename(in_progress_path, &taken_path).await {
+        Ok(_) => Some(taken_path),
+        Err(_) => None,
+    }
 }
 
 /// Whether a claimed job has gone quiet for longer than `stale_after`.
@@ -844,13 +913,9 @@ impl<'a> ClaimedJob<'a> {
         // takes that worker's claim, because nothing in a job file or beside it
         // identifies which worker holds it. Telling those apart needs a claim to
         // carry an identity, which is a larger change than this one.
-        let taken_path = taken_path_for(&self.in_progress_path);
-        if async_fs::rename(&self.in_progress_path, &taken_path)
-            .await
-            .is_err()
-        {
+        let Some(taken_path) = take_for_move(&self.in_progress_path).await else {
             return Ok(FailureDisposition::Lost);
-        }
+        };
 
         self.job.attempts += 1;
         // Keep the tail of the message: that is where FFmpeg says what actually
@@ -1218,25 +1283,66 @@ mod tests {
     }
 
     /// A move that is still running is not an interrupted one. Recovering it
-    /// would put a second copy of the job back where its mover is about to
-    /// deliver the first.
+    /// would put the job back while its mover is still writing to it, and the
+    /// mover - whose write creates the file again - would then deliver a second
+    /// copy to `_queue`.
+    ///
+    /// The job here is quiet by the only clock the sweep had before it was
+    /// taken, which is the whole difficulty: every job a mover takes is one that
+    /// looked abandoned, so a `.taken` file that still carried its old timestamp
+    /// would be recovered from under every mover that ever ran. Taking it
+    /// through `take_for_move` is what makes it read as attended, so this goes
+    /// through the real take rather than a hand-rolled rename.
     #[test]
     async fn a_move_still_in_progress_is_not_recovered() {
         let temp_dir = TempDir::new().unwrap();
         let (queue, job_name) = queue_with_one_claimed_job(&temp_dir).await;
 
         let in_progress_path = queue.in_progress_dir.join(&job_name);
-        let taken_path = taken_path_for(&in_progress_path);
-        std::fs::rename(&in_progress_path, &taken_path).unwrap();
+        age(
+            &[&in_progress_path, &heartbeat_of(&in_progress_path)],
+            Duration::from_secs(600),
+        );
+
+        let taken_path = take_for_move(&in_progress_path).await.unwrap();
 
         let swept = queue
             .reclaim_stranded_jobs(Duration::from_secs(300))
             .await
             .unwrap();
 
-        assert!(swept.is_empty());
+        assert!(
+            swept.is_empty(),
+            "a job in flight is nobody else's to move: {swept:?}"
+        );
         assert!(taken_path.exists(), "left for its mover to finish");
         assert!(!queue.queue_dir.join(&job_name).exists());
+        assert!(
+            !in_progress_path.exists(),
+            "and never put back under the name its mover took it from"
+        );
+    }
+
+    /// The fallback that keeps a job claimed by a worker whose first heartbeat
+    /// never landed from sitting in `_in_progress` for good. Marking the job
+    /// overwrites its own timestamp, so the sweep has to read that before it
+    /// takes the file rather than after.
+    #[test]
+    async fn a_job_claimed_without_a_heartbeat_is_still_reclaimed() {
+        let temp_dir = TempDir::new().unwrap();
+        let (queue, job_name) = queue_with_one_claimed_job(&temp_dir).await;
+
+        let in_progress_path = queue.in_progress_dir.join(&job_name);
+        std::fs::remove_file(heartbeat_of(&in_progress_path)).unwrap();
+        age(&[&in_progress_path], Duration::from_secs(600));
+
+        let swept = queue
+            .reclaim_stranded_jobs(Duration::from_secs(300))
+            .await
+            .unwrap();
+
+        assert_eq!(swept.reclaimed, vec![job_name.clone()]);
+        assert!(queue.queue_dir.join(&job_name).exists());
     }
 
     #[test]
