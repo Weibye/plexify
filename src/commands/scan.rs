@@ -346,6 +346,7 @@ fn resolve_one(path: &Path, targets: &[PlaybackTarget]) -> Resolution {
 mod tests {
     use super::*;
     use crate::job::{AudioAction, SubtitleAction};
+    use crate::target::Conformance;
     use std::fs;
     use tempfile::TempDir;
 
@@ -585,25 +586,37 @@ mod tests {
         assert!(built.success(), "could not build {path:?}");
     }
 
-    /// Every job the queue holds, by the file it transcodes.
-    fn queued(work_root: &Path) -> Vec<(String, Operation)> {
-        let mut jobs: Vec<(String, Operation)> = fs::read_dir(work_root.join("_queue"))
+    /// Every job the queue holds, ordered by the file it transcodes.
+    fn queued_jobs(work_root: &Path) -> Vec<crate::job::Job> {
+        let mut jobs: Vec<crate::job::Job> = fs::read_dir(work_root.join("_queue"))
             .unwrap()
             .filter_map(|entry| {
                 let path = entry.ok()?.path();
                 if path.extension()? != "job" {
                     return None;
                 }
-                let job: crate::job::Job =
-                    serde_json::from_str(&fs::read_to_string(&path).ok()?).ok()?;
-                Some((
-                    job.input_path.file_name()?.to_string_lossy().to_string(),
-                    job.operation,
-                ))
+                serde_json::from_str(&fs::read_to_string(&path).ok()?).ok()
             })
             .collect();
-        jobs.sort_by(|left, right| left.0.cmp(&right.0));
+        jobs.sort_by(|left, right| left.input_path.cmp(&right.input_path));
         jobs
+    }
+
+    /// Every job the queue holds, by the file it transcodes.
+    fn queued(work_root: &Path) -> Vec<(String, Operation)> {
+        queued_jobs(work_root)
+            .into_iter()
+            .map(|job| {
+                (
+                    job.input_path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string(),
+                    job.operation,
+                )
+            })
+            .collect()
     }
 
     /// The whole point of asking a client before queueing: a file it already
@@ -731,6 +744,94 @@ mod tests {
             )],
             "the Chromecast does not, and a file that plays on only one device \
              is one the Pi is asked to transcode when it is played on the other"
+        );
+    }
+
+    /// A file one target already Direct Plays is re-encoded to the other
+    /// target's envelope, and the copy the first was playing is not kept.
+    ///
+    /// This is a description of a gap, not of an intended behaviour, and it
+    /// asserts what the code does today so that changing it is deliberate
+    /// (#180).
+    /// `resolve_one` folds every target's answer into one `Operation` and
+    /// `Job::new` derives one output from the input's name, so a pair of
+    /// clients that disagree has exactly one destination to land in - and
+    /// `hardest` decides it belongs to the client that needs more work. 869
+    /// files in this library sit in exactly this position: the LG plays them
+    /// as they are, the Chromecast does not.
+    ///
+    /// The premise is measured here rather than assumed, because the test
+    /// says nothing about the fold unless the two verdicts really differ.
+    #[tokio::test]
+    async fn a_file_one_target_already_plays_is_re_encoded_for_the_other_and_not_kept() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+        let source = media_root.join("legacy.mkv");
+
+        // MPEG-4 video in Matroska, stereo AAC. Nothing but the video codec
+        // separates the two targets on it.
+        build(&source, &["-c:v", "mpeg4", "-c:a", "aac", "-ac", "2"]);
+
+        let probed = crate::probe::probe(&source).unwrap();
+        assert!(
+            matches!(
+                evaluate(&probed, &PlaybackTarget::load("lg-cx-webos").unwrap()),
+                Conformance::Conforms { .. }
+            ),
+            "the fixture has to Direct Play on the LG for this test to be about anything"
+        );
+        assert!(
+            matches!(
+                evaluate(&probed, &PlaybackTarget::load("chromecast-gen2-3").unwrap()),
+                Conformance::Reencode { .. }
+            ),
+            "and it has to need its picture re-encoded for the Chromecast"
+        );
+
+        // Scanning against the LG alone queues nothing, which is what the
+        // pair below takes away.
+        let lg_only = media_root.join("lg");
+        fs::create_dir_all(&lg_only).unwrap();
+        ScanCommand::new(
+            media_root.to_path_buf(),
+            lg_only.clone(),
+            None,
+            &["lg-cx-webos".to_string()],
+        )
+        .unwrap()
+        .execute()
+        .await
+        .unwrap();
+        assert!(queued_jobs(&lg_only).is_empty());
+
+        let both = media_root.join("both");
+        fs::create_dir_all(&both).unwrap();
+        ScanCommand::new(
+            media_root.to_path_buf(),
+            both.clone(),
+            None,
+            &["lg-cx-webos".to_string(), "chromecast-gen2-3".to_string()],
+        )
+        .unwrap()
+        .execute()
+        .await
+        .unwrap();
+
+        let jobs = queued_jobs(&both);
+        assert_eq!(jobs.len(), 1, "one file, one job - there is no second one");
+        assert_eq!(
+            jobs[0].operation,
+            Operation::Reencode { channels: None },
+            "the harder target's answer is the only one queued"
+        );
+        assert_eq!(
+            jobs[0].output_path,
+            source.with_extension("mp4"),
+            "and it has one destination, derived from the input's own name"
         );
     }
 
