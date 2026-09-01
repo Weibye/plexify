@@ -189,7 +189,7 @@ jobs:
         qemu-aarch64-static "$binary" audit --help > /dev/null
 
     - name: Upload
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: plexify-aarch64-unknown-linux-musl
         path: target/aarch64-unknown-linux-musl/release/plexify
