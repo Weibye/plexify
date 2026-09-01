@@ -261,28 +261,67 @@ mod tests {
             (false, Provenance::Observed)
         );
 
+        // Both LG rejections were rechecked against the client cap that
+        // manufactured the subtitle burns below, and both survive it: the Opus
+        // session transcoded the audio with the **video copied**, and the AVI
+        // stall had no transcode session in flight at all. A capped playback is
+        // a video re-encode, and neither of those is one.
         let lg = PlaybackTarget::builtin("lg-cx-webos").unwrap().unwrap();
         assert_eq!(
             lg.audio.codecs.verdict("opus"),
             (false, Provenance::Observed)
         );
-        assert_eq!(
-            lg.subtitles.burns_in.provenance_of("mov_text"),
-            Some(Provenance::Observed)
-        );
-        // Seen burned in a Critical Role session on this app. The mechanism is
-        // unresolved - that session was transcoding the video anyway - but a
-        // text format burning at all is what #162 was built on the opposite of.
-        assert_eq!(
-            lg.subtitles.burns_in.provenance_of("webvtt"),
-            Some(Provenance::Observed)
-        );
-        // Not inferred from webvtt. 284 files carry styled text and nothing has
-        // watched one play here.
-        assert_eq!(lg.subtitles.burns_in.provenance_of("ass"), None);
+        assert_eq!(lg.containers.verdict("avi"), (false, Provenance::Observed));
     }
 
-    /// VP9 and yuvj420p on the Chromecast, and AC3 on the LG, are unverified.
+    /// The LG burns nothing in, and every format once listed there is named
+    /// here so that re-adding one has to argue with a test.
+    ///
+    /// `mov_text` and `webvtt` were `observed`, read off sessions taken with
+    /// the app's own quality set to 3 Mbps 720p - which re-encodes every
+    /// picture, and a re-encode burns a text track into it for free. Measured
+    /// 2026-09-01 with that set to Original: a selected `mov_text` track was
+    /// converted into an `srt` sidecar and a selected `hdmv_pgs_subtitle`
+    /// track was copied for the app to render, both while the part decision
+    /// stayed `directplay` and the video was untouched.
+    #[test]
+    fn the_lg_is_not_claimed_to_burn_any_subtitle_in() {
+        let lg = PlaybackTarget::builtin("lg-cx-webos").unwrap().unwrap();
+
+        for codec in [
+            "mov_text",
+            "webvtt",
+            "hdmv_pgs_subtitle",
+            "dvd_subtitle",
+            "dvb_subtitle",
+            "ass",
+        ] {
+            assert_eq!(lg.subtitles.burns_in.provenance_of(codec), None, "{codec}");
+        }
+    }
+
+    /// One codec, opposite verdicts, both measured. An envelope is per-client
+    /// for exactly this reason: meeting the two, a reader should not have to
+    /// wonder which is stale.
+    ///
+    /// The Chromecast's receiver app transcodes AC3 in every layout. The LG
+    /// panel decodes it - measured 2026-09-01 with the app's quality set to
+    /// Original, `part decision = directplay` and no audio decision at all.
+    #[test]
+    fn ac3_is_refused_on_the_chromecast_and_played_on_the_lg() {
+        let chromecast = PlaybackTarget::builtin("chromecast-gen2-3")
+            .unwrap()
+            .unwrap();
+        let lg = PlaybackTarget::builtin("lg-cx-webos").unwrap().unwrap();
+
+        assert_eq!(
+            chromecast.audio.codecs.verdict("ac3"),
+            (false, Provenance::Observed)
+        );
+        assert_eq!(lg.audio.codecs.verdict("ac3"), (true, Provenance::Observed));
+    }
+
+    /// VP9 and yuvj420p on the Chromecast, and FLAC on the LG, are unverified.
     /// If any of them ever reads as observed, someone has promoted a spec sheet.
     #[test]
     fn what_is_unverified_says_so() {
@@ -299,7 +338,7 @@ mod tests {
         );
 
         let lg = PlaybackTarget::builtin("lg-cx-webos").unwrap().unwrap();
-        assert_eq!(lg.audio.codecs.verdict("ac3"), (true, Provenance::Assumed));
+        assert_eq!(lg.audio.codecs.verdict("flac"), (true, Provenance::Assumed));
     }
 
     #[test]

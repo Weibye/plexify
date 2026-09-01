@@ -51,6 +51,10 @@ assumed = ["mp3", "opus", "vorbis", "flac"]
 [audio.codecs.rejects]
 # Measured, and the single most expensive assumption this project got wrong:
 # AC3 is transcoded in every channel layout, stereo included.
+#
+# The LG envelope has ac3 under `accepts.observed`, measured just as this was.
+# The two do not contradict each other: this is the receiver app, that is the
+# panel, and an envelope is per client so they are allowed to differ.
 observed = ["ac3"]
 assumed = ["eac3", "dts", "truehd"]
 
