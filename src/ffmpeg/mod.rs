@@ -263,6 +263,35 @@ impl FFmpegCommandBuilder {
         self
     }
 
+    /// Write the encoder's reorder delay into the samples, not only into the
+    /// edit list.
+    ///
+    /// x264 at any preset that reorders frames emits the first picture with a
+    /// decode timestamp below its presentation timestamp. The MP4 muxer's
+    /// default answer is the video track's edit list `media_time`, and nothing
+    /// then says so in the media timeline - so the file is only in sync on a
+    /// player that honours `elst`. One that does not plays the picture
+    /// `has_b_frames` frame intervals late: measured 80ms at 25fps and 200ms at
+    /// 10fps, on all three MP4s this project writes.
+    ///
+    /// `+negative_cts_offsets` says the same thing as a signed composition
+    /// offset instead, which lives in the sample table every player reads. It
+    /// is not a second answer to the first. Measured with FFmpeg 9.0 on
+    /// Windows, an edit-list-honouring reading of the output is unchanged by
+    /// it: the same first video packet at 0.000000 and the same first audio
+    /// packet at -0.021333, while the edit-list-ignoring reading comes back
+    /// from 0.080000 to 0.000000. So it corrects the players that were wrong
+    /// and leaves the ones that were right alone.
+    ///
+    /// `-movflags` accumulates across repeats rather than replacing, so this
+    /// and [`Self::with_faststart`] can both be asked for; measured, the
+    /// remux's `moov` still comes out in front of its `mdat`.
+    pub fn with_negative_composition_offsets(mut self) -> Self {
+        self.output_options
+            .extend_from_slice(&["-movflags".to_string(), "+negative_cts_offsets".to_string()]);
+        self
+    }
+
     /// Put the MP4 index in front of the media data.
     ///
     /// The muxer writes it last either way; this rewrites the finished file to
@@ -1062,6 +1091,7 @@ impl FFmpegProcessor {
             source_channels,
         )
         .with_overwrite()
+        .with_negative_composition_offsets()
         .with_output(output_path);
 
         let adds_a_track = job.operation.adds_an_audio_track() && !source_channels.is_empty();
@@ -1184,6 +1214,7 @@ impl FFmpegProcessor {
             job.operation.audio_cap(),
             source_channels,
         )
+        .with_negative_composition_offsets()
         .with_output(output_path);
 
         let mux_builder = match subtitles {
@@ -2589,6 +2620,35 @@ mod tests {
             .collect()
     }
 
+    /// The presentation timestamps of one stream's packets as a player that
+    /// does not read the edit list sees them.
+    ///
+    /// Edit-list handling is inconsistent across hardware decoders and set-top
+    /// clients, and this is what the ones that skip it get: the media timeline
+    /// as it was actually written, with nothing rebased on the way out.
+    fn packet_times_ignoring_edit_list(path: &Path, stream: &str) -> Vec<f64> {
+        let output = std::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-ignore_editlist",
+                "1",
+                "-select_streams",
+                stream,
+                "-show_entries",
+                "packet=pts_time",
+                "-of",
+                "csv=p=0",
+            ])
+            .arg(path)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().trim_end_matches(',').parse().ok())
+            .collect()
+    }
+
     /// The codecs of every stream in a file, in order.
     fn stream_codecs(path: &Path) -> Vec<String> {
         let output = std::process::Command::new("ffprobe")
@@ -2762,6 +2822,104 @@ mod tests {
                 *duration > 100,
                 "a {duration}ms subtitle at {start}ms is the seam a shifted timeline leaves \
                  behind, not an event the source has: {events:?}"
+            );
+        }
+    }
+
+    /// A job whose preset reorders frames, which is what puts a reorder delay
+    /// in front of the muxer at all.
+    ///
+    /// `chunking_job` asks for `ultrafast`, and x264 turns B-frames off there,
+    /// so a fixture built on it has no delay to express and would pass this
+    /// whatever the muxer was told. `veryfast` is what the project actually
+    /// ships, and it reorders.
+    fn reordering_job(input: &Path) -> Job {
+        Job::new(
+            input.to_path_buf(),
+            MediaFileType::Mkv,
+            Operation::Reencode { channels: None },
+            QualitySettings {
+                ffmpeg_preset: "veryfast".to_string(),
+                ffmpeg_crf: "30".to_string(),
+                ffmpeg_audio_bitrate: "64k".to_string(),
+            },
+            PostProcessingSettings::default(),
+            input.parent().unwrap(),
+        )
+    }
+
+    /// The picture has to be in the media timeline, not only in the edit list.
+    ///
+    /// x264 emits the first picture with a decode timestamp below its
+    /// presentation timestamp, and the MP4 muxer's default answer is the video
+    /// track's `elst` `media_time`. A player that skips the edit list - and
+    /// hardware decoders and set-top clients are inconsistent about it - then
+    /// plays the picture `has_b_frames` frame intervals behind the sound: 200ms
+    /// on this 10fps fixture, 80ms at 25fps.
+    ///
+    /// Both encode paths are measured, because the delay reaches the muxer by
+    /// two different routes. The one-pass encode hands it over from x264
+    /// directly; the join is fed by the concat demuxer, whose first video DTS
+    /// is a reorder delay before its PTS, so a join that assumed its input was
+    /// already non-negative would leave this in place on exactly the files that
+    /// are long enough to matter.
+    ///
+    /// The second half of each check is what says the fix is not a trade: the
+    /// edit-list-honouring reading has to be unchanged, or a player that was
+    /// right before has been broken to fix one that was wrong.
+    #[tokio::test]
+    async fn the_picture_is_in_the_timeline_and_not_only_in_the_edit_list() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("film.mkv");
+        build_chunking_source(&input, 6);
+
+        for (path, chunking) in [
+            (
+                "one-pass",
+                Chunking {
+                    chunk_seconds: 2.0,
+                    // Above the source length, so the whole file is one run.
+                    min_source_seconds: 60.0,
+                },
+            ),
+            ("chunked", TEST_CHUNKING),
+        ] {
+            let work_folder = temp.path().join(format!("work-{path}"));
+            std::fs::create_dir_all(&work_folder).unwrap();
+
+            let job = reordering_job(&input);
+            FFmpegProcessor::new(false)
+                .with_chunking(chunking)
+                .process_job(&job, None, Some(&work_folder))
+                .await
+                .unwrap();
+
+            let output = job.work_folder_output_path(&work_folder);
+
+            let raw_picture = *packet_times_ignoring_edit_list(&output, "v")
+                .first()
+                .expect("the output should carry video");
+            let raw_sound = *packet_times_ignoring_edit_list(&output, "a")
+                .first()
+                .expect("the output should carry audio");
+            assert!(
+                (raw_picture - raw_sound).abs() < 0.02,
+                "on the {path} output a player ignoring the edit list starts the picture at \
+                 {raw_picture}s and the sound at {raw_sound}s"
+            );
+
+            // And the players that were already right are still right: the
+            // presentation timeline the edit list describes is untouched.
+            let picture = *packet_times(&output, "v")
+                .first()
+                .expect("the output should carry video");
+            assert!(
+                picture.abs() < 0.005,
+                "the {path} output's first picture is at {picture}s, not at the start of the file"
             );
         }
     }
