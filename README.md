@@ -236,23 +236,39 @@ plexify work /path/to/media --priority none  # or just omit --priority
 ```
 
 **Episode Priority Mode:**
-- **Series episodes are processed first**, sorted alphabetically by series name
-- **Within each series**, episodes are processed in ascending order (S01E01, S01E02, S01E03...)
-- **Non-episode content** (movies, etc.) is processed after all episodes
-- **Perfect for binge-watching scenarios** - get your episodes in the right order
+- **The files of one series are worked through together**, and finished before
+  another series is started. That is the guarantee the mode offers.
+- **Within a series**, episodes are worked in ascending order (S01E01, S01E02,
+  S01E03...), taken from the marker in the filename rather than from the season
+  directory - so an episode filed under the wrong season is still worked in its
+  own.
+- **The order between two series is unspecified.** Files are grouped by the
+  series directory as it is written, including the root, so `Anime` happens to
+  precede `Series` today. Do not depend on it.
+- **Non-episode content** (movies, and anything with no episode marker) is
+  worked after all episodes.
 
 **Example processing order with `--priority episode`:**
-1. Series/Better Call Saul/Season 01/Better Call Saul S01E01 Uno.mkv
-2. Series/Better Call Saul/Season 01/Better Call Saul S01E02 Mijo.mkv  
-3. Series/Breaking Bad/Season 01/Breaking Bad S01E01 Pilot.mkv
-4. Series/Breaking Bad/Season 01/Breaking Bad S01E03 Gray Matter.mkv
-5. Movies/The Matrix (1999)/The Matrix (1999).mkv
+1. Anime/Cowboy Bebop/Season 01/Cowboy Bebop S01E01 Asteroid Blues.mkv
+2. Series/Better Call Saul/Season 01/Better Call Saul S01E01 Uno.mkv
+3. Series/Better Call Saul/Season 01/Better Call Saul S01E02 Mijo.mkv
+4. Series/Breaking Bad/Season 01/Breaking Bad S01E01 Pilot.mkv
+5. Series/Breaking Bad/Season 01/Breaking Bad S01E03 Gray Matter.mkv
+6. Movies/The Matrix (1999)/The Matrix (1999).mkv
 
-**Supported episode formats:**
-- `Series/Show Name/Season XX/Show Name SxxExx Episode Title.ext`
-- `Series/Show Name {tvdb-12345}/Season XX/Show Name SxxExx Episode Title.ext`
-- `Series/Show Name/Season XX - Extra Info/Show Name SxxExx Episode Title.ext`
-- `Anime/Show Name/Season XX/Show Name SxxExx Episode Title.ext`
+**What counts as an episode here** is any file under `Series/` or `Anime/` whose
+name carries a `SxxExx` marker. It does not have to be in canonical form, and it
+does not have to be a file `validate` can propose a destination for: a name only
+has to be good enough to order by, which is a weaker thing to ask of it than a
+name it can be renamed to.
+
+```
+Series/Show Name/Season XX/Show Name SxxExx Episode Title.ext
+Series/Show Name {tvdb-12345}/Season XX/Show Name SxxExx Episode Title.ext
+Series/Show Name/Season XX - Extra Info/Show Name SxxExx Episode Title.ext
+Series/Show Name/Season XX/SxxExx.ext
+Anime/Show Name/Season XX/Show Name SxxExx Episode Title.ext
+```
 
 ### Quality Presets
 

@@ -438,6 +438,55 @@ pub fn series_directory_disagreement(relative_path: &Path) -> Option<SeriesDirec
     })
 }
 
+/// Where an episode sits in the order work should be done in.
+///
+/// This is a **different question** from what the file should be called, and the
+/// difference is the whole reason it is a separate type. A destination has to be
+/// right: a wrong one moves a file somewhere nobody will look for it, and only
+/// `undo` gets it back. An order only has to be useful, and being wrong about it
+/// costs a worker some minutes spent on the wrong episode.
+///
+/// So [`parse`] refuses a path it cannot decompose, and [`sort_key`] answers for
+/// paths it refuses. A file whose directory is named after an episode, a half
+/// episode, a tree nested into itself - none of those has a canonical name, and
+/// all of them have an obvious place in a queue.
+///
+/// The fields are ordered so the derived `Ord` is the ordering itself: group,
+/// then season, then episode.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EpisodeSortKey {
+    /// The library-relative directory chain above the season directory, root
+    /// included - `Series/Breaking Bad (2008)`.
+    ///
+    /// **Where the file is, not what it is called.** The rendered series name is
+    /// the wrong key to group by in both directions. It drops the year, so
+    /// `Breaking Bad (2008)` and `Breaking Bad (2020)` become one indistinguishable
+    /// group; and it comes from the filename, so one directory holding both
+    /// `Show - Long Name - S01E13.webm` and `S01E14.webm` becomes two groups with
+    /// room for another series to sort between them. The directory is one string
+    /// for the whole season in the second case and two different strings in the
+    /// first, which is exactly the other way round from what the name gives.
+    pub series_directory: String,
+    /// The season the *file's* marker claims, not its directory's - the same
+    /// choice `render` makes, so a misfiled episode is ordered where it belongs.
+    pub season: u32,
+    pub episode: u32,
+}
+
+/// Group and order an episode file, for a caller that needs a queue order rather
+/// than a name.
+///
+/// Takes a path relative to the library root. `None` means the path holds
+/// nothing to order by: it is not under `Series` or `Anime`, or its filename
+/// carries no episode marker. A film is `None`, which is what puts films behind
+/// episodes.
+///
+/// See [`EpisodeSortKey`] for why this is allowed to answer where [`parse`] is
+/// not.
+pub fn sort_key(relative_path: &Path) -> Option<EpisodeSortKey> {
+    parse::sort_key(&to_forward_slashes(relative_path))
+}
+
 /// What should happen to a path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Assessment {
@@ -877,6 +926,87 @@ mod tests {
                 "for {path}"
             );
         }
+    }
+
+    fn key(path: &str) -> EpisodeSortKey {
+        sort_key(Path::new(path)).unwrap_or_else(|| panic!("no sort key for {path}"))
+    }
+
+    /// Issue #138: the year is what tells two shows of one name apart, and it
+    /// lives on the directory precisely because the canonical *filename* does
+    /// not carry it. Grouping by the rendered name throws it away and leaves the
+    /// comparator returning `Equal` for every pair, so the two are interleaved.
+    #[test]
+    fn a_reboot_pair_is_two_groups_rather_than_one() {
+        let original = "Series/Breaking Bad (2008)/Season 01/Breaking Bad - S01E01 - Pilot.mkv";
+        let reboot = "Series/Breaking Bad (2020)/Season 01/Breaking Bad - S01E01 - Pilot.mkv";
+
+        let series_of = |path: &str| match parse(path).unwrap() {
+            MediaName::Episode(episode) => episode.series,
+            other => panic!("expected an episode, got {other:?}"),
+        };
+        assert_eq!(
+            series_of(original),
+            series_of(reboot),
+            "the rendered name is the same for both, which is what made them one group"
+        );
+        assert_ne!(
+            key(original),
+            key(reboot),
+            "two shows of one name must not share a group"
+        );
+    }
+
+    /// The other direction of the same mistake: the filename wins over the
+    /// directory when a name is *rendered*, so one season directory whose files
+    /// are inconsistently named becomes two groups, with room for another series
+    /// to sort between them.
+    #[test]
+    fn one_series_directory_is_one_group_however_its_files_are_named() {
+        let named = "Series/Super Best Friends Play - FFX/Season 01/Super Best Friends Play - Final Fantasy X - S01E13.webm";
+        let bare = "Series/Super Best Friends Play - FFX/Season 01/S01E14.webm";
+
+        assert_eq!(key(named).series_directory, key(bare).series_directory);
+        assert!(key(named) < key(bare), "and ordered by their markers");
+    }
+
+    /// The group is where the file is, so a series of one name under two roots
+    /// stays two series.
+    #[test]
+    fn the_root_is_part_of_the_group() {
+        assert_ne!(
+            key("Series/Trigun/Season 01/Trigun - S01E01 - The 60 Billion Double Dollar Man.mkv"),
+            key("Anime/Trigun/Season 01/Trigun - S01E01 - The 60 Billion Double Dollar Man.mkv")
+        );
+    }
+
+    /// A season directory is what the marker orders *within*, so it cannot be
+    /// part of the group - an unpadded season, an arc name, `Specials` and a
+    /// missing season directory all describe one series.
+    #[test]
+    fn the_season_directory_is_not_part_of_the_group() {
+        let expected = "Series/Critical Role";
+
+        for path in [
+            "Series/Critical Role/Season 1/Critical Role - S01E12 - Kraghammer.mkv",
+            "Series/Critical Role/Season 01 - Vox Machina/Critical Role - S01E12 - Kraghammer.mkv",
+            "Series/Critical Role/Specials/Critical Role - S00E01 - Talks Machina.mkv",
+            "Series/Critical Role/Critical Role - S01E12 - Kraghammer.mkv",
+            "Series/Critical Role/Season 01/Extras/Critical Role - S01E12 - Clip.mkv",
+        ] {
+            assert_eq!(key(path).series_directory, expected, "for {path}");
+        }
+    }
+
+    /// Everything the queue orders, it orders by the marker in the filename -
+    /// the same evidence `render` files the episode under, so a misfiled episode
+    /// is worked in the season it belongs to rather than the one it sits in.
+    #[test]
+    fn the_marker_decides_the_season_not_the_directory() {
+        let misfiled = key("Series/Elementary/Season 05/Elementary - S06E08 - Sand Trap.mkv");
+
+        assert_eq!(misfiled.season, 6);
+        assert_eq!(misfiled.episode, 8);
     }
 
     #[test]

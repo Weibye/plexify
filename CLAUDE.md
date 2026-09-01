@@ -473,6 +473,31 @@ Consequences to preserve when changing it:
   marker and the arc name is curated information - but only where the directory already
   agrees with the marker, since a file moving seasons cannot carry the old arc name along.
 
+**A queue order is not a destination, and `naming::sort_key` is where that is said.** The
+`work --priority episode` prioritiser is the module's other caller, and it wants something
+different from `parse`. A destination has to be right - a wrong one moves a file somewhere
+nobody will look and only `undo` gets it back - so `parse` refuses what it cannot name. An
+order only has to be useful, so `sort_key` answers for paths `parse` refuses: a directory
+named after an episode, half an episode, a tree nested into itself. Collapsing those refusals
+into "no metadata" sorted them behind every parseable episode in the library, in `read_dir`
+order, with nothing logged, and they are exactly the files `validate --fix` also refuses -
+so they stay in that shape and lose their order every run.
+
+It groups by the **library-relative series directory, root included**, and orders within that
+by the marker. The rendered series name is wrong as a key in both directions: it drops the
+year, so `Breaking Bad (2008)` and `Breaking Bad (2020)` become one indistinguishable group;
+and it is taken from the filename, so one directory holding both `Show - Long Name - S01E13`
+and `S01E14` becomes two groups with room for another series to sort between them. The
+directory is one string in the second case and two in the first, which is the other way round
+from what the name gives. The season directory is excluded because it is what the marker
+orders *within*, and the root is included because a series of one name under `Series` and
+under `Anime` is two series.
+
+`sort_key` reads the path itself rather than calling `parse`, and that is deliberate rather
+than duplication: routing it through `parse` is what coupled the two decisions in the first
+place. `EpisodeSortKey`'s field order is the ordering, so a caller compares keys rather than
+writing a second comparator that can drift from it.
+
 **A run can be narrowed without changing what canonical means.** `naming::scope_for` splits
 the path a user gave into a `library_root` (the parent of the outermost `Series`/`Anime`/
 `Movies` component *that is actually a root* — see below) and a `scan_path` (what to walk).
