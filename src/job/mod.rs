@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-use crate::naming::{self, LibraryRoot, MediaName};
+use crate::naming::{self, EpisodeSortKey, LibraryRoot};
 use crate::paths::to_forward_slashes;
 use crate::target::{Conformance, Field, PlaybackTarget};
 
@@ -417,17 +417,6 @@ pub enum MediaFileType {
     Avi,
 }
 
-/// Episode metadata extracted from file paths for prioritization.
-///
-/// Only episodes have metadata. Movies and anything else that does not parse as
-/// an episode yield `None`, which is what separates the two during prioritization.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct EpisodeMetadata {
-    pub series_name: String,
-    pub season_number: u32,
-    pub episode_number: u32,
-}
-
 impl Job {
     /// Namespace for the v5 UUIDs that identify jobs by the file they transcode.
     ///
@@ -585,28 +574,28 @@ impl Job {
         })
     }
 
-    /// Extract episode metadata from the job's input path for prioritization.
+    /// Where this job's input sits in the order episodes should be worked in.
     ///
     /// What counts as a season directory or an episode marker is asked of
     /// `naming`, which owns that question for the whole project. One description
     /// serves both callers, so an unpadded `Season 6`, a `Specials` directory and
     /// a three-digit episode number order here exactly as they render there.
     ///
+    /// It asks `naming::sort_key` rather than `naming::parse`, and that is the
+    /// point rather than a shortcut. `parse` refuses a path it cannot *name*, and
+    /// a refusal collapsing into `None` here demotes the file to the back of the
+    /// queue in `read_dir` order with nothing said about it - silently, and for
+    /// exactly the files `validate --fix` also refuses, so they are the ones that
+    /// will still be in that shape next month.
+    ///
     /// The path is absolute and carries native separators, so it is normalised
-    /// and cut down to the library-relative form `naming::parse` reads. That cut
-    /// needs the media root, which the job does not carry; the queue holds it and
+    /// and cut down to the library-relative form `naming` reads. That cut needs
+    /// the media root, which the job does not carry; the queue holds it and
     /// passes it in.
-    pub fn extract_episode_metadata(&self, media_root: &Path) -> Option<EpisodeMetadata> {
+    pub fn episode_sort_key(&self, media_root: &Path) -> Option<EpisodeSortKey> {
         let relative = Self::library_relative_path(&self.input_path, media_root)?;
 
-        match naming::parse(&relative) {
-            Ok(MediaName::Episode(episode)) => Some(EpisodeMetadata {
-                series_name: episode.series,
-                season_number: episode.season,
-                episode_number: episode.number,
-            }),
-            _ => None,
-        }
+        naming::sort_key(Path::new(&relative))
     }
 
     /// Cut an absolute input path down to the library-relative form
@@ -1454,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn test_episode_metadata_extraction_series() {
+    fn a_sort_key_comes_off_a_standard_series_path() {
         let quality = QualitySettings::default();
         let post_processing = PostProcessingSettings::default();
         let media_root = PathBuf::from("/media");
@@ -1469,14 +1458,14 @@ mod tests {
             &media_root,
         );
 
-        let metadata = job.extract_episode_metadata(&media_root).unwrap();
-        assert_eq!(metadata.series_name, "Breaking Bad");
-        assert_eq!(metadata.season_number, 1);
-        assert_eq!(metadata.episode_number, 3);
+        let key = job.episode_sort_key(&media_root).unwrap();
+        assert_eq!(key.series_directory, "Series/Breaking Bad");
+        assert_eq!(key.season, 1);
+        assert_eq!(key.episode, 3);
     }
 
     #[test]
-    fn test_episode_metadata_extraction_series_with_tvdb() {
+    fn an_annotated_series_directory_is_the_group_as_written() {
         let quality = QualitySettings::default();
         let post_processing = PostProcessingSettings::default();
         let media_root = PathBuf::from("/media");
@@ -1493,14 +1482,17 @@ mod tests {
             &media_root,
         );
 
-        let metadata = job.extract_episode_metadata(&media_root).unwrap();
-        assert_eq!(metadata.series_name, "Breaking Bad");
-        assert_eq!(metadata.season_number, 1);
-        assert_eq!(metadata.episode_number, 1);
+        let key = job.episode_sort_key(&media_root).unwrap();
+        assert_eq!(
+            key.series_directory,
+            "Series/Breaking Bad (2008) {tvdb-296861}"
+        );
+        assert_eq!(key.season, 1);
+        assert_eq!(key.episode, 1);
     }
 
     #[test]
-    fn test_episode_metadata_extraction_anime() {
+    fn an_anime_path_sorts_the_same_way() {
         let quality = QualitySettings::default();
         let post_processing = PostProcessingSettings::default();
         let media_root = PathBuf::from("/media");
@@ -1517,14 +1509,14 @@ mod tests {
             &media_root,
         );
 
-        let metadata = job.extract_episode_metadata(&media_root).unwrap();
-        assert_eq!(metadata.series_name, "Attack on Titan");
-        assert_eq!(metadata.season_number, 1);
-        assert_eq!(metadata.episode_number, 5);
+        let key = job.episode_sort_key(&media_root).unwrap();
+        assert_eq!(key.series_directory, "Anime/Attack on Titan");
+        assert_eq!(key.season, 1);
+        assert_eq!(key.episode, 5);
     }
 
     #[test]
-    fn test_episode_metadata_extraction_season_with_extra_info() {
+    fn an_arc_named_season_directory_is_not_part_of_the_group() {
         let quality = QualitySettings::default();
         let post_processing = PostProcessingSettings::default();
         let media_root = PathBuf::from("/media");
@@ -1539,14 +1531,17 @@ mod tests {
             &media_root,
         );
 
-        let metadata = job.extract_episode_metadata(&media_root).unwrap();
-        assert_eq!(metadata.series_name, "Critical Role");
-        assert_eq!(metadata.season_number, 1);
-        assert_eq!(metadata.episode_number, 12);
+        let key = job.episode_sort_key(&media_root).unwrap();
+        assert_eq!(
+            key.series_directory,
+            "Series/Critical Role (2015) {tvdb-296861}"
+        );
+        assert_eq!(key.season, 1);
+        assert_eq!(key.episode, 12);
     }
 
     #[test]
-    fn test_episode_metadata_extraction_movie_returns_none() {
+    fn a_film_has_no_sort_key_and_so_sorts_last() {
         let quality = QualitySettings::default();
         let post_processing = PostProcessingSettings::default();
         let media_root = PathBuf::from("/media");
@@ -1561,21 +1556,20 @@ mod tests {
             &media_root,
         );
 
-        let metadata = job.extract_episode_metadata(&media_root);
-        assert!(metadata.is_none());
+        assert!(job.episode_sort_key(&media_root).is_none());
     }
 
-    /// Metadata for a library-relative path, as a scan would queue it.
-    fn metadata_for(relative_path: PathBuf) -> Option<EpisodeMetadata> {
-        metadata_under(Path::new("/media"), relative_path)
+    /// The sort key for a library-relative path, as a scan would queue it.
+    fn sort_key_for(relative_path: PathBuf) -> Option<EpisodeSortKey> {
+        sort_key_under(Path::new("/media"), relative_path)
     }
 
-    /// Metadata for a path queued by a scan of `media_root`.
+    /// The sort key for a path queued by a scan of `media_root`.
     ///
     /// The two arguments are the two a scan supplies, and keeping them apart is
     /// the point: `Job::new` joins them into one absolute path, and what the
     /// prioritiser has to do is take the join back apart.
-    fn metadata_under(media_root: &Path, relative_path: PathBuf) -> Option<EpisodeMetadata> {
+    fn sort_key_under(media_root: &Path, relative_path: PathBuf) -> Option<EpisodeSortKey> {
         Job::new(
             relative_path,
             MediaFileType::Mkv,
@@ -1584,15 +1578,15 @@ mod tests {
             PostProcessingSettings::default(),
             media_root,
         )
-        .extract_episode_metadata(media_root)
+        .episode_sort_key(media_root)
     }
 
     #[test]
-    fn episode_metadata_reads_a_path_with_native_separators() {
-        let expected = EpisodeMetadata {
-            series_name: "Elementary".to_string(),
-            season_number: 6,
-            episode_number: 8,
+    fn a_sort_key_reads_a_path_with_native_separators() {
+        let expected = EpisodeSortKey {
+            series_directory: "Series/Elementary".to_string(),
+            season: 6,
+            episode: 8,
         };
 
         // Built component-wise, which is what a scan hands over: `WalkDir` and
@@ -1602,18 +1596,18 @@ mod tests {
             .join("Elementary")
             .join("Season 06")
             .join("Elementary - S06E08 - Sand Trap.mkv");
-        assert_eq!(metadata_for(joined), Some(expected.clone()));
+        assert_eq!(sort_key_for(joined), Some(expected.clone()));
 
         // Spelled out as well, so the normalisation is asserted on every
         // platform rather than only on the one that produces backslashes.
         let backslashes =
             PathBuf::from(r"Series\Elementary\Season 06\Elementary - S06E08 - Sand Trap.mkv");
-        assert_eq!(metadata_for(backslashes), Some(expected));
+        assert_eq!(sort_key_for(backslashes), Some(expected));
     }
 
     #[test]
-    fn episode_metadata_covers_the_season_directories_a_library_holds() {
-        let unpadded = metadata_for(
+    fn a_sort_key_covers_the_season_directories_a_library_holds() {
+        let unpadded = sort_key_for(
             PathBuf::from("Series")
                 .join("Elementary")
                 .join("Season 6")
@@ -1621,14 +1615,14 @@ mod tests {
         );
         assert_eq!(
             unpadded,
-            Some(EpisodeMetadata {
-                series_name: "Elementary".to_string(),
-                season_number: 6,
-                episode_number: 8,
+            Some(EpisodeSortKey {
+                series_directory: "Series/Elementary".to_string(),
+                season: 6,
+                episode: 8,
             })
         );
 
-        let specials = metadata_for(
+        let specials = sort_key_for(
             PathBuf::from("Series")
                 .join("Firefly")
                 .join("Specials")
@@ -1636,10 +1630,10 @@ mod tests {
         );
         assert_eq!(
             specials,
-            Some(EpisodeMetadata {
-                series_name: "Firefly".to_string(),
-                season_number: 0,
-                episode_number: 1,
+            Some(EpisodeSortKey {
+                series_directory: "Series/Firefly".to_string(),
+                season: 0,
+                episode: 1,
             })
         );
     }
@@ -1652,10 +1646,10 @@ mod tests {
         // the library, and a search of the whole absolute path takes it anyway -
         // which makes every real root below it read as a tree nested into itself
         // and costs the metadata for the entire library at once.
-        let expected = EpisodeMetadata {
-            series_name: "Elementary".to_string(),
-            season_number: 1,
-            episode_number: 1,
+        let expected = EpisodeSortKey {
+            series_directory: "Series/Elementary".to_string(),
+            season: 1,
+            episode: 1,
         };
 
         let episode = PathBuf::from("Series")
@@ -1665,7 +1659,7 @@ mod tests {
 
         for media_root in ["/home/bob/Movies", "/srv/Anime", r"D:\Media\Series"] {
             assert_eq!(
-                metadata_under(Path::new(media_root), episode.clone()),
+                sort_key_under(Path::new(media_root), episode.clone()),
                 Some(expected.clone()),
                 "a library under a media root at '{media_root}'"
             );
@@ -1677,7 +1671,7 @@ mod tests {
         // The other thing `/srv/Anime` can mean: the root itself, with series
         // directories directly inside it. Nothing below the media root is
         // library-shaped, so the root is found where it actually is.
-        let episode = metadata_under(
+        let episode = sort_key_under(
             Path::new("/srv/Anime"),
             PathBuf::from("Naruto")
                 .join("Season 01")
@@ -1686,29 +1680,29 @@ mod tests {
 
         assert_eq!(
             episode,
-            Some(EpisodeMetadata {
-                series_name: "Naruto".to_string(),
-                season_number: 1,
-                episode_number: 1,
+            Some(EpisodeSortKey {
+                series_directory: "Anime/Naruto".to_string(),
+                season: 1,
+                episode: 1,
             })
         );
     }
 
     #[test]
-    fn a_three_digit_episode_number_is_read_whole() {
-        let long_running = metadata_for(
+    fn a_three_digit_episode_is_read_whole() {
+        let long_running = sort_key_for(
             PathBuf::from("Anime")
                 .join("One Piece")
                 .join("Season 01")
                 .join("One Piece - S01E108 - Dashing Onto The Scene.mkv"),
         );
-        assert_eq!(long_running.unwrap().episode_number, 108);
+        assert_eq!(long_running.unwrap().episode, 108);
     }
 
     #[test]
     fn a_three_digit_episode_sorts_after_the_two_digit_ones() {
         let episode = |number: &str| {
-            metadata_for(
+            sort_key_for(
                 PathBuf::from("Anime")
                     .join("One Piece")
                     .join("Season 01")
@@ -1723,9 +1717,9 @@ mod tests {
     }
 
     #[test]
-    fn every_episode_naming_parses_yields_prioritization_metadata() {
-        // Both answer the same question about the same file, so a path one of
-        // them calls an episode cannot be a path the other passes over.
+    fn every_episode_naming_parses_also_sorts() {
+        // The sort key answers for more paths than `parse` does, but never for
+        // fewer, and where both speak they must agree about which file this is.
         let paths = [
             "Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap.mkv",
             "Series/Elementary/Season 6/Elementary - S06E08 - Sand Trap.mkv",
@@ -1737,76 +1731,121 @@ mod tests {
             "Series/Elementary/Season 01/Elementary - S01E02 - Extras/S01E02 clip.mkv",
             "Anime/One Piece/Season 01/One Piece - S01E108 - Dashing Onto The Scene.mkv",
             "Anime/Attack on Titan/Season 01/Attack on Titan S01E05 First Battle.mkv",
-            "Movies/The Dark Knight (2008)/The Dark Knight (2008).mkv",
-            "Random/Path/file.mkv",
-            // Carries an episode marker and is still not a canonical episode.
-            // `naming` refuses both of these today, so both take the `_` arm and
-            // are asserted to have no metadata - see the seam test below for what
-            // that costs.
-            "Series/Elementary/Season 01/Elementary - S01E13.5 - Recap.mkv",
-            "Series/Veronica Mars/Series/Season 01/Veronica Mars - S01E01 - Pilot.mkv",
         ];
 
         for path in paths {
-            let parsed = crate::naming::parse(path);
-            let metadata = metadata_for(PathBuf::from(path));
+            let Ok(crate::naming::MediaName::Episode(episode)) = crate::naming::parse(path) else {
+                panic!("'{path}' is meant to parse as an episode");
+            };
+            let key = sort_key_for(PathBuf::from(path))
+                .unwrap_or_else(|| panic!("'{path}' parses as an episode but has no sort key"));
 
-            match parsed {
-                Ok(MediaName::Episode(episode)) => {
-                    let metadata = metadata.unwrap_or_else(|| {
-                        panic!("'{path}' parses as an episode but has no metadata")
-                    });
-                    assert_eq!(
-                        metadata.season_number, episode.season,
-                        "season for '{path}'"
-                    );
-                    assert_eq!(
-                        metadata.episode_number, episode.number,
-                        "episode for '{path}'"
-                    );
-                    assert_eq!(metadata.series_name, episode.series, "series for '{path}'");
-                }
-                _ => assert!(
-                    metadata.is_none(),
-                    "'{path}' is not an episode but yielded {metadata:?}"
-                ),
-            }
+            assert_eq!(key.season, episode.season, "season for '{path}'");
+            assert_eq!(key.episode, episode.number, "episode for '{path}'");
+
+            // The group is where the parse says the file is - the root and the
+            // directories above the season directory - rather than the series
+            // name the parse recovered from the file.
+            let expected: Vec<&str> = std::iter::once(episode.root.as_str())
+                .chain(episode.directories.iter().map(String::as_str))
+                .collect();
+            assert_eq!(
+                key.series_directory,
+                expected.join("/"),
+                "group for '{path}'"
+            );
         }
     }
 
-    /// A file `naming` will not name is demoted, not ordered.
-    ///
-    /// This is the seam #133 is about, pinned as it currently stands so that
-    /// changing it has to be deliberate. A path carrying a perfectly legible
-    /// `S01E13` still yields no metadata when anything else about it is
-    /// unresolvable, and `claim_prioritized_job` sorts `None` behind `Some`
-    /// rather than filtering it - so the file is still transcoded, just at the
-    /// back of the queue in `read_dir` order, with nothing logged.
-    ///
-    /// Both shapes below are refused on `main` today, so this records existing
-    /// behaviour rather than introducing it. Giving the prioritiser a sort key
-    /// that can fall back where a *destination* may not is #133's decision to
-    /// make, not this test's.
     #[test]
-    fn a_marker_naming_refuses_is_demoted_rather_than_ordered() {
-        let fractional = "Series/Elementary/Season 01/Elementary - S01E13.5 - Recap.mkv";
-        let nested = "Series/Veronica Mars/Series/Season 01/Veronica Mars - S01E01 - Pilot.mkv";
+    fn nothing_episodic_in_the_path_means_no_sort_key() {
+        for path in [
+            // A film: under a root that holds no episodes.
+            "Movies/The Dark Knight (2008)/The Dark Knight (2008).mkv",
+            // Under no library root at all.
+            "Random/Path/file.mkv",
+            // Under an episodic root, but the filename states no episode.
+            "Series/Firefly/Season 01/Serenity.mkv",
+        ] {
+            assert_eq!(sort_key_for(PathBuf::from(path)), None, "for '{path}'");
+        }
+    }
 
-        for path in [fractional, nested] {
+    /// Issue #133: a file `naming` will not *name* is still a file the queue can
+    /// order.
+    ///
+    /// Every path here carries a legible marker and is refused by `parse` for a
+    /// reason that has nothing to do with the marker - a directory named after an
+    /// episode, half an episode, a tree nested into itself. Collapsing those
+    /// refusals into `None` sorted them behind every parseable episode in the
+    /// library, in `read_dir` order, with nothing logged - and they are precisely
+    /// the files `validate --fix` also refuses, so they stay in that shape.
+    #[test]
+    fn a_path_naming_refuses_is_still_ordered() {
+        for (path, expected) in [
+            (
+                "Series/S01E01/Season 01/S01E01 - x.mkv",
+                EpisodeSortKey {
+                    series_directory: "Series/S01E01".to_string(),
+                    season: 1,
+                    episode: 1,
+                },
+            ),
+            (
+                "Series/Veronica Mars S02E04/Season 02/S02E04.mp4",
+                EpisodeSortKey {
+                    series_directory: "Series/Veronica Mars S02E04".to_string(),
+                    season: 2,
+                    episode: 4,
+                },
+            ),
+            (
+                "Series/Elementary/Season 01/Elementary - S01E13.5 - Recap.mkv",
+                EpisodeSortKey {
+                    series_directory: "Series/Elementary".to_string(),
+                    season: 1,
+                    episode: 13,
+                },
+            ),
+            (
+                "Series/Veronica Mars/Series/Season 01/Veronica Mars - S01E01 - Pilot.mkv",
+                EpisodeSortKey {
+                    series_directory: "Series/Veronica Mars/Series".to_string(),
+                    season: 1,
+                    episode: 1,
+                },
+            ),
+        ] {
             assert!(
                 crate::naming::parse(path).is_err(),
-                "'{path}' is meant to be a path naming refuses"
+                "'{path}' is meant to be a path naming refuses to name"
             );
             assert_eq!(
-                metadata_for(PathBuf::from(path)),
-                None,
-                "'{path}' carries a marker but is demoted, not ordered"
+                sort_key_for(PathBuf::from(path)),
+                Some(expected),
+                "'{path}' carries a marker and must be ordered by it"
             );
         }
     }
 
+    /// A half episode ties with the whole one it sits beside, and that is the
+    /// answer rather than a gap in it: they are adjacent in the season, so
+    /// either order is right, and there is no third episode a tie can let in.
     #[test]
-    fn test_episode_metadata_extraction_invalid_format_returns_none() {
+    fn a_half_episode_sorts_beside_the_episode_it_follows() {
+        let whole = sort_key_for(PathBuf::from(
+            "Series/Elementary/Season 01/Elementary - S01E13 - Real.mkv",
+        ));
+        let half = sort_key_for(PathBuf::from(
+            "Series/Elementary/Season 01/Elementary - S01E13.5 - Recap.mkv",
+        ));
+
+        assert_eq!(whole, half);
+        assert!(whole.is_some());
+    }
+
+    #[test]
+    fn a_path_under_no_library_root_has_no_sort_key() {
         let quality = QualitySettings::default();
         let post_processing = PostProcessingSettings::default();
         let media_root = PathBuf::from("/media");
@@ -1821,8 +1860,7 @@ mod tests {
             &media_root,
         );
 
-        let metadata = job.extract_episode_metadata(&media_root);
-        assert!(metadata.is_none());
+        assert!(job.episode_sort_key(&media_root).is_none());
     }
 
     #[test]

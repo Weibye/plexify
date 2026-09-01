@@ -223,6 +223,56 @@ fn parse_episode(
     }))
 }
 
+/// Group and order an episode for the transcode queue.
+///
+/// Given with `/` separators, relative to the library root, exactly as [`parse`]
+/// takes it. `None` means there is nothing episodic to order: the path is not
+/// under an episodic root, or its filename carries no marker.
+///
+/// Everything this reads, it reads directly. It does not call [`parse`] and does
+/// not inherit its refusals, because the two are answering different questions -
+/// see [`super::EpisodeSortKey`] for why that is deliberate rather than
+/// duplication.
+pub(super) fn sort_key(path: &str) -> Option<super::EpisodeSortKey> {
+    let components: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+
+    let (root_name, below_root) = components.split_first()?;
+    if !LibraryRoot::from_component(root_name)?.is_episodic() {
+        return None;
+    }
+
+    let (filename, directories) = below_root.split_last()?;
+
+    // Group 3 - the `.5` of a half episode - is deliberately not consulted. It
+    // makes `parse` refuse, because there is no canonical *name* for half an
+    // episode, but ordering `S01E13.5` alongside `S01E13` is right, and a tie
+    // between them costs nothing.
+    let marker = episode_marker().captures(filename)?;
+    let season = marker[1].parse().ok()?;
+    let episode = marker[2].parse().ok()?;
+
+    // The season directory is not part of the group: it is what the marker
+    // orders within. Everything above it is, including the root, so that a
+    // series of the same name under `Series` and under `Anime` stays two groups.
+    let above_season = match directories
+        .iter()
+        .rposition(|component| parse_season_directory(component).is_some())
+    {
+        Some(position) => &directories[..position],
+        None => directories,
+    };
+
+    Some(super::EpisodeSortKey {
+        series_directory: std::iter::once(root_name)
+            .chain(above_season.iter())
+            .copied()
+            .collect::<Vec<_>>()
+            .join("/"),
+        season,
+        episode,
+    })
+}
+
 /// The series name a directory component states, stripped of its annotations.
 ///
 /// `Breaking Bad (2008) {tvdb-81189}` names the series `Breaking Bad`; the year

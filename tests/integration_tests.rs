@@ -837,15 +837,19 @@ async fn test_episode_prioritization_integration() {
         claimed.complete().await.unwrap();
     }
 
+    // Jobs group by the library-relative series directory, root included, so the
+    // `Anime` series is worked through before the `Series` ones. What the order
+    // between two series is does not matter; that each is finished before the
+    // next is started is the whole point of the mode.
     let expected = [
+        "One Piece S01E99 Spirit Of The Fight.mkv",
+        "One Piece S01E108 Dashing Onto The Scene.mkv",
         "Better Call Saul S01E01 Uno.mkv",
         "Better Call Saul S01E02 Mijo.mkv",
         "Breaking Bad S01E01 Pilot.mkv",
         "Breaking Bad S01E03 Gray Matter.mkv",
         "Firefly S00E01 Here's How It Was.mkv",
-        "One Piece S01E99 Spirit Of The Fight.mkv",
-        "One Piece S01E108 Dashing Onto The Scene.mkv",
-        // Nothing parses as an episode here, so the film is claimed last.
+        // Nothing under an episodic root here, so the film is claimed last.
         "The Matrix (1999).mkv",
     ];
 

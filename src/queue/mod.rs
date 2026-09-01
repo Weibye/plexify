@@ -175,40 +175,32 @@ impl JobQueue {
             return Ok(None);
         }
 
-        // Load all jobs and extract metadata for sorting
-        let mut jobs_with_metadata = Vec::new();
+        // Load all jobs and take a sort key from each
+        let mut jobs_with_keys = Vec::new();
         for job_path in job_files {
             // Try to read the job file
             if let Ok(content) = async_fs::read_to_string(&job_path).await {
                 if let Ok(job) = serde_json::from_str::<Job>(&content) {
-                    let metadata = job.extract_episode_metadata(&self.media_root);
-                    jobs_with_metadata.push((job_path, job, metadata));
+                    let sort_key = job.episode_sort_key(&self.media_root);
+                    jobs_with_keys.push((job_path, job, sort_key));
                 }
             }
         }
 
         // Sort jobs by priority:
-        // 1. Episode jobs first (with metadata)
-        // 2. Within episodes: by series name, then season, then episode
-        // 3. Non-episode jobs last (maintain original order)
-        jobs_with_metadata.sort_by(|a, b| {
-            match (&a.2, &b.2) {
-                (Some(meta_a), Some(meta_b)) => {
-                    // Both have metadata - sort by series, season, episode
-                    meta_a
-                        .series_name
-                        .cmp(&meta_b.series_name)
-                        .then(meta_a.season_number.cmp(&meta_b.season_number))
-                        .then(meta_a.episode_number.cmp(&meta_b.episode_number))
-                }
-                (Some(_), None) => std::cmp::Ordering::Less, // Episode jobs first
-                (None, Some(_)) => std::cmp::Ordering::Greater, // Episode jobs first
-                (None, None) => std::cmp::Ordering::Equal,   // Maintain order for non-episodes
-            }
+        // 1. Episode jobs first (those with a key)
+        // 2. Within episodes: series directory, then season, then episode - the
+        //    `EpisodeSortKey` ordering, so this is not a second description of it
+        // 3. Everything with no key last, in the order it was read
+        jobs_with_keys.sort_by(|a, b| match (&a.2, &b.2) {
+            (Some(key_a), Some(key_b)) => key_a.cmp(key_b),
+            (Some(_), None) => std::cmp::Ordering::Less, // Episode jobs first
+            (None, Some(_)) => std::cmp::Ordering::Greater, // Episode jobs first
+            (None, None) => std::cmp::Ordering::Equal,   // Maintain order for non-episodes
         });
 
         // Try to claim jobs in priority order
-        for (job_path, _, _) in jobs_with_metadata {
+        for (job_path, _, _) in jobs_with_keys {
             if let Some(claimed_job) = self.try_claim_job_file(&job_path).await? {
                 return Ok(Some(claimed_job));
             }
@@ -2019,6 +2011,79 @@ mod tests {
         assert!(claimed_order[3].contains("Breaking Bad S01E03"));
         // Movie should come last
         assert!(claimed_order[4].contains("The Matrix"));
+    }
+
+    /// Issues #138 and #133, asserted where the order is actually produced.
+    ///
+    /// The queue is given four files that all carry the marker `S01E01` or
+    /// `S01E02`, in two pairs that a sort key taken from the *rendered* series
+    /// name cannot separate or keep together: two shows called `Breaking Bad`,
+    /// and one directory holding a file that names no series at all. Claiming
+    /// them must finish each show before starting the other.
+    #[test]
+    async fn a_reboot_pair_and_a_bare_filename_are_each_worked_through_in_turn() {
+        let temp_dir = TempDir::new().unwrap();
+        let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        queue.init().await.unwrap();
+        let media_root = temp_dir.path();
+
+        // Interleaved on the way in, so an order that comes out right cannot
+        // have come from the order they were enqueued in.
+        let files = [
+            ("Breaking Bad (2020)", "Breaking Bad - S01E02 - Cat.mkv"),
+            ("Breaking Bad (2008)", "S01E02 - Cats in the Bag.mkv"),
+            ("Breaking Bad (2020)", "Breaking Bad - S01E01 - Pilot.mkv"),
+            ("Breaking Bad (2008)", "Breaking Bad - S01E01 - Pilot.mkv"),
+        ];
+
+        for (series, file) in files {
+            queue
+                .enqueue_job(&Job::new(
+                    episode_path("Series", series, "Season 01", file),
+                    MediaFileType::Mkv,
+                    Operation::Reencode { channels: None },
+                    QualitySettings::default(),
+                    PostProcessingSettings::default(),
+                    media_root,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let mut claimed_order = Vec::new();
+        while let Some(claimed) = queue
+            .claim_job(Some(crate::JobPriority::Episode))
+            .await
+            .unwrap()
+        {
+            claimed_order.push(crate::paths::to_forward_slashes(&claimed.job.input_path));
+            claimed.complete().await.unwrap();
+        }
+
+        let series_of = |claimed: &String| {
+            claimed
+                .rsplit('/')
+                .nth(2)
+                .expect("an episode path has a series directory")
+                .to_string()
+        };
+        let order: Vec<String> = claimed_order.iter().map(series_of).collect();
+
+        assert_eq!(
+            order,
+            vec![
+                "Breaking Bad (2008)",
+                "Breaking Bad (2008)",
+                "Breaking Bad (2020)",
+                "Breaking Bad (2020)",
+            ],
+            "each show has to be finished before the other is started: {claimed_order:?}"
+        );
+        assert!(
+            claimed_order[0].ends_with("Breaking Bad - S01E01 - Pilot.mkv")
+                && claimed_order[1].ends_with("S01E02 - Cats in the Bag.mkv"),
+            "and ordered by its markers, whether or not the file names the series: {claimed_order:?}"
+        );
     }
 
     #[test]
