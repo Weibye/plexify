@@ -1792,14 +1792,6 @@ mod tests {
                 },
             ),
             (
-                "Series/Veronica Mars S02E04/Season 02/S02E04.mp4",
-                EpisodeSortKey {
-                    series_directory: "Series/Veronica Mars S02E04".to_string(),
-                    season: 2,
-                    episode: 4,
-                },
-            ),
-            (
                 "Series/Elementary/Season 01/Elementary - S01E13.5 - Recap.mkv",
                 EpisodeSortKey {
                     series_directory: "Series/Elementary".to_string(),

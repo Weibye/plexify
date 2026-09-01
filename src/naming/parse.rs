@@ -188,16 +188,12 @@ fn parse_episode(
     let mut series = clean_name(&stem[..whole_marker.start()]);
     if series.is_empty() {
         // The filename carried no name at all, so the directory is the only
-        // evidence left - but a directory carrying an episode marker is not
-        // evidence of what the series is called. It is also a name that cannot
-        // survive the round trip: `render` writes the series in front of the
-        // marker, and the parser reads the series back as whatever precedes the
-        // *first* marker, so a series name holding one of its own would be read
-        // short and prepended again on every run.
+        // evidence left. A directory that states nothing - because it was
+        // nothing but a marker - leaves the name empty, and the parse refuses
+        // below rather than inventing one.
         series = directories
             .last()
             .map(|directory| series_name_from_directory(directory))
-            .filter(|candidate| !episode_marker().is_match(candidate))
             .unwrap_or_default();
     }
     if series.is_empty() {
@@ -276,9 +272,26 @@ pub(super) fn sort_key(path: &str) -> Option<super::EpisodeSortKey> {
 /// The series name a directory component states, stripped of its annotations.
 ///
 /// `Breaking Bad (2008) {tvdb-81189}` names the series `Breaking Bad`; the year
-/// and the identifier describe it rather than being part of its name.
+/// and the identifier describe it rather than being part of its name. An episode
+/// marker that leaked into the directory - `Veronica Mars S02E04` - is the same
+/// kind of noise and comes off for the same reason: it describes one file, so it
+/// cannot be part of what the directory calls the series.
+///
+/// Taking it out rather than refusing the whole candidate is also what makes the
+/// name safe to use. A series name holding a marker cannot survive the round
+/// trip: `render` writes the series in front of the marker and the parser reads
+/// it back as whatever precedes the *first* one, so the name would be read short
+/// and prepended again on every run. What is left after the strip holds no
+/// marker, so there is nothing to read short. A directory that is nothing but a
+/// marker states nothing, and the empty string is what the caller refuses on.
+///
+/// The result is the one reading of a directory in this module, so the fallback
+/// in [`parse_episode`] and the disagreement note in
+/// [`super::series_directory_disagreement`] cannot end up with two.
 pub(super) fn series_name_from_directory(directory: &str) -> String {
-    clean_name(&directory_annotations().replace(directory, ""))
+    let without_annotations = directory_annotations().replace(directory, "");
+
+    clean_name(&episode_marker().replace_all(&without_annotations, ""))
 }
 
 fn parse_season_directory(component: &str) -> Option<SeasonDirectory> {
@@ -627,17 +640,43 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_directory_named_after_an_episode_rather_than_a_series() {
+    fn refuses_a_directory_that_is_nothing_but_an_episode_marker() {
         for path in [
             "Series/S01E01/Season 01/S01E01 - Pilot.mkv",
-            "Series/Veronica Mars S02E04/Season 02/S02E04.mp4",
+            "Series/S01E01/Season 01/S01E02 - Nothing To Go On.mkv",
+            "Series/s01.e01/Season 01/S01E01.mkv",
         ] {
             assert_eq!(
                 parse(path),
                 Err(Unresolvable::NoSeriesName),
-                "a directory holding a marker does not name the series: {path}"
+                "a marker is not a name, and nothing is left once it goes: {path}"
             );
         }
+    }
+
+    /// Issue #134: a marker glued onto a directory is noise, and taking it out
+    /// leaves the name that was there all along.
+    ///
+    /// This runs only where the *file* names nothing, which is the shape that
+    /// makes it worth doing: a season downloaded as `S02E01.mp4` … `S02E22.mp4`
+    /// into `Veronica Mars S02E04/` is 22 files a person can read at a glance
+    /// and had to rename by hand.
+    #[test]
+    fn strips_a_stray_marker_off_a_directory_rather_than_discarding_the_name() {
+        assert_eq!(
+            episode("Series/Veronica Mars S02E04/Season 02/S02E04.mp4").series,
+            "Veronica Mars"
+        );
+        assert_eq!(
+            episode("Series/Veronica Mars S02E04/Season 02/S02E01.mp4").series,
+            "Veronica Mars",
+            "the marker on the directory says nothing about which episode this is"
+        );
+        assert_eq!(
+            episode("Series/Elementary.S06E08 (2012)/Season 06/S06E08.mkv").series,
+            "Elementary",
+            "an annotation and a marker on one directory both come off"
+        );
     }
 
     #[test]
