@@ -751,7 +751,8 @@ mod tests {
     /// target's envelope, and the copy the first was playing is not kept.
     ///
     /// This is a description of a gap, not of an intended behaviour, and it
-    /// asserts what the code does today so that changing it is deliberate.
+    /// asserts what the code does today so that changing it is deliberate
+    /// (#180).
     /// `resolve_one` folds every target's answer into one `Operation` and
     /// `Job::new` derives one output from the input's name, so a pair of
     /// clients that disagree has exactly one destination to land in - and
