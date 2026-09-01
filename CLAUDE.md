@@ -330,10 +330,28 @@ A source over `MIN_CHUNKED_SECONDS` is encoded in `CHUNK_SECONDS` pieces into
 exits successfully. A chunk file existing is therefore the whole record of progress —
 `encode_chunks` skips what is already there — so nothing may create one by any other route.
 The pieces are transport streams because that is the container built to be concatenated;
-separately encoded MP4s each carry their own encoder delay and the audio walks further out of
-sync at every join. Subtitles are held out of the chunks and muxed in during the join, from
-the source, so that no subtitle event is cut in half at a boundary. `reclaim_stranded_jobs`
-leaves the chunk directory alone for exactly this reason.
+separately encoded MP4s each carry their own encoder delay in an edit list the demuxer does
+not read. `reclaim_stranded_jobs` leaves the chunk directory alone for exactly this reason.
+
+**A chunk holds the picture and nothing else.** The audio and the subtitles are both taken
+from the source at the join, and for nearly the same reason. A subtitle event straddling a
+boundary would be cut in half by it; and one FFmpeg run per chunk is one AAC priming frame
+per chunk, which MPEG-TS — having no edit list and no negative timestamp — can only carry by
+spending real time on it. Whether that frame falls inside the length the concat list declares
+for its chunk then varies from chunk to chunk, so the sound steps one AAC frame, 21ms at
+48kHz, back and forth at every boundary while the picture stays where it belongs. Measured
+on a 30s source in 5s pieces: alternating runs of +0.2ms and +21.2ms. Encoding the audio once
+over the whole file is one priming frame in front of an MP4 that has the edit list to hold
+it — which is exactly what the one-pass path already produces, and is why the two paths now
+put the sound in the same place. `the_joined_audio_lands_where_the_source_has_it` is what
+keeps that true; its fixture is 25fps rather than the 10fps the others use, because at 10fps
+a frame interval is five times an AAC frame and the priming disappears inside the picture's
+own reorder delay.
+
+The audio channel cap therefore rides on the join rather than on the chunks. Do not put an
+encoder back in the chunk command to save the join a pass over the source: the join already
+reads that file for its subtitles, so the audio costs no extra I/O, and it is the only place
+the output's sound can be written once.
 
 **The concat list declares each chunk's length, and that is load-bearing.** A chunk never
 ends exactly where `-t` asked it to, because video cuts on a frame boundary and audio on a
@@ -347,18 +365,18 @@ the only thing keeping it right.
 **The plan divides up the container's duration, and a chunk has to produce video to be
 joinable.** A container's duration is the longest of its streams, so it outlives the last
 video frame by the audio encoder's padding - and `plan_chunks` rounds up, so the final chunk
-can begin after the picture has ended. That chunk encodes happily and comes out carrying
-audio alone. The concat demuxer needs every file in its list to declare the same streams;
-given one that does not, the joined MP4's video track is left running a whole frame interval
-past its own last picture. `encode_chunks` therefore treats a chunk that **FFprobe can find no
-video stream in** as the end of the file.
+can begin after the picture has ended. That chunk encodes happily and comes out a few hundred
+bytes long with no video stream in it at all; joined in, it leaves the MP4's video track
+running a whole frame interval past its own last picture. `encode_chunks` therefore treats a
+chunk that **FFprobe can find no video stream in** as the end of the file.
 
-That criterion is narrower than "produced no video", and the difference matters. An MPEG-TS
-chunk still declares a video stream in its PMT on the strength of the audio alone, so a chunk
-holding a genuine audio tail and no picture - a source whose sound outlives its image - does
-not trip the guard and is joined in with its audio intact. What the guard actually catches is
-the sub-kilobyte final chunk that begins past the end of everything, which ffprobe reads as
-having no video stream at all. Nothing is dropped but that.
+A source whose sound outlives its image loses nothing to that. The audio is not in the chunks,
+so the join reads it from the source in full however far the picture got - and the joined
+output then ends where the *source* ends, which is what
+`the_joined_output_ends_where_the_source_ends` measures. That test compares the joined picture
+against the source's **picture**, not against its container: an MKV declares no per-stream
+duration and its container outlives its last frame by the audio encoder's padding, so
+comparing the two would leave a whole AAC frame of room for a fault to sit in.
 
 **Nothing shifts the output timeline to keep it off zero.** Two different things put a negative
 timestamp in front of an MP4 mux, and MP4's edit list is the field built to carry both. An AAC
