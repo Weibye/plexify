@@ -64,10 +64,81 @@ pub struct Scope {
 }
 
 impl Scope {
+    /// A scope whose root the **user stated**, rather than one inferred from the
+    /// shape of the tree.
+    ///
+    /// [`scope_for`] has to guess, and one shape is genuinely undecidable from
+    /// disk: a media root named after a library root that holds exactly one -
+    /// `/srv/Movies` containing only `Movies/`. Nothing below it separates that
+    /// from a duplication, and descending further only moves the guess, since a
+    /// tree rsynced into itself contains season directories too. So the probe
+    /// refuses it, and refusing is the right way to be wrong about a *guess*.
+    ///
+    /// It is the wrong way to be wrong about a fact the user knows. This turns
+    /// the inference off rather than making it cleverer: the root is taken as
+    /// given, no directory is listed, and the only judgement left is whether the
+    /// two paths describe one tree.
+    ///
+    /// The two paths are kept **as the user spelled them**, made absolute and no
+    /// more. Every path validation walks comes out of `scan_path`, so the root
+    /// has to be a prefix of that same spelling for `strip_prefix` to be sound -
+    /// and canonicalising to guarantee it would put a Windows `\\?\` prefix into
+    /// the report and into the fix record, where a person then cannot paste it
+    /// back into the command that produced it.
+    ///
+    /// The price is that two spellings of one directory - a `..` in the middle,
+    /// a differing drive-letter case - are refused rather than reconciled. That
+    /// is the same trade the rest of this area makes: a refusal names the two
+    /// paths and is answered by retyping one of them, which is cheaper than
+    /// being wrong about which tree was meant.
+    ///
+    /// Refuses rather than guesses on both counts: a root that is not a readable
+    /// directory, and a scan path that is not inside it.
+    pub fn stated(library_root: &Path, scan_path: &Path) -> anyhow::Result<Self> {
+        let library_root = absolute(library_root);
+        let scan_path = absolute(scan_path);
+
+        if !library_root.is_dir() {
+            return Err(anyhow::anyhow!(
+                "library root {} is not a readable directory",
+                library_root.display()
+            ));
+        }
+
+        if !scan_path.starts_with(&library_root) {
+            return Err(anyhow::anyhow!(
+                "{} is not inside the library root {}; both are read as spelled, so a '..' or a \
+                 differing drive letter has to be retyped rather than resolved",
+                scan_path.display(),
+                library_root.display()
+            ));
+        }
+
+        Ok(Scope {
+            library_root,
+            scan_path,
+        })
+    }
+
     /// Whether this run covers the whole library.
     pub fn is_whole_library(&self) -> bool {
         self.library_root == self.scan_path
     }
+}
+
+/// Resolve a path against the current directory without otherwise changing it.
+///
+/// A relative path that *starts* at a root - plain `Series/Elementary` - has
+/// nothing before that component to be the library root, so it has to be made
+/// absolute before anything can be measured from it.
+fn absolute(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Work out which library a path belongs to, and how much of it to walk.

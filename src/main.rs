@@ -172,6 +172,11 @@ enum Commands {
         /// Carry out the renames instead of only reporting them
         #[arg(long)]
         fix: bool,
+        /// The directory holding Series/, Anime/ and Movies/, when it cannot be
+        /// worked out from the path - a media root named after a library root
+        /// and holding only one is the case that needs it
+        #[arg(long)]
+        library_root: Option<PathBuf>,
     },
 }
 
@@ -310,15 +315,23 @@ async fn main() -> Result<()> {
                 Err(e) => Err(e),
             }
         }
-        Commands::Validate { path, fix } => {
+        Commands::Validate {
+            path,
+            fix,
+            library_root,
+        } => {
             info!(
-                "Starting validate command for path: {:?}, fix: {}",
-                path, fix
+                "Starting validate command for path: {:?}, fix: {}, library root: {:?}",
+                path, fix, library_root
             );
+            let validate_cmd = match library_root {
+                Some(root) => ValidateCommand::rooted_at(path, root)?,
+                None => ValidateCommand::new(path),
+            };
             let validate_cmd = if fix {
-                ValidateCommand::new(path).fixing()
+                validate_cmd.fixing()
             } else {
-                ValidateCommand::new(path)
+                validate_cmd
             };
 
             match validate_cmd.execute().await {
