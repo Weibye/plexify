@@ -538,6 +538,21 @@ disk; keep it out of parse/render, and keep the count where it is:
   library is recoverable by hand; a file moved to a wrong root is recoverable only through
   `undo`, and only if someone notices.
 
+**`validate --library-root` is how a user states what the probe may not guess**, and it is not
+a loosening of the paragraph above. That argument is about what to *infer* from disk evidence,
+and the answer stays no: nothing below `/srv/Movies` separates a media root from a duplication,
+and descending further only moves the guess, since a tree rsynced into itself contains season
+directories too. The flag adds evidence rather than inference. `Scope::stated` takes the root
+as given, lists no directory, and judges only whether the two paths describe one tree —
+refusing a root that is not a readable directory and a path outside it. Both are kept as the
+user spelled them, made absolute and no more: every path validation walks comes out of
+`scan_path`, so the root has to be a prefix of that same spelling, and canonicalising to
+guarantee that put a verbatim `\\?\` prefix on every Windows path in the report and the fix
+record. The price is that two spellings of one directory — a `..` in the middle, a differing
+drive-letter case — are refused rather than reconciled, and answered by retyping one of them.
+Without the flag `scope_for` is unchanged, so no ordinary library needs it and no existing
+refusal quietly became a guess.
+
 Two further consequences that are easy to break:
 
 - `fix` resolves destinations from `library_root`, never `scan_path`. A destination routinely

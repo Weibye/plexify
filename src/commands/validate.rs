@@ -131,6 +131,19 @@ impl ValidateCommand {
         }
     }
 
+    /// Create a validate command whose library root the user stated.
+    ///
+    /// `scope_for` infers the root from the shape of the tree and refuses one
+    /// shape it cannot decide - a media root named after a library root that
+    /// holds exactly one. This is how a user says which reading is right, and it
+    /// replaces the inference rather than tuning it. See [`Scope::stated`].
+    pub fn rooted_at(path: PathBuf, library_root: PathBuf) -> Result<Self> {
+        Ok(Self {
+            scope: Scope::stated(&library_root, &path)?,
+            fixing: false,
+        })
+    }
+
     /// State that the report will be acted on, so it does not describe itself
     /// as a dry run.
     pub fn fixing(mut self) -> Self {
@@ -1179,6 +1192,124 @@ mod tests {
                 .iter()
                 .any(|issue| issue.path.contains("Batman Begins")),
             "a film sitting in the Movies root is canonical and must not be reported at all"
+        );
+    }
+
+    /// Issue #142: a media root named after a library root and holding exactly
+    /// one, which the probe cannot tell from a duplication and so refuses.
+    ///
+    /// Both halves are asserted here, because the flag is only worth anything if
+    /// the inference really does refuse this tree - a test that only exercised
+    /// the flag would pass whether or not there was a problem to solve.
+    #[tokio::test]
+    async fn a_stated_library_root_resolves_a_tree_the_probe_refuses() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path().join("srv").join("Movies");
+        let film = media_root.join("Movies").join("Batman Begins (2005)");
+        fs::create_dir_all(&film).unwrap();
+        fs::write(film.join("Batman Begins 2005.mkv"), "").unwrap();
+
+        let inferred = ValidateCommand::new(media_root.clone())
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(
+            inferred.needing_decision().count(),
+            1,
+            "the inference reads the media root as the Movies root, so the real one duplicates it"
+        );
+        assert_eq!(inferred.renames().count(), 0);
+
+        let stated = ValidateCommand::rooted_at(media_root.clone(), media_root.clone())
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stated.needing_decision().count(),
+            0,
+            "the root is stated, so nothing below it is a duplication"
+        );
+        assert_eq!(
+            stated
+                .renames()
+                .map(|issue| issue.path.clone())
+                .collect::<Vec<_>>(),
+            vec!["Movies/Batman Begins (2005)/Batman Begins 2005.mkv".to_string()],
+            "and the film below it is judged against that root"
+        );
+    }
+
+    /// The paths reach the report as they were spelled, so what a user reads is
+    /// what they can type back. Canonicalising them to make `strip_prefix` safe
+    /// put a `\\?\` in front of every Windows path instead.
+    #[tokio::test]
+    async fn a_stated_root_reaches_the_report_as_it_was_given() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path().join("srv").join("Movies");
+        fs::create_dir_all(media_root.join("Movies")).unwrap();
+
+        let report = ValidateCommand::rooted_at(media_root.clone(), media_root.clone())
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(report.library_root, media_root);
+        assert_eq!(report.scan_path, media_root);
+    }
+
+    /// The flag states a fact; it does not license a guess. A path outside the
+    /// root it is given, and a root that cannot be read, are both refused.
+    #[tokio::test]
+    async fn a_stated_root_that_does_not_hold_the_path_is_refused() {
+        let temp_dir = TempDir::new().unwrap();
+        let library = temp_dir.path().join("library");
+        let elsewhere = temp_dir.path().join("elsewhere");
+        fs::create_dir_all(library.join("Series")).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+
+        let outside = ValidateCommand::rooted_at(elsewhere, library.clone());
+        assert!(
+            outside.is_err(),
+            "a path outside the stated root describes no one tree"
+        );
+
+        let missing =
+            ValidateCommand::rooted_at(library.join("Series"), temp_dir.path().join("nope"));
+        assert!(
+            missing.is_err(),
+            "a root that cannot be read is a refusal, not a fallback to the inference"
+        );
+    }
+
+    /// Narrowing a run under a stated root still judges from the root, which is
+    /// the property the whole `Scope` split exists for.
+    #[tokio::test]
+    async fn a_stated_root_still_judges_a_narrowed_run_from_the_root() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path().join("srv").join("Series");
+        let season = media_root
+            .join("Series")
+            .join("Elementary")
+            .join("Season 6");
+        fs::create_dir_all(&season).unwrap();
+        fs::write(season.join("Elementary - S06E08 Sand Trap.mkv"), "").unwrap();
+
+        let report = ValidateCommand::rooted_at(season, media_root)
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report
+                .renames()
+                .map(|issue| issue.path.clone())
+                .collect::<Vec<_>>(),
+            vec!["Series/Elementary/Season 6/Elementary - S06E08 Sand Trap.mkv".to_string()],
+            "a path starting at the season directory would name no series at all"
         );
     }
 
