@@ -353,6 +353,15 @@ encoder back in the chunk command to save the join a pass over the source: the j
 reads that file for its subtitles, so the audio costs no extra I/O, and it is the only place
 the output's sound can be written once.
 
+**The join maps a WebM's subtitle without a `?`, and that arm has its own round trip.** A
+WebM's subtitle is a sidecar and is the reason the job exists, so `2:s` is not optional there:
+a sidecar that produced no stream would fail the job outright rather than degrade, and under
+`MAX_ATTEMPTS` that is `_failed` for every long WebM in the library.
+`a_long_webm_is_chunked_and_still_carries_its_sidecar` is what says it does not. Its fixture is
+VP8 and Opus rather than the H.264 and AAC every other chunk fixture uses, because the chunks
+are cut by seeking, and what a seek lands on is a property of the codec rather than of the
+container the MKV fixtures happen to hold.
+
 **The concat list declares each chunk's length, and that is load-bearing.** A chunk never
 ends exactly where `-t` asked it to, because video cuts on a frame boundary and audio on a
 1024-sample AAC frame boundary. Without a `duration` line the demuxer starts each chunk
