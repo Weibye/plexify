@@ -380,14 +380,15 @@ impl JobQueue {
             }
 
             match reclaimed {
-                Reclaimed::Lost | Reclaimed::Counted(FailureDisposition::Lost) => {
-                    debug!("Another worker got to {job_name} first")
-                }
-                Reclaimed::Counted(FailureDisposition::Requeued { .. }) => {
+                Reclaimed::Lost => debug!("Another worker got to {job_name} first"),
+                Reclaimed::Counted { parked: false, .. } => {
                     info!("♻️ Reclaimed abandoned job: {job_name}");
                     outcome.reclaimed.push(job_name);
                 }
-                Reclaimed::Counted(FailureDisposition::Parked { attempts }) => {
+                Reclaimed::Counted {
+                    attempts,
+                    parked: true,
+                } => {
                     warn!(
                         "🚫 {job_name} has taken down {attempts} workers; parking it in _failed."
                     );
@@ -453,7 +454,7 @@ impl JobQueue {
         // would sit in `_in_progress` for good.
         let job_last_written = modified_at(in_progress_path).await;
 
-        let Some(taken_path) = take_for_move(in_progress_path).await else {
+        let Some(taken_path) = take_for_move(in_progress_path).await? else {
             return Ok(Reclaimed::Lost);
         };
         let taken_path = taken_path.as_path();
@@ -518,13 +519,10 @@ impl JobQueue {
         // been enqueued again while the count was being written.
         async_fs::rename(taken_path, &destination).await?;
 
-        if park {
-            Ok(Reclaimed::Counted(FailureDisposition::Parked { attempts }))
-        } else {
-            Ok(Reclaimed::Counted(FailureDisposition::Requeued {
-                attempts,
-            }))
-        }
+        Ok(Reclaimed::Counted {
+            attempts,
+            parked: park,
+        })
     }
 
     /// Move a job file that cannot be read as a job out of `_in_progress`.
@@ -654,8 +652,13 @@ impl SweepOutcome {
 
 /// What the sweep did with one file in `_in_progress`.
 enum Reclaimed {
-    /// The attempt was counted and the job moved on, to `_queue` or `_failed`.
-    Counted(FailureDisposition),
+    /// The attempt was counted and the job moved on: to `_failed` when `parked`,
+    /// otherwise back to `_queue`.
+    ///
+    /// Its own shape rather than a [`FailureDisposition`], because a sweep that
+    /// did not take the job reports [`Reclaimed::Lost`] before it has an attempt
+    /// to count - so a counted-but-lost reclaim is not a state that exists.
+    Counted { attempts: u32, parked: bool },
     /// The file could not be read as a job and was moved to `_failed`.
     Unreadable,
     /// Another sweeper moved the file first; this one did nothing.
@@ -770,19 +773,32 @@ fn quiet_for(seen: Option<SystemTime>, stale_after: Duration) -> bool {
 /// Opening for write cannot create the file, so this fails rather than
 /// resurrecting a job that has moved on. It records nothing except that somebody
 /// was here, which is the one thing a timestamp can say honestly.
-async fn mark_attended(path: &std::path::Path) -> Result<()> {
+///
+/// `Ok(false)` means the job is not there, which is the ordinary way to lose a
+/// race. Anything else is an error, and stays one: on a network work root a
+/// refused open is a work root that has dropped out, and reporting that as
+/// another worker having been quicker would hide it.
+async fn mark_attended(path: &std::path::Path) -> Result<bool> {
     let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let file = std::fs::File::options().write(true).open(&path)?;
-        file.set_times(std::fs::FileTimes::new().set_modified(SystemTime::now()))
+    let marked = tokio::task::spawn_blocking(move || {
+        let file = match std::fs::File::options().write(true).open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        file.set_times(std::fs::FileTimes::new().set_modified(SystemTime::now()))?;
+        Ok(true)
     })
     .await??;
-    Ok(())
+
+    Ok(marked)
 }
 
 /// Take a job out of `_in_progress` so that it can be rewritten and moved on.
 ///
 /// Returns the name it is now held under, or `None` if it is not there to take.
+/// A work root that cannot be reached at all is an error rather than a `None`,
+/// so that a sweep says so instead of reporting a lost race it never ran.
 ///
 /// The mark comes *before* the take, and the order is the whole point. Renaming
 /// preserves the timestamp, so a job taken without one first would sit under its
@@ -796,15 +812,16 @@ async fn mark_attended(path: &std::path::Path) -> Result<()> {
 /// as attended, so the `.taken` file is never quiet while a mover lives. A mover
 /// that dies between the two leaves the job looking fresh for `stale_after` and
 /// the sweep after that collects it, which costs a delay and nothing else.
-async fn take_for_move(in_progress_path: &std::path::Path) -> Option<PathBuf> {
-    if mark_attended(in_progress_path).await.is_err() {
-        return None;
+async fn take_for_move(in_progress_path: &std::path::Path) -> Result<Option<PathBuf>> {
+    if !mark_attended(in_progress_path).await? {
+        return Ok(None);
     }
 
     let taken_path = taken_path_for(in_progress_path);
     match async_fs::rename(in_progress_path, &taken_path).await {
-        Ok(_) => Some(taken_path),
-        Err(_) => None,
+        Ok(_) => Ok(Some(taken_path)),
+        // Somebody else took it between the mark and the rename.
+        Err(_) => Ok(None),
     }
 }
 
@@ -913,7 +930,7 @@ impl<'a> ClaimedJob<'a> {
         // takes that worker's claim, because nothing in a job file or beside it
         // identifies which worker holds it. Telling those apart needs a claim to
         // carry an identity, which is a larger change than this one.
-        let Some(taken_path) = take_for_move(&self.in_progress_path).await else {
+        let Some(taken_path) = take_for_move(&self.in_progress_path).await? else {
             return Ok(FailureDisposition::Lost);
         };
 
@@ -1304,7 +1321,7 @@ mod tests {
             Duration::from_secs(600),
         );
 
-        let taken_path = take_for_move(&in_progress_path).await.unwrap();
+        let taken_path = take_for_move(&in_progress_path).await.unwrap().unwrap();
 
         let swept = queue
             .reclaim_stranded_jobs(Duration::from_secs(300))
@@ -1772,8 +1789,14 @@ mod tests {
         // second sweeper: two workers starting together is the ordinary case.
         // A rewrite only ever adds to a job - an attempt count, an error - so
         // anything shorter than the job as claimed is a write in flight.
+        //
+        // It watches the name the sweep rewrites the job *under*, which is the
+        // `.taken` one, not the name the job was claimed under. Watching the
+        // claim path would leave this test asserting nothing: the rewrite has
+        // not happened there since a mover started taking a job before touching
+        // its contents.
         let whole = std::fs::metadata(&in_progress_path).unwrap().len();
-        let reader = Reader::watching(in_progress_path.clone(), whole);
+        let reader = Reader::watching(taken_path_for(&in_progress_path), whole);
 
         // The rewrite is a small part of what a sweep does, so one sweep is a
         // thin sample of a window that must not exist at all. Each round puts
