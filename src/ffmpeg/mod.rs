@@ -186,8 +186,14 @@ impl FFmpegCommandBuilder {
     /// Chunks are written as transport streams because that is the container
     /// designed to be concatenated: timestamps are explicit and continuous
     /// across a join, where stitching separately encoded MP4s leaves each part
-    /// carrying its own encoder delay and the audio drifting a little further
-    /// out of sync at every boundary.
+    /// carrying its own encoder delay in an edit list the demuxer does not
+    /// read.
+    ///
+    /// What MPEG-TS cannot do is carry an encoder delay at all, since it has no
+    /// edit list and no negative timestamp. That is why a chunk holds the
+    /// picture alone: an AAC frame of priming per chunk would have to occupy
+    /// real time on the chunk's own timeline, and the sound would step at every
+    /// boundary. See [`FFmpegProcessor::process_in_chunks`].
     pub fn with_transport_stream_output(mut self) -> Self {
         self.output_options.extend_from_slice(&[
             "-muxdelay".to_string(),
@@ -212,11 +218,6 @@ impl FFmpegCommandBuilder {
         self.output_options
             .extend_from_slice(&["-c:a".to_string(), "copy".to_string()]);
         self
-    }
-
-    /// Copy video and audio through untouched.
-    pub fn with_video_and_audio_copy(self) -> Self {
-        self.with_video_copy().with_audio_copy()
     }
 
     /// Keep every audio track the source has and encode one more beside them.
@@ -635,17 +636,21 @@ enum SubtitleSource {
     Embedded(SubtitleSelection),
 }
 
-/// Every stream an output takes: video and audio from input 0, and the subtitle
-/// streams that can be carried, from `subtitle_input`.
+/// Every stream an output takes: the picture from input 0, the sound from
+/// `audio_input`, and the subtitle streams that can be carried from
+/// `subtitle_input`.
 ///
 /// Input 0 is the source for a one-pass encode and the list of chunks for the
-/// join that follows a chunked one, and in both it is where the picture and the
-/// sound come from. Only the subtitles are read from somewhere else.
+/// join that follows a chunked one, and in both it is where the picture comes
+/// from. On the one-pass path everything is input 0; the join takes only the
+/// picture from the chunks, and reads the sound and the subtitles from the
+/// source.
 fn media_and_subtitle_mappings(
+    audio_input: usize,
     subtitle_input: usize,
     selection: &SubtitleSelection,
 ) -> Vec<String> {
-    let mut mappings = vec!["0:v".to_string(), "0:a".to_string()];
+    let mut mappings = vec!["0:v".to_string(), format!("{audio_input}:a")];
     mappings.extend(selection.mappings(subtitle_input));
     mappings
 }
@@ -1090,7 +1095,7 @@ impl FFmpegProcessor {
             Some(SubtitleSource::Embedded(selection)) => ffmpeg_builder
                 .with_subtitle_encoding()
                 .with_input(input_path)
-                .with_stream_mapping(&media_and_subtitle_mappings(0, selection)),
+                .with_stream_mapping(&media_and_subtitle_mappings(0, 0, selection)),
         };
 
         self.run(ffmpeg_builder.build(), "conversion").await?;
@@ -1111,9 +1116,18 @@ impl FFmpegProcessor {
     /// the chunk directory *is* the progress, which is the same trade the job
     /// queue makes.
     ///
-    /// Subtitles are deliberately left out of the chunks and muxed in at the
-    /// end, straight from the source. A subtitle event that straddles a chunk
-    /// boundary would otherwise be cut in half by it.
+    /// Only the picture is cut up. Both of the other streams are left out of
+    /// the chunks and taken from the source at the join, for reasons that are
+    /// nearly the same one: a subtitle event straddling a boundary would be cut
+    /// in half by it, and an AAC encoder run per chunk emits a priming frame
+    /// per chunk. MPEG-TS has no edit list to carry that frame in, so it takes
+    /// up real time in the chunk, and whether it lands inside or outside the
+    /// length the concat list declares varies from chunk to chunk. Measured on
+    /// a 30s source in 5s pieces, that stepped the sound one AAC frame - 21ms -
+    /// back and forth at every boundary while the picture stayed put. Encoding
+    /// the audio once, over the whole file, is one priming frame, in front of
+    /// an MP4 that has the edit list to hold it: the same arrangement the
+    /// one-pass encode already produces.
     async fn process_in_chunks(
         &self,
         job: &Job,
@@ -1141,7 +1155,7 @@ impl FFmpegProcessor {
 
         let planned = plan_chunks(duration, self.chunking.chunk_seconds);
         let chunks = self
-            .encode_chunks(job, input_path, &chunk_dir, &planned, source_channels)
+            .encode_chunks(job, input_path, &chunk_dir, &planned)
             .await?;
 
         let list_path = chunk_dir.join("chunks.txt");
@@ -1156,29 +1170,37 @@ impl FFmpegProcessor {
             .collect::<String>();
         tokio::fs::write(&list_path, list.as_bytes()).await?;
 
-        // Joining the chunks copies the streams rather than touching them
-        // again; only the subtitles, which were held back, are encoded here.
-        let mux_builder = FFmpegCommandBuilder::new()
-            .with_overwrite()
-            .with_concat_list(&list_path)
-            .with_video_and_audio_copy()
-            .with_output(output_path);
+        // The picture is copied out of the chunks; the sound and the subtitles
+        // are read from the source, which is input 1, and encoded here. The
+        // cap rides on the audio for the same reason it does everywhere else -
+        // a client that refuses 5.1 refuses it however the file was assembled.
+        let mux_builder = with_encoded_audio(
+            FFmpegCommandBuilder::new()
+                .with_overwrite()
+                .with_concat_list(&list_path)
+                .with_input(input_path)
+                .with_video_copy(),
+            job,
+            job.operation.audio_cap(),
+            source_channels,
+        )
+        .with_output(output_path);
 
         let mux_builder = match subtitles {
-            None => mux_builder.with_stream_mapping(&["0:v", "0:a"]),
+            None => mux_builder.with_stream_mapping(&["0:v", "1:a"]),
+            // The sidecar is a third input of its own: the source is already
+            // input 1, and a WebM's subtitle is not in it.
             Some(SubtitleSource::External(vtt_path)) => mux_builder
                 .with_subtitle_encoding()
                 .with_input(vtt_path.as_path())
-                .with_stream_mapping(&["0:v", "0:a", "1:s"]),
+                .with_stream_mapping(&["0:v", "1:a", "2:s"]),
             // The same selection the one-pass encode was handed, read from the
             // source rather than from the chunks - which hold no subtitles,
             // because a subtitle event straddling a boundary would have been
-            // cut in half by it. Video and audio still come from the chunk
-            // list, input 0; the subtitles come from input 1.
+            // cut in half by it.
             Some(SubtitleSource::Embedded(selection)) => mux_builder
                 .with_subtitle_encoding()
-                .with_input(input_path)
-                .with_stream_mapping(&media_and_subtitle_mappings(1, selection)),
+                .with_stream_mapping(&media_and_subtitle_mappings(1, 1, selection)),
         };
 
         self.run(mux_builder.build(), "joining chunks").await?;
@@ -1200,13 +1222,16 @@ impl FFmpegProcessor {
     /// exited successfully, so a finished chunk file existing is what says the
     /// work behind it is sound and can be skipped. That rename is the whole
     /// resume mechanism - nothing else is written down.
+    ///
+    /// A chunk carries the picture alone. The audio is encoded once at the
+    /// join instead, because an encoder run per chunk is a priming frame per
+    /// chunk and MPEG-TS has nowhere to put one but the timeline itself.
     async fn encode_chunks(
         &self,
         job: &Job,
         input_path: &Path,
         chunk_dir: &Path,
         chunks: &[Chunk],
-        source_channels: &[u32],
     ) -> Result<Vec<Chunk>> {
         let total = chunks.len();
 
@@ -1227,24 +1252,15 @@ impl FFmpegProcessor {
 
             let partial_path = chunk.partial_path(chunk_dir);
 
-            // The chunk carries the cap, not just the join: the join copies
-            // what the chunks hold, so a 5.1 chunk is a 5.1 output however the
-            // pieces are stitched back together. This is the path a film takes,
-            // which is where a surround track is most likely to be.
-            let mut builder = with_encoded_audio(
-                FFmpegCommandBuilder::new()
-                    .with_generated_pts()
-                    .with_overwrite()
-                    .with_seek(chunk.start)
-                    .with_input(input_path)
-                    .with_stream_mapping(&["0:v", "0:a"])
-                    .with_video_encoding(&job.quality_settings),
-                job,
-                job.operation.audio_cap(),
-                source_channels,
-            )
-            .with_transport_stream_output()
-            .with_output(&partial_path);
+            let mut builder = FFmpegCommandBuilder::new()
+                .with_generated_pts()
+                .with_overwrite()
+                .with_seek(chunk.start)
+                .with_input(input_path)
+                .with_stream_mapping(&["0:v"])
+                .with_video_encoding(&job.quality_settings)
+                .with_transport_stream_output()
+                .with_output(&partial_path);
 
             if let Some(chunk_duration) = chunk.duration {
                 builder = builder.with_duration(chunk_duration);
@@ -1259,22 +1275,14 @@ impl FFmpegProcessor {
             // The plan came from the container's duration, which is the longest
             // of its streams - so the final chunk can begin after the last
             // video frame, and `plan_chunks` rounds up, so it can begin after
-            // the audio has ended too. What comes out is a chunk of a few
-            // hundred bytes that ffprobe can find no video stream in at all.
+            // everything has ended. What comes out is a chunk of a few hundred
+            // bytes that ffprobe can find no video stream in at all, and
+            // joining it leaves the MP4's video track running a whole frame
+            // interval past its own last picture.
             //
-            // The concat demuxer needs every file in its list to declare the
-            // same streams. Given one that does not, the joined MP4's video
-            // track is left running a whole frame interval past its own last
-            // picture. So the criterion is exactly what is asked below: a chunk
-            // no video stream can be found in is the end of the file.
-            //
-            // That is narrower than "produced no video", and deliberately. A
-            // chunk that holds a real audio tail and no picture - a source
-            // whose sound outlives its image - still declares a video stream in
-            // its PMT, so it does not trip this and is joined in with its audio
-            // intact. Measured: 2s chunks past the last frame carry 0 video and
-            // 95 audio packets and are kept; only the sub-kilobyte final chunk
-            // is dropped.
+            // A source whose sound outlives its image loses nothing to this:
+            // the audio is not in the chunks at all, and the join reads it from
+            // the source in full however far the picture got.
             if self.probe_video_stream_count(&partial_path).await == Some(0) {
                 let _ = tokio::fs::remove_file(&partial_path).await;
                 debug!(
@@ -1883,9 +1891,8 @@ mod tests {
             .with_overwrite()
             .with_seek(600.0)
             .with_input("/media/film.mkv")
-            .with_stream_mapping(&["0:v", "0:a"])
+            .with_stream_mapping(&["0:v"])
             .with_video_encoding(&quality)
-            .with_audio_encoding(&quality)
             .with_transport_stream_output()
             .with_output("/work/00002.ts.part")
             .with_duration(300.0)
@@ -1907,21 +1914,35 @@ mod tests {
         // Subtitles are held back for the join, so a subtitle spanning a chunk
         // boundary is not cut in half by it.
         assert!(!joined.contains("0:s"));
+        // And so is the audio: one AAC encoder run per chunk is one priming
+        // frame per chunk, and MPEG-TS has to spend real time on it.
+        assert!(!joined.contains("0:a"), "{joined}");
+        assert!(!joined.contains("-c:a"), "{joined}");
     }
 
     #[test]
-    fn the_join_copies_the_chunks_and_takes_subtitles_from_the_source() {
-        let args = FFmpegCommandBuilder::new()
-            .with_overwrite()
-            .with_concat_list("/work/chunks.txt")
-            .with_video_and_audio_copy()
-            .with_subtitle_encoding()
-            .with_output("/work/film.mp4")
-            .with_input("/media/film.mkv")
-            .with_stream_mapping(&["0:v", "0:a", "1:s?"])
-            .build();
+    fn the_join_copies_the_picture_and_takes_everything_else_from_the_source() {
+        let job = job_for(
+            "/media/film.mkv",
+            MediaFileType::Mkv,
+            Operation::Reencode { channels: Some(2) },
+        );
 
-        let joined = args.join(" ");
+        let joined = with_encoded_audio(
+            FFmpegCommandBuilder::new()
+                .with_overwrite()
+                .with_concat_list("/work/chunks.txt")
+                .with_input("/media/film.mkv")
+                .with_video_copy(),
+            &job,
+            job.operation.audio_cap(),
+            &[6],
+        )
+        .with_subtitle_encoding()
+        .with_output("/work/film.mp4")
+        .with_stream_mapping(&["0:v", "1:a", "1:s?"])
+        .build()
+        .join(" ");
 
         // `-f concat` applies to the input that follows it, so the chunk list
         // has to be input 0 and the source input 1.
@@ -1929,9 +1950,16 @@ mod tests {
             joined.contains("-f concat -safe 0 -i /work/chunks.txt -i /media/film.mkv"),
             "{joined}"
         );
-        assert!(joined.contains("-c:v copy -c:a copy"));
-        assert!(joined.contains("-c:s mov_text"));
-        assert!(joined.ends_with("/work/film.mp4"));
+        // Only the picture is copied. The sound is encoded here, once, rather
+        // than a chunk at a time.
+        assert!(joined.contains("-c:v copy"), "{joined}");
+        assert!(!joined.contains("-c:a copy"), "{joined}");
+        assert!(joined.contains("-c:a aac"), "{joined}");
+        // And the cap comes with it, because this is now the only place the
+        // output's audio is written.
+        assert!(joined.contains("-ac:a:0 2"), "{joined}");
+        assert!(joined.contains("-c:s mov_text"), "{joined}");
+        assert!(joined.ends_with("/work/film.mp4"), "{joined}");
     }
 
     /// A job for one path, carrying the operation the caller chose.
@@ -2014,36 +2042,6 @@ mod tests {
         assert!(joined.contains("-c:v libx264"), "{joined}");
         assert!(joined.contains("-c:a aac"), "{joined}");
         assert!(joined.contains("-ac:a:0 2"), "{joined}");
-    }
-
-    /// The same rule, on the path a film actually takes. The join copies what
-    /// the chunks hold, so a chunk encoded at 5.1 is a 5.1 output however the
-    /// pieces are stitched back together - and it is the long sources, which
-    /// are the ones that get chunked, that carry surround.
-    #[test]
-    fn a_chunk_carries_the_cap_because_the_join_only_copies_what_it_finds() {
-        let job = job_for(
-            "/media/film.mkv",
-            MediaFileType::Mkv,
-            Operation::Reencode { channels: Some(2) },
-        );
-
-        let joined = with_encoded_audio(
-            FFmpegCommandBuilder::new()
-                .with_input("/media/film.mkv")
-                .with_stream_mapping(&["0:v", "0:a"])
-                .with_video_encoding(&job.quality_settings),
-            &job,
-            job.operation.audio_cap(),
-            &[6],
-        )
-        .with_transport_stream_output()
-        .with_output("/work/00000.ts.part")
-        .build()
-        .join(" ");
-
-        assert!(joined.contains("-ac:a:0 2"), "{joined}");
-        assert!(joined.contains("-f mpegts"), "{joined}");
     }
 
     /// `-ac` sets a channel count rather than limiting one, so a cap applied
@@ -2337,7 +2335,7 @@ mod tests {
 
         let args = FFmpegCommandBuilder::new()
             .with_input("/in.mkv")
-            .with_stream_mapping(&media_and_subtitle_mappings(0, &selection))
+            .with_stream_mapping(&media_and_subtitle_mappings(0, 0, &selection))
             .with_output("/out.mp4")
             .build();
 
@@ -2380,6 +2378,79 @@ mod tests {
     /// The same, with subtitles the caller chooses.
     fn build_source(path: &Path, seconds: u32, srt: &str) {
         build_source_with_audio(path, seconds, srt, "aac")
+    }
+
+    /// Build a short MKV whose sound says where in the file it is: a 100ms
+    /// 1kHz tone at the start of every second, silence in between.
+    ///
+    /// A continuous tone cannot show a timing fault, because every part of it
+    /// looks like every other part. Marks a whole AAC frame apart can, and are
+    /// what `beep_starts` reads back.
+    ///
+    /// 25fps rather than the 10fps the other fixtures use, and that is
+    /// load-bearing. A chunk's own timeline has to hold both the picture's
+    /// reorder delay and the audio encoder's priming frame, and at 10fps a
+    /// frame interval is five times an AAC frame, so the priming disappears
+    /// inside it and every chunk comes out with the same offset. What is being
+    /// measured only shows where the two are comparable.
+    fn build_beeping_source(path: &Path, seconds: u32) {
+        let built = std::process::Command::new("ffmpeg")
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("testsrc=duration={seconds}:size=160x120:rate=25"),
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("sine=frequency=1000:sample_rate=48000:duration={seconds}"),
+                "-af",
+                "volume=0:enable='gte(mod(t,1),0.1)'",
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-c:a",
+                "aac",
+                "-y",
+            ])
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(built.success(), "could not build the beeping test source");
+    }
+
+    /// Where each tone begins, as `silencedetect` hears it.
+    ///
+    /// The same detector is run over the source and over the output, so the
+    /// two lists are directly comparable: whatever the encoder's window does
+    /// to the attack, it does to both.
+    ///
+    /// The last run of silence is dropped. It is ended by the end of the file
+    /// rather than by a tone, so where it falls says only how much padding the
+    /// encoder left, which is not what any of this is measuring.
+    fn beep_starts(path: &Path) -> Vec<f64> {
+        let output = std::process::Command::new("ffmpeg")
+            .args(["-v", "info", "-i"])
+            .arg(path)
+            .args(["-af", "silencedetect=n=-40dB:d=0.2", "-f", "null", "-"])
+            .output()
+            .unwrap();
+
+        let mut marks: Vec<f64> = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter_map(|line| line.split("silence_end: ").nth(1))
+            .filter_map(|rest| rest.split_whitespace().next())
+            .filter_map(|value| value.parse().ok())
+            .collect();
+        marks.pop();
+        marks
     }
 
     /// The same again, with the source's audio codec the caller's choice.
@@ -2695,6 +2766,72 @@ mod tests {
         }
     }
 
+    /// The sound of a joined file has to sit where the source's does at every
+    /// boundary, not only at the first one.
+    ///
+    /// This is what an AAC encoder run per chunk cost. MPEG-TS has no edit
+    /// list, so each chunk's priming frame took up real time on that chunk's
+    /// own timeline, and whether it fell inside the length the concat list
+    /// declares varied from chunk to chunk. The sound stepped one AAC frame -
+    /// 21ms at 48kHz - back and forth at every boundary while the picture
+    /// stayed where it belonged. An offset is one thing; sync that changes
+    /// every few minutes is another, and it also puts a floor under any later
+    /// measurement of A/V alignment.
+    ///
+    /// The tolerance is a quarter of that step, which is wide enough for what
+    /// re-encoding does to the attack of a tone and narrow enough that the
+    /// step itself cannot hide inside it. Measured with FFmpeg 9.0 on Windows:
+    /// every mark 0.2ms late once the audio is encoded once, and a run of
+    /// eight marks 21.2ms late between two that are not when it is encoded a
+    /// chunk at a time.
+    #[tokio::test]
+    async fn the_joined_audio_lands_where_the_source_has_it() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("film.mkv");
+        // Long enough to cross five boundaries. The fault alternates, so a
+        // source crossing one could show nothing at all.
+        build_beeping_source(&input, 12);
+
+        let work_folder = temp.path().join("work");
+        std::fs::create_dir_all(&work_folder).unwrap();
+
+        let job = chunking_job(&input);
+        FFmpegProcessor::new(false)
+            .with_chunking(TEST_CHUNKING)
+            .process_job(&job, None, Some(&work_folder))
+            .await
+            .unwrap();
+
+        let output = job.work_folder_output_path(&work_folder);
+
+        let source = beep_starts(&input);
+        let joined = beep_starts(&output);
+
+        assert!(
+            source.len() > 5,
+            "the fixture must carry a mark on either side of several boundaries: {source:?}"
+        );
+        assert_eq!(
+            source.len(),
+            joined.len(),
+            "the output has {} marks against the source's {}: {joined:?} vs {source:?}",
+            joined.len(),
+            source.len()
+        );
+
+        for (expected, actual) in source.iter().zip(&joined) {
+            assert!(
+                (actual - expected).abs() < 0.005,
+                "a mark the source has at {expected}s is at {actual}s in the joined output: \
+                 {joined:?} against {source:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn the_joined_output_ends_where_the_source_ends() {
         if !ffmpeg_present() {
@@ -2731,17 +2868,26 @@ mod tests {
         let output = job.work_folder_output_path(&work_folder);
 
         // The container's duration is the longest of its streams, so the plan's
-        // final chunk can begin after the last picture and hold nothing but the
-        // audio encoder's padding. Joined in, that chunk leaves the video track
-        // running a whole frame interval past its own last frame.
+        // final chunk can begin after the last picture and hold nothing at all.
+        // Joined in, that chunk leaves the video track running a whole frame
+        // interval past its own last frame.
         //
         // The same figure catches a boundary that stopped declaring its length,
         // because that error is per boundary and this source crosses ten of
         // them.
+        //
+        // The picture is measured against the source's *picture*, not against
+        // its container: an MKV declares no per-stream duration, and its
+        // container outlives its last frame by the audio encoder's padding, so
+        // comparing the two would leave a whole AAC frame of room for a fault
+        // to sit in.
+        let source_frames = packet_times(&input, "v");
+        let source_video = source_frames.last().unwrap()
+            + (source_frames[source_frames.len() - 1] - source_frames[source_frames.len() - 2]);
         let video = probed_stream_duration(&output, "v");
         assert!(
-            (video - source_duration).abs() < 0.02,
-            "the joined video runs {video}s against a {source_duration}s source"
+            (video - source_video).abs() < 0.02,
+            "the joined video runs {video}s against a {source_video}s source picture"
         );
 
         let audio = probed_stream_duration(&output, "a");
@@ -2780,7 +2926,7 @@ mod tests {
 
         // A worker gets part-way through and is killed.
         processor
-            .encode_chunks(&job, &input, &chunk_dir, &chunks[..1], &[])
+            .encode_chunks(&job, &input, &chunk_dir, &chunks[..1])
             .await
             .unwrap();
 
@@ -2789,7 +2935,7 @@ mod tests {
 
         // The next worker picks the job back up and finishes it.
         let encoded = processor
-            .encode_chunks(&job, &input, &chunk_dir, &chunks, &[])
+            .encode_chunks(&job, &input, &chunk_dir, &chunks)
             .await
             .unwrap();
 
@@ -2898,7 +3044,7 @@ mod tests {
         let chunks = plan_chunks(probed_duration(&input), TEST_CHUNKING.chunk_seconds);
         processor.prepare_chunk_dir(&job, &chunk_dir).await.unwrap();
         processor
-            .encode_chunks(&job, &input, &chunk_dir, &chunks[..1], &[])
+            .encode_chunks(&job, &input, &chunk_dir, &chunks[..1])
             .await
             .unwrap();
         assert!(chunks[0].path(&chunk_dir).exists());
@@ -2940,7 +3086,7 @@ mod tests {
         let chunks = plan_chunks(probed_duration(&input), TEST_CHUNKING.chunk_seconds);
         processor.prepare_chunk_dir(&job, &chunk_dir).await.unwrap();
         processor
-            .encode_chunks(&job, &input, &chunk_dir, &chunks[..1], &[])
+            .encode_chunks(&job, &input, &chunk_dir, &chunks[..1])
             .await
             .unwrap();
 
@@ -2972,7 +3118,7 @@ mod tests {
         let chunks = plan_chunks(probed_duration(&input), TEST_CHUNKING.chunk_seconds);
         processor.prepare_chunk_dir(&job, &chunk_dir).await.unwrap();
         processor
-            .encode_chunks(&job, &input, &chunk_dir, &chunks[..1], &[])
+            .encode_chunks(&job, &input, &chunk_dir, &chunks[..1])
             .await
             .unwrap();
         assert!(chunk_dir.exists());
