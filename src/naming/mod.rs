@@ -820,6 +820,12 @@ mod tests {
             "S.W.A.T",
             "S01E01",
             "Veronica Mars S02E04",
+            // Markers a directory can carry other than at the end, more than one
+            // of them, and one alongside an annotation. Each leaves a different
+            // remainder for the round trip to be wrong about.
+            "S02E04 Veronica Mars",
+            "Veronica Mars S02E04 (2004)",
+            "Veronica Mars S02E04-S02E05",
             "Show.S01",
         ];
         let season_directories = [
@@ -915,6 +921,10 @@ mod tests {
             // The filename names no series, so the directory is where the name
             // came from and cannot contradict it.
             "Series/Breaking Bad/Season 01/S01E01 - Pilot.mkv",
+            // Same, with a marker glued onto the directory. Both readings of a
+            // directory go through one function, so the name the parse took out
+            // of it cannot then be reported as disagreeing with it.
+            "Series/Veronica Mars S02E04/Season 02/S02E01.mp4",
             // A film has no series directory to disagree with.
             "Movies/The Dark Knight (2008)/The Dark Knight (2008).mkv",
             // A path that cannot be parsed says nothing about anything.
