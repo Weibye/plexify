@@ -501,6 +501,26 @@ Consequences to preserve when changing it:
   marker and the arc name is curated information - but only where the directory already
   agrees with the marker, since a file moving seasons cannot carry the old arc name along.
 
+**A marker that stops in the middle of a marker has dropped a value.** One file can hold two
+episodes, and `S04E01-E02` is how it says so. Reading only the first left `-E02` to be
+absorbed as the opening of a title, which round-tripped perfectly - the destination
+`S04E01 - E02 - Charmed Again` parsed to those same fields and rendered back to itself - while
+saying the file holds one episode when it holds two. So the marker carries a range, `Episode`
+carries `through`, and `render` writes the one form Plex reads for it. The rule that decides
+the grammar is **the second number has to say it is an episode**: `-E02` and `-S01E02` do,
+which is why both are read and the second is normalised onto the first; a bare `-02` does not,
+and reading it as one would invent the value this exists to protect. Glued is also the whole
+of the distinction from a title - `- E02 Is A Title` is spaced, so it is prose. A range whose
+two halves name different seasons is refused: no one name states it, and neither season
+directory is the right one.
+
+`no_path_is_renamed_twice` cannot see any of this, and that is why it went unnoticed for as
+long as it did: it checks that `render(parse(p))` is *stable*, not that `parse` discarded
+nothing, and a round trip through a lossy parse is still a round trip. No check on the text
+catches it either, since `E02` is in the destination either way and only its position says
+what it is. `a_marker_never_stops_in_the_middle_of_a_marker` is the invariant that does, and
+it asserts adjacency rather than content.
+
 **A queue order is not a destination, and `naming::sort_key` is where that is said.** The
 `work --priority episode` prioritiser is the module's other caller, and it wants something
 different from `parse`. A destination has to be right - a wrong one moves a file somewhere

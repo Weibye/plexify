@@ -3,7 +3,7 @@
 //! This is the only place that decides what a path in this library looks like:
 //!
 //! ```text
-//! {Root}/{Series Directory}/Season {NN}/{Series} - S{NN}E{NN} - {Title} [{quality}].{ext}
+//! {Root}/{Series Directory}/Season {NN}/{Series} - S{NN}E{NN}[-E{NN}] - {Title} [{quality}].{ext}
 //! {Root}/{Film Directory}/{Title} ({Year}) [{quality}].{ext}
 //! ```
 //!
@@ -54,6 +54,12 @@ fn render_episode(episode: &Episode) -> String {
         "{} - S{:02}E{:02}",
         episode.series, episode.season, episode.number
     );
+    // A file covering two episodes says so, in the one form Plex reads for it.
+    // It joins the marker with a bare hyphen and no spaces, which is what keeps
+    // it a marker: spaced, it would be read back as the start of a title.
+    if let Some(through) = episode.through {
+        filename.push_str(&format!("-E{through:02}"));
+    }
     if let Some(title) = &episode.title {
         filename.push_str(" - ");
         filename.push_str(title);
@@ -117,6 +123,7 @@ mod tests {
             series: "Elementary".to_string(),
             season: 6,
             number: 8,
+            through: None,
             title: Some("Sand Trap".to_string()),
             quality: None,
             extension: "mkv".to_string(),
@@ -154,6 +161,23 @@ mod tests {
         assert_eq!(
             render(&MediaName::Episode(with_quality)),
             "Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap [1080p60].mkv"
+        );
+    }
+
+    /// Issue #198: one file holding two episodes states both, and states them
+    /// where a reader and a scanner both look for them - in the marker.
+    #[test]
+    fn a_double_episode_keeps_both_of_its_numbers() {
+        let double = Episode {
+            number: 1,
+            through: Some(2),
+            title: Some("Charmed Again".to_string()),
+            ..episode()
+        };
+
+        assert_eq!(
+            render(&MediaName::Episode(double)),
+            "Series/Elementary/Season 06/Elementary - S06E01-E02 - Charmed Again.mkv"
         );
     }
 
@@ -305,6 +329,15 @@ mod tests {
             }),
             MediaName::Episode(Episode {
                 nested_directories: vec!["Extras".to_string()],
+                ..episode()
+            }),
+            MediaName::Episode(Episode {
+                through: Some(9),
+                ..episode()
+            }),
+            MediaName::Episode(Episode {
+                through: Some(9),
+                title: None,
                 ..episode()
             }),
         ];
