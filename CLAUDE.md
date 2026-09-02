@@ -501,6 +501,33 @@ Consequences to preserve when changing it:
   marker and the arc name is curated information - but only where the directory already
   agrees with the marker, since a file moving seasons cannot carry the old arc name along.
 
+**A marker that stops in the middle of a marker has dropped a value.** One file can hold two
+episodes, and `S04E01-E02` is how it says so. Reading only the first left `-E02` to be
+absorbed as the opening of a title, which round-tripped perfectly - the destination
+`S04E01 - E02 - Charmed Again` parsed to those same fields and rendered back to itself - while
+saying the file holds one episode when it holds two. So the marker carries a range, `Episode`
+carries `through` - the last episode covered, so `S04E01-E03` is a span of three - and
+`render` writes the one form the library actually holds. Two rules decide the rest of the
+grammar, and they pull in opposite directions:
+
+- **The second number has to say it is an episode.** A bare `-02` is a part number or a
+  release fragment as often as an episode, so it is not read; reading it would invent the
+  value this exists to protect. Glued is also the whole of the distinction from a title -
+  `- E02 Is A Title` is spaced, so it is prose.
+- **A shape with no canonical form is refused, never read short.** `S04E01-S04E02`,
+  `S04E01-E02-E03` and `S04E01-E02.5` are each matched by the marker *in order to be
+  refused*: a marker that stops in the middle of itself hands the rest to the title, which is
+  this bug one episode further along. None occurs in the library, and a form nobody has does
+  not earn a second accepted spelling - Plex reading a form is an argument for rendering it,
+  not for parsing it.
+
+`no_path_is_renamed_twice` cannot see any of this, and that is why it went unnoticed for as
+long as it did: it checks that `render(parse(p))` is *stable*, not that `parse` discarded
+nothing, and a round trip through a lossy parse is still a round trip. No check on the text
+catches it either, since `E02` is in the destination either way and only its position says
+what it is. `a_marker_never_stops_in_the_middle_of_a_marker` is the invariant that does, and
+it asserts adjacency rather than content.
+
 **A queue order is not a destination, and `naming::sort_key` is where that is said.** The
 `work --priority episode` prioritiser is the module's other caller, and it wants something
 different from `parse`. A destination has to be right - a wrong one moves a file somewhere

@@ -1741,6 +1741,8 @@ mod tests {
             "Series/Critical Role/Season 01 - Vox Machina/Critical Role S01E12 Kraghammer.mkv",
             "Series/The Wire/Season 02/the.wire.s02e05.1080p.mkv",
             "Series/Charmed/Charmed - S06E12 - Prince Charmed.mkv",
+            // A double episode is ordered by the first episode it covers.
+            "Series/Charmed/Season 04/Charmed - S04E01-E02 - Charmed Again.avi",
             "Series/Elementary/Season 01/Elementary - S01E02 - Extras/S01E02 clip.mkv",
             "Anime/One Piece/Season 01/One Piece - S01E108 - Dashing Onto The Scene.mkv",
             "Anime/Attack on Titan/Season 01/Attack on Titan S01E05 First Battle.mkv",

@@ -55,7 +55,13 @@ Rules that hold across every entry:
   settled it: three arc-named Critical Role seasons all render correctly, and the one season
   that failed to appear in Plex was the one whose *files* carried no `SxxExx` marker. The
   marker is what Plex reads; the directory name is decoration.
-- `SxxExx` markers are uppercase.
+- `SxxExx` markers are uppercase. One file holding two episodes states both, glued to the
+  marker with a bare hyphen: `Charmed - S04E01-E02 - Charmed Again.avi`, where the second
+  number is the last episode covered. A bare `S01E01-02` is not read as a range, because a
+  number that does not say it is an episode could be a part number and reading it as one
+  would invent a value. `S01E01-S01E02`, `S01E01-E02-E03` and `S01E01-E02.5` are matched and
+  then **refused**: none is in the library, and a marker that stopped short of them would
+  hand the remainder to the title, which is the bug in #198 one episode along.
 - A dash with surrounding spaces separates series name, episode marker, and episode title.
 - Quality metadata goes in square brackets and comes after the title, with no dash before
   it: `... - Uno [1080p].mkv`.
@@ -79,6 +85,12 @@ Constraints that are easy to get wrong:
 - **Whatever `render` emits must parse back to the same fields.** Otherwise a fix moves a
   file, and the next run moves it again. `what_is_rendered_parses_back_to_the_same_fields`
   and `every_proposed_destination_is_itself_canonical` guard this; keep both passing.
+- **A stable round trip is not a lossless one.** Those tests ask whether a destination would
+  be renamed again, which a parse that quietly discarded half the marker also satisfies —
+  that is how a double episode was proposed a name saying it holds one. Whatever the parser
+  drops, it has to be something no grammar reads as a value:
+  `a_marker_never_stops_in_the_middle_of_a_marker` is the check with teeth here, and adding a
+  form to the marker means adding it there too.
 - **Rules apply per path component.** A component with no rule is preserved, and the series
   directory has no rule — it is never renamed, because this runs against a library nobody
   can reconstruct.

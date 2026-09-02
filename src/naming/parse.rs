@@ -47,13 +47,47 @@ const AMBIGUOUS_RELEASE_TOKENS: &[&str] = &[
     "subbed",
 ];
 
-/// `S01E02`, `s1e2`, `S01.E02` - the marker that makes a file an episode.
+/// `S01E02`, `s1e2`, `S01.E02` - the marker that makes a file an episode, and
+/// `S01E01-E02` - the marker that makes it two.
+///
+/// Groups are named because three callers read them and a fourth would otherwise
+/// have to count.
 fn episode_marker() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    // The trailing group catches `S01E13.5`, a half episode. It is captured
-    // rather than ignored so the parser can refuse it instead of reading `E13`
-    // and quietly putting it on top of the real one.
-    RE.get_or_init(|| Regex::new(r"(?i)\bs(\d{1,3})[\s._-]*e(\d{1,3})(\.\d{1,2})?\b").unwrap())
+    // `fraction` catches `S01E13.5`, a half episode. It is captured rather than
+    // ignored so the parser can refuse it instead of reading `E13` and quietly
+    // putting it on top of the real one.
+    //
+    // `through` is the same problem from the other side: a file covering two
+    // episodes states the second one, and stopping the marker at the first read
+    // `-E02` as the opening of a title. That is a value being dropped, not noise,
+    // so the marker has to reach the end of what it names.
+    //
+    // The second number has to **say it is an episode** - never a bare `-02`. A
+    // bare number after a marker is a part number, a year, or a release fragment
+    // as often as it is an episode, and reading it as one would be inventing the
+    // value this exists to stop being lost. Separators are not allowed around the
+    // hyphen either: ` - E02` is how a title begins.
+    //
+    // `through_season`, `through_fraction` and `excess` are matched and then
+    // refused by the caller, which is the point of matching them: a marker that
+    // stops in the middle of itself hands the rest to the title, and
+    // `S04E01-E02-E03` truncated to `S04E01-E02 - E03` is issue #198 one episode
+    // further along. None of the three occurs in the library, so none of them
+    // earns a rendering - but each has to be *seen* to be refused.
+    RE.get_or_init(|| {
+        Regex::new(
+            r"(?ix)
+              \b s (?P<season>\d{1,3}) [\s._-]* e (?P<episode>\d{1,3}) (?P<fraction>\.\d{1,2})?
+              (?:
+                - (?: s (?P<through_season>\d{1,3}) [\s._-]* )? e (?P<through>\d{1,3})
+                (?P<through_fraction>\.\d{1,2})?
+              )?
+              (?P<excess> (?: - (?: s\d{1,3}[\s._-]* )? e\d{1,3} (?:\.\d{1,2})? )+ )?
+              \b",
+        )
+        .unwrap()
+    })
 }
 
 /// `Season 6`, `season 06 - The Arc Name`.
@@ -154,17 +188,45 @@ fn parse_episode(
 
     // `S01E13.5` is a half episode - a recap or a special that sits between two
     // numbered ones. There is no canonical form for it, and rounding it to E13
-    // would put it on top of the real E13.
-    if marker.get(3).is_some() {
+    // would put it on top of the real E13. A fraction on the far end of a range,
+    // `S04E01-E02.5`, is the same thing and is refused for the same reason.
+    if marker.name("fraction").is_some() || marker.name("through_fraction").is_some() {
         return Err(Unresolvable::FractionalEpisode);
     }
 
-    let season = marker[1]
-        .parse()
-        .map_err(|_| Unresolvable::NoEpisodeMarker)?;
-    let number = marker[2]
-        .parse()
-        .map_err(|_| Unresolvable::NoEpisodeMarker)?;
+    let number_at = |name: &str| -> Result<u32, Unresolvable> {
+        marker
+            .name(name)
+            .ok_or(Unresolvable::NoEpisodeMarker)?
+            .as_str()
+            .parse()
+            .map_err(|_| Unresolvable::NoEpisodeMarker)
+    };
+
+    let season = number_at("season")?;
+    let number = number_at("episode")?;
+
+    // A range written out in full - `S01E01-S01E02` - is matched so that the
+    // marker does not stop in the middle of itself, and then refused. The
+    // library holds none, and one accepted spelling of a range is the whole
+    // point of having a canonical form; where the two seasons differ there is no
+    // single name for the file and no season directory to put it in either.
+    if marker.name("through_season").is_some() {
+        return Err(Unresolvable::EpisodeRangeStatesItsSeasonTwice);
+    }
+
+    // `S04E01-E02-E03`. A range is two ends, and `through` is the last episode
+    // covered - a span of three written `S04E01-E03` is already read. A marker
+    // that lists them instead has no canonical form and no instance in the
+    // library, so it is refused rather than read down to its first two.
+    if marker.name("excess").is_some() {
+        return Err(Unresolvable::EpisodeRangeNamesMoreThanTwo);
+    }
+
+    let through = match marker.name("through") {
+        Some(_) => Some(number_at("through")?),
+        None => None,
+    };
 
     // Find the season directory anywhere in the chain rather than only at the
     // end: a file in `Season 01/Extras` is still in season one, and treating
@@ -213,6 +275,7 @@ fn parse_episode(
         series,
         season,
         number,
+        through,
         title,
         quality,
         extension: extension.to_string(),
@@ -239,13 +302,14 @@ pub(super) fn sort_key(path: &str) -> Option<super::EpisodeSortKey> {
 
     let (filename, directories) = below_root.split_last()?;
 
-    // Group 3 - the `.5` of a half episode - is deliberately not consulted. It
-    // makes `parse` refuse, because there is no canonical *name* for half an
-    // episode, but ordering `S01E13.5` alongside `S01E13` is right, and a tie
-    // between them costs nothing.
+    // Only the first two numbers are consulted. The `.5` of a half episode makes
+    // `parse` refuse, because there is no canonical *name* for half an episode,
+    // but ordering `S01E13.5` alongside `S01E13` is right and a tie between them
+    // costs nothing. A double episode is ordered by the first episode it covers,
+    // which is where a person watching in order meets it.
     let marker = episode_marker().captures(filename)?;
-    let season = marker[1].parse().ok()?;
-    let episode = marker[2].parse().ok()?;
+    let season = marker.name("season")?.as_str().parse().ok()?;
+    let episode = marker.name("episode")?.as_str().parse().ok()?;
 
     // The season directory is not part of the group: it is what the marker
     // orders within. Everything above it is, including the root, so that a
@@ -590,6 +654,86 @@ mod tests {
         assert_eq!(parsed.title.as_deref(), Some("Pilot"));
     }
 
+    /// Issue #198: `-E02` is the second half of the marker, not the first four
+    /// characters of a title.
+    #[test]
+    fn reads_both_episodes_of_a_double_marker() {
+        let parsed = episode("Series/Charmed/Season 04/Charmed - S04E01-E02 - Charmed Again.avi");
+
+        assert_eq!(parsed.number, 1);
+        assert_eq!(parsed.through, Some(2));
+        assert_eq!(parsed.title.as_deref(), Some("Charmed Again"));
+    }
+
+    /// A range written out in full is matched, so that the marker does not stop
+    /// in the middle of itself and leave `-S04E02` to be read as a title, and
+    /// then refused rather than rewritten. The library holds none of them, in
+    /// either season shape, and a form with no instances does not earn a second
+    /// accepted spelling of a range.
+    #[test]
+    fn refuses_a_range_that_states_its_season_twice() {
+        for path in [
+            "Series/Charmed/Season 04/Charmed - S04E01-S04E02 - Charmed Again.avi",
+            "Series/Charmed/Season 04/Charmed - S04E22-S05E01 - Finale.avi",
+        ] {
+            assert_eq!(
+                parse(path),
+                Err(Unresolvable::EpisodeRangeStatesItsSeasonTwice),
+                "for {path}"
+            );
+        }
+    }
+
+    /// A range is its two ends, and anything past them is refused rather than
+    /// read down to the first two - which would be issue #198 one episode
+    /// further along.
+    #[test]
+    fn refuses_a_marker_that_names_more_than_two_episodes() {
+        assert_eq!(
+            parse("Series/Charmed/Season 04/Charmed - S04E01-E02-E03 - Charmed Again.avi"),
+            Err(Unresolvable::EpisodeRangeNamesMoreThanTwo)
+        );
+        assert_eq!(
+            episode("Series/Charmed/Season 04/Charmed - S04E01-E03 - Charmed Again.avi").through,
+            Some(3),
+            "a span of three written as its two ends is the form that is read"
+        );
+    }
+
+    #[test]
+    fn refuses_a_fraction_on_either_end_of_a_range() {
+        for path in [
+            "Series/Charmed/Season 04/Charmed - S04E01.5-E02 - Charmed Again.avi",
+            "Series/Charmed/Season 04/Charmed - S04E01-E02.5 - Charmed Again.avi",
+        ] {
+            assert_eq!(
+                parse(path),
+                Err(Unresolvable::FractionalEpisode),
+                "for {path}"
+            );
+        }
+    }
+
+    /// The forms deliberately left out, each for its own reason.
+    #[test]
+    fn a_second_number_has_to_say_it_is_an_episode() {
+        assert_eq!(
+            episode("Series/Show/Season 01/Show - S01E01-02 - Pilot.mkv").through,
+            None,
+            "a bare number after a marker is a part number as often as an episode"
+        );
+        assert_eq!(
+            episode("Series/Show/Season 01/Show - S01E01 - E02 Is A Title.mkv").through,
+            None,
+            "spaced and dashed is how a title begins, whatever it begins with"
+        );
+        assert_eq!(
+            parse("Series/Show/Season 01/Show - S01E01E02 - Pilot.mkv"),
+            Err(Unresolvable::NoEpisodeMarker),
+            "an unseparated pair is refused outright rather than read short"
+        );
+    }
+
     #[test]
     fn keeps_the_season_directory_it_found_and_the_arc_name_on_it() {
         let parsed = episode("Anime/Bebop/Season 2 - The Long Night/Bebop - S02E03 - Ballad.mkv");
@@ -675,6 +819,87 @@ mod tests {
             episode("Series/Elementary.S06E08 (2012)/Season 06/S06E08.mkv").series,
             "Elementary",
             "an annotation and a marker on one directory both come off"
+        );
+    }
+
+    /// Issue #198: a round trip through a **lossy** parse is still a round trip.
+    ///
+    /// `no_path_is_renamed_twice` asks whether a destination is stable, and
+    /// `Charmed - S04E01-E02 - Charmed Again.avi` satisfied it perfectly. The
+    /// marker stopped at `E01`, `-E02` fell into the title, and the destination
+    /// `Charmed - S04E01 - E02 - Charmed Again.avi` parsed back to those same
+    /// fields and rendered back to itself. Nothing downstream could see that the
+    /// name now says the file holds one episode when it holds two.
+    ///
+    /// No check on the *text* catches that: `E02` is in the destination either
+    /// way, and only its position says whether it is an episode or four
+    /// characters of prose. What separates the two is adjacency, so that is what
+    /// this asserts - **the marker must consume every episode designator glued to
+    /// it**, because a designator carrying no separator is not the start of a
+    /// title, it is the rest of the marker. A marker that stops in the middle of
+    /// one has dropped a value, whatever it does with the remainder afterwards.
+    ///
+    /// The separator is the whole of the distinction, and the corpus says so from
+    /// both sides: `- E02 Is A Title` is a title that legitimately opens with
+    /// something marker-shaped, and it is spaced, so it is not glued and does not
+    /// fire. `-02` is not a designator at all - a bare number is a part number or
+    /// a release fragment as often as an episode - so reading it as one would be
+    /// inventing the value this exists to protect.
+    #[test]
+    fn a_marker_never_stops_in_the_middle_of_a_marker() {
+        // What the marker must never leave behind: another episode designator
+        // attached with nothing or with a bare hyphen, or a fraction of the
+        // episode it just read. A four digit tail is a year rather than a
+        // fraction, which is why this counts digits the way the marker does.
+        let designator =
+            Regex::new(r"(?i)^(?:-?(?:s\d{1,3}[\s._-]*)?e\d{1,3}|\.\d{1,2}\b)").unwrap();
+
+        let filenames = [
+            "Charmed - S04E01-E02 - Charmed Again.avi",
+            "Charmed - S05E22-E23 - Oh My Goddess.avi",
+            "Elementary - S01E23-E24 - The Woman & Heroine.mkv",
+            "One Piece - S07E227-E228 - [K-F].mp4",
+            "Elementary.S01E01-E02.Pilot.1080p.BluRay.x264.mkv",
+            "S01E01-E02.mkv",
+            // Refused rather than rendered, but the marker still has to reach
+            // the end of what it names, or the refusal becomes a truncation.
+            "Charmed - s04e01-s04e02 - Charmed Again.avi",
+            "Charmed - S04E01-E02-E03 - Charmed Again.avi",
+            "Charmed - S04E01-E02.5 - Charmed Again.avi",
+            // The other side of the rule: a separator means a title, a bare
+            // number is nobody's episode, and a four digit tail is a year.
+            "Elementary - S01E01 - E02 Is A Title.mkv",
+            "Elementary - S01E01-02 - Pilot.mkv",
+            "Elementary - S01E01 - Pilot.mkv",
+            "Show.S01E01.2020.1080p.WEB.mkv",
+        ];
+
+        let mut doubles = 0;
+        for filename in filenames {
+            let Some(marker) = episode_marker().find(filename) else {
+                continue;
+            };
+            if marker
+                .as_str()
+                .chars()
+                .filter(|c| *c == 'e' || *c == 'E')
+                .count()
+                > 1
+            {
+                doubles += 1;
+            }
+
+            let remainder = &filename[marker.end()..];
+            assert!(
+                !designator.is_match(remainder),
+                "the marker stopped at '{}' and left '{remainder}' for the title to absorb: {filename}",
+                marker.as_str()
+            );
+        }
+
+        assert!(
+            doubles > 0,
+            "the corpus held no double episode, so it proved nothing"
         );
     }
 

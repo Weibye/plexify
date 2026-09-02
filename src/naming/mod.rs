@@ -347,7 +347,16 @@ pub struct Episode {
     pub series: String,
     /// The season the *file* claims, which is not necessarily its directory's.
     pub season: u32,
+    /// The first episode the file covers.
     pub number: u32,
+    /// The last episode it covers, when the marker names two - a double episode
+    /// held in one file, `S04E01-E02`.
+    ///
+    /// It is a field rather than something the title absorbs because it is a
+    /// *value*: folded into the title, `E02` becomes four characters that no
+    /// longer say the file contains an episode, and the library then claims an
+    /// episode nothing appears to hold.
+    pub through: Option<u32>,
     /// The episode title, or `None` when the name carried nothing recoverable.
     pub title: Option<String>,
     /// Resolution and frame rate, if the name carried them.
@@ -403,6 +412,11 @@ pub enum Unresolvable {
     NoEpisodeMarker,
     /// A marker naming a fraction of an episode, such as `S01E13.5`.
     FractionalEpisode,
+    /// A range that puts a season on both of its episodes, `S01E01-S01E02`.
+    EpisodeRangeStatesItsSeasonTwice,
+    /// A marker listing episodes rather than naming the two ends of a range,
+    /// `S01E01-E02-E03`.
+    EpisodeRangeNamesMoreThanTwo,
     /// Neither the filename nor the directory it sits in names the series.
     NoSeriesName,
     /// A movie file whose name is nothing but a year and release metadata.
@@ -441,6 +455,14 @@ impl Unresolvable {
             }
             Unresolvable::FractionalEpisode => {
                 "the marker names a fraction of an episode, which has no canonical form; calling it a whole episode would collide with the real one"
+                    .to_string()
+            }
+            Unresolvable::EpisodeRangeStatesItsSeasonTwice => {
+                "the marker states a season on both of its episodes; the canonical form states it once, and where the two disagree there is no one name for the file and no season directory to put it in"
+                    .to_string()
+            }
+            Unresolvable::EpisodeRangeNamesMoreThanTwo => {
+                "the marker names more than two episodes; a range is written as its two ends, and reading only those would drop the rest"
                     .to_string()
             }
             Unresolvable::NoSeriesName => {
@@ -893,6 +915,11 @@ mod tests {
     /// canonical in its own right. Refusing a path is an acceptable answer here
     /// and a rename to a path that would be renamed again is not, which is what
     /// separates a heuristic that gives up from one that grows a filename.
+    ///
+    /// It is not, on its own, enough. Stability says nothing about whether the
+    /// parse behind it threw something away - see
+    /// [`parse::tests::a_marker_never_stops_in_the_middle_of_a_marker`], which is
+    /// the half of the property this one cannot see.
     #[test]
     fn no_path_is_renamed_twice() {
         let series_directories = [
@@ -928,6 +955,18 @@ mod tests {
             "s01e01 - pilot.mkv",
             "Elementary - S01E01 (1080p60).webm",
             "S00E01 - [1080p][HorribleSubs].mkv",
+            // A file holding two episodes, in each form the marker recognises
+            // and in the two that follow it - a bare second number, and a title
+            // that opens with something marker-shaped.
+            "S01E01-E02.mkv",
+            "Elementary - S01E01-E02 - Pilot & Aftermath.mkv",
+            "Elementary.S01E01-E02.Pilot.1080p.BluRay.x264.mkv",
+            "Elementary - S01E01-E02 - [K-F].mp4",
+            "elementary - s01e01-s01e02 - pilot.mkv",
+            "Elementary - S01E01-E02-E03 - Pilot.mkv",
+            "Elementary - S01E01-E02.5 - Pilot.mkv",
+            "Elementary - S01E01-02 - Pilot.mkv",
+            "Elementary - S01E01 - E02 Is A Title.mkv",
         ];
 
         let mut proposals = 0;
@@ -1437,6 +1476,70 @@ mod tests {
             Assessment::Unresolvable(Unresolvable::FractionalEpisode),
             "S01E13.5 is a half episode; calling it E13 would collide with the real one"
         );
+    }
+
+    /// Issue #198, the four files it found, verbatim. All four were already
+    /// named the way Plex reads a double episode, and were being proposed a name
+    /// that says the file holds one.
+    #[test]
+    fn leaves_a_double_episode_that_is_already_named_correctly_alone() {
+        for path in [
+            "Series/Charmed/Season 04/Charmed - S04E01-E02 - Charmed Again.avi",
+            "Series/Charmed/Season 05/Charmed - S05E01-E02 - A Witches Tale.avi",
+            "Series/Charmed/Season 05/Charmed - S05E22-E23 - Oh My Goddess.avi",
+            "Series/Elementary/Season 01/Elementary - S01E23-E24 - The Woman & Heroine.mkv",
+        ] {
+            assert_eq!(assess(Path::new(path)), Assessment::Canonical, "for {path}");
+        }
+    }
+
+    /// The other four files, found by sweeping the library for the shape rather
+    /// than by eye. They carry a release tag and no title, so the second episode
+    /// number did not fall *into* a title - it became one, and the destination
+    /// asserted an episode called `E228`.
+    #[test]
+    fn a_double_episode_with_no_title_keeps_both_numbers_and_gains_no_title() {
+        assert_eq!(
+            assess(Path::new(
+                "Anime/One Piece/Season 07 - Escape! (196-228)/One Piece - S07E227-E228 - [K-F].mp4"
+            )),
+            Assessment::Rename {
+                destination:
+                    "Anime/One Piece/Season 07 - Escape! (196-228)/One Piece - S07E227-E228.mp4"
+                        .to_string()
+            }
+        );
+    }
+
+    /// Shapes with no canonical form and no instance in the library. Each is
+    /// refused rather than read short, because reading one short is what issue
+    /// #198 was: a name that quietly asserts less than the file said.
+    #[test]
+    fn refuses_the_range_shapes_that_have_no_canonical_form() {
+        for (path, expected) in [
+            (
+                "Series/Charmed/Season 04/Charmed - S04E01-S04E02 - Charmed Again.avi",
+                Unresolvable::EpisodeRangeStatesItsSeasonTwice,
+            ),
+            (
+                "Series/Charmed/Season 04/Charmed - S04E22-S05E01 - Finale.avi",
+                Unresolvable::EpisodeRangeStatesItsSeasonTwice,
+            ),
+            (
+                "Series/Charmed/Season 04/Charmed - S04E01-E02-E03 - Charmed Again.avi",
+                Unresolvable::EpisodeRangeNamesMoreThanTwo,
+            ),
+            (
+                "Series/Charmed/Season 04/Charmed - S04E01-E02.5 - Charmed Again.avi",
+                Unresolvable::FractionalEpisode,
+            ),
+        ] {
+            assert_eq!(
+                assess(Path::new(path)),
+                Assessment::Unresolvable(expected),
+                "for {path}"
+            );
+        }
     }
 
     #[test]
