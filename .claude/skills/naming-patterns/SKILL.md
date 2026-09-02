@@ -56,10 +56,12 @@ Rules that hold across every entry:
   that failed to appear in Plex was the one whose *files* carried no `SxxExx` marker. The
   marker is what Plex reads; the directory name is decoration.
 - `SxxExx` markers are uppercase. One file holding two episodes states both, glued to the
-  marker with a bare hyphen: `Charmed - S04E01-E02 - Charmed Again.avi`. `S01E01-S01E02` is
-  the same range and normalises onto that form; a bare `S01E01-02` is not read as a range,
-  because a second number that does not say it is an episode could be a part number, and
-  reading it as one would be inventing a value. A range across two seasons is refused.
+  marker with a bare hyphen: `Charmed - S04E01-E02 - Charmed Again.avi`, where the second
+  number is the last episode covered. A bare `S01E01-02` is not read as a range, because a
+  number that does not say it is an episode could be a part number and reading it as one
+  would invent a value. `S01E01-S01E02`, `S01E01-E02-E03` and `S01E01-E02.5` are matched and
+  then **refused**: none is in the library, and a marker that stopped short of them would
+  hand the remainder to the title, which is the bug in #198 one episode along.
 - A dash with surrounding spaces separates series name, episode marker, and episode title.
 - Quality metadata goes in square brackets and comes after the title, with no dash before
   it: `... - Uno [1080p].mkv`.

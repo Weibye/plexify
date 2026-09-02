@@ -506,13 +506,20 @@ episodes, and `S04E01-E02` is how it says so. Reading only the first left `-E02`
 absorbed as the opening of a title, which round-tripped perfectly - the destination
 `S04E01 - E02 - Charmed Again` parsed to those same fields and rendered back to itself - while
 saying the file holds one episode when it holds two. So the marker carries a range, `Episode`
-carries `through`, and `render` writes the one form Plex reads for it. The rule that decides
-the grammar is **the second number has to say it is an episode**: `-E02` and `-S01E02` do,
-which is why both are read and the second is normalised onto the first; a bare `-02` does not,
-and reading it as one would invent the value this exists to protect. Glued is also the whole
-of the distinction from a title - `- E02 Is A Title` is spaced, so it is prose. A range whose
-two halves name different seasons is refused: no one name states it, and neither season
-directory is the right one.
+carries `through` - the last episode covered, so `S04E01-E03` is a span of three - and
+`render` writes the one form the library actually holds. Two rules decide the rest of the
+grammar, and they pull in opposite directions:
+
+- **The second number has to say it is an episode.** A bare `-02` is a part number or a
+  release fragment as often as an episode, so it is not read; reading it would invent the
+  value this exists to protect. Glued is also the whole of the distinction from a title -
+  `- E02 Is A Title` is spaced, so it is prose.
+- **A shape with no canonical form is refused, never read short.** `S04E01-S04E02`,
+  `S04E01-E02-E03` and `S04E01-E02.5` are each matched by the marker *in order to be
+  refused*: a marker that stops in the middle of itself hands the rest to the title, which is
+  this bug one episode further along. None occurs in the library, and a form nobody has does
+  not earn a second accepted spelling - Plex reading a form is an argument for rendering it,
+  not for parsing it.
 
 `no_path_is_renamed_twice` cannot see any of this, and that is why it went unnoticed for as
 long as it did: it checks that `render(parse(p))` is *stable*, not that `parse` discarded
