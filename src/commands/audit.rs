@@ -7,7 +7,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
@@ -26,6 +26,13 @@ pub struct AuditEntry {
     pub size_bytes: u64,
     /// How much of `size_bytes` is actually backed by disk. See [`Allocation`].
     pub allocation: Allocation,
+    /// When the file was last written, out of the same `stat`.
+    ///
+    /// A shortfall cannot tell a lost file from one still being copied, and no
+    /// threshold can: a preallocated file mid-transfer is exactly what a sparse
+    /// file looks like. This is what lets the report attach that caveat to the
+    /// individual line rather than only to the heading above the list.
+    pub modified: Option<SystemTime>,
     pub outcome: Outcome,
 }
 
@@ -94,6 +101,14 @@ impl Allocation {
     }
 }
 
+/// Whether this platform can read an allocated size at all.
+///
+/// It separates the two things [`Allocation::Unmeasurable`] otherwise conflates:
+/// where this is false nothing was measured and the report says so once, and
+/// where it is true an `Unmeasurable` entry is one file whose own `stat` failed,
+/// which has to be named rather than left looking whole.
+pub const ALLOCATION_IS_MEASURABLE: bool = cfg!(unix);
+
 /// Read the allocated size out of a `stat` that has already been performed.
 #[cfg(unix)]
 fn allocation_of(metadata: &std::fs::Metadata) -> Allocation {
@@ -157,11 +172,12 @@ impl AuditReport {
         })
     }
 
-    /// Whether any file's allocated size could be read at all.
-    fn allocation_measurable(&self) -> bool {
-        self.entries
-            .iter()
-            .any(|entry| matches!(entry.allocation, Allocation::Measured { .. }))
+    /// Files this platform could have measured but did not, because their own
+    /// `stat` failed. Always zero where the platform cannot measure at all.
+    pub fn unmeasured(&self) -> impl Iterator<Item = &AuditEntry> {
+        self.entries.iter().filter(|entry| {
+            ALLOCATION_IS_MEASURABLE && matches!(entry.allocation, Allocation::Unmeasurable)
+        })
     }
 }
 
@@ -263,6 +279,7 @@ impl AuditCommand {
                 .as_ref()
                 .map(allocation_of)
                 .unwrap_or(Allocation::Unmeasurable),
+            modified: metadata.as_ref().and_then(|m| m.modified().ok()),
             outcome,
         }
     }
@@ -387,13 +404,15 @@ impl AuditCommand {
         // Deliberately its own section rather than a bucket or a finding: an
         // incomplete file keeps whatever verdict its header earned, and this
         // neither changes it nor proposes anything be done about it.
-        if !report.allocation_measurable() && !report.entries.is_empty() {
-            let _ = writeln!(out, "\n🕳️  How much of each file is on the disk:");
-            let _ = writeln!(out, "─────────────────────────────────────────");
-            let _ = writeln!(
-                out,
-                "   Not measurable on this platform, so no file below was checked.\n   Allocated size comes from stat's st_blocks, which Windows does not have."
-            );
+        if !ALLOCATION_IS_MEASURABLE {
+            if !report.entries.is_empty() {
+                let _ = writeln!(out, "\n🕳️  How much of each file is on the disk:");
+                let _ = writeln!(out, "─────────────────────────────────────────");
+                let _ = writeln!(
+                    out,
+                    "   Not measurable on this platform, so no file below was checked.\n   Allocated size comes from stat's st_blocks, which Windows does not have."
+                );
+            }
         } else {
             let mut missing: Vec<_> = report.incomplete().collect();
             if !missing.is_empty() {
@@ -415,12 +434,30 @@ impl AuditCommand {
                 for (entry, bytes) in missing {
                     let _ = writeln!(
                         out,
-                        "   {:3.0}% of this file is not on disk  ({:6.1} GB of {:6.1} GB)  {}",
+                        "   {:3.0}% of this file is not on disk  ({:6.1} GB of {:6.1} GB)  {}{}",
                         percent(bytes as usize, entry.size_bytes.max(1) as usize),
                         bytes as f64 / 1e9,
                         entry.size_bytes as f64 / 1e9,
                         entry.path,
+                        in_flight_caveat(entry.modified),
                     );
+                }
+            }
+
+            // Not folded into the banner above. A file whose own stat failed is
+            // unmeasured on a platform that measures, and letting its measured
+            // neighbours suppress the notice would leave it looking whole -
+            // the same silent clean bill of health the banner exists to
+            // prevent, one file at a time instead of all of them at once.
+            let unmeasured: Vec<_> = report.unmeasured().collect();
+            if !unmeasured.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "\n🕳️  {} file(s) could not be stat'd, so nothing is claimed about how much of them is on disk:",
+                    unmeasured.len()
+                );
+                for entry in unmeasured {
+                    let _ = writeln!(out, "   {}", entry.path);
                 }
             }
         }
@@ -523,6 +560,29 @@ fn is_queue_directory(path: &Path) -> bool {
                 .any(|directory| name == directory.on_disk_name())
         })
         .unwrap_or(false)
+}
+
+/// How long after a write a file is still plausibly being written.
+///
+/// A copy touches the mtime on every write, so a file written moments ago is
+/// most likely still arriving and its holes are preallocation rather than loss.
+/// The window is deliberately generous - a transfer that stalls briefly should
+/// not lose the caveat - because being wrong costs a hedge on a line rather
+/// than a missing line: the file is listed either way.
+const IN_FLIGHT_WINDOW: Duration = Duration::from_secs(15 * 60);
+
+/// The caveat in the section heading, restated on a line that may be read on
+/// its own. Empty unless the file was written recently enough for it to apply.
+fn in_flight_caveat(modified: Option<SystemTime>) -> &'static str {
+    let recent = modified
+        .and_then(|at| SystemTime::now().duration_since(at).ok())
+        .is_some_and(|age| age < IN_FLIGHT_WINDOW);
+
+    if recent {
+        "  (written just now - may still be arriving)"
+    } else {
+        ""
+    }
 }
 
 fn percent(part: usize, whole: usize) -> f64 {
@@ -782,12 +842,30 @@ mod tests {
             allocation,
             Allocation::Measured { allocated_bytes } if allocated_bytes < apparent
         );
+
         if !holed {
+            // On Linux this is a failure, not a skip. `cargo test` captures a
+            // passing test's stderr, so a skip and a real measurement leave
+            // identical job logs, and a green CI run would then prove nothing
+            // about whether a hole was ever created. Every filesystem the CI
+            // job can land on - ext4, tmpfs, overlayfs - supports holes, so
+            // there is nothing here to be tolerant of.
+            #[cfg(target_os = "linux")]
+            panic!(
+                "no hole was created under {path:?} ({allocation:?}); the sparse-file \
+                 tests are only meaningful against a real hole, and on Linux that is \
+                 required rather than skipped"
+            );
+
+            // Elsewhere it stays a skip, and is audible: the platforms that
+            // reach this line are read by a person at their own terminal.
+            #[cfg(not(target_os = "linux"))]
             eprintln!(
                 "skipping: the filesystem under {path:?} allocated the extension \
                  rather than leaving a hole, so there is no sparse file to measure ({allocation:?})"
             );
         }
+
         holed
     }
 
@@ -811,6 +889,61 @@ mod tests {
         assert_eq!(measured((4 << 30) - (4 << 20)).shortfall(4 << 30), None);
         // And a platform that cannot measure never reports a file as whole.
         assert_eq!(Allocation::Unmeasurable.shortfall(4 << 30), None);
+    }
+
+    #[test]
+    fn the_in_flight_caveat_is_attached_to_a_line_that_may_be_read_on_its_own() {
+        let now = SystemTime::now();
+
+        assert!(in_flight_caveat(Some(now)).contains("may still be arriving"));
+        assert_eq!(
+            in_flight_caveat(Some(now - Duration::from_secs(24 * 3600))),
+            ""
+        );
+        assert_eq!(in_flight_caveat(None), "");
+    }
+
+    /// A file whose own stat failed must not hide behind its measured
+    /// neighbours - that is the per-file version of the clean bill of health
+    /// the platform banner exists to prevent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_file_whose_stat_failed_is_named_rather_than_left_looking_whole() {
+        fn entry(path: &str, allocation: Allocation) -> AuditEntry {
+            AuditEntry {
+                path: path.to_string(),
+                size_bytes: 1000,
+                allocation,
+                modified: None,
+                outcome: Outcome::ProbeFailed {
+                    reason: "fixture".into(),
+                },
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let command = AuditCommand::new(dir.path().to_path_buf(), "chromecast-gen2-3").unwrap();
+        let report = AuditReport {
+            target: "chromecast-gen2-3".into(),
+            scan_path: dir.path().to_path_buf(),
+            audit_time: Duration::from_secs(0),
+            entries: vec![
+                entry(
+                    "measured.mp4",
+                    Allocation::Measured {
+                        allocated_bytes: 1000,
+                    },
+                ),
+                entry("unstattable.mp4", Allocation::Unmeasurable),
+            ],
+        };
+
+        let rendered = command.render_report(&report);
+        assert!(
+            rendered.contains("1 file(s) could not be stat'd"),
+            "the measured neighbour must not suppress or absorb it: {rendered}"
+        );
+        assert!(rendered.contains("unstattable.mp4"), "{rendered}");
     }
 
     /// A real hole, and a file of exactly the same apparent size that has none.
