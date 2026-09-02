@@ -862,6 +862,17 @@ impl Drop for ClaimedJob<'_> {
     }
 }
 
+/// Where a finished job went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionDisposition {
+    /// The job was moved to `_completed`.
+    Recorded,
+    /// The claim was gone before the success could be recorded: a sweep judged
+    /// this worker stranded and gave the job to somebody else. Nothing was
+    /// written, because the job is no longer this worker's to describe.
+    Lost,
+}
+
 /// Where a failed job went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureDisposition {
@@ -876,14 +887,56 @@ pub enum FailureDisposition {
 }
 
 impl<'a> ClaimedJob<'a> {
-    /// Mark the job as completed
-    pub async fn complete(mut self) -> Result<()> {
+    /// Record the job as completed and move it to `_completed`.
+    ///
+    /// Losing the race to a sweep is a disposition, not an error, for the same
+    /// reason it is in [`ClaimedJob::fail`]: a worker that went quiet long
+    /// enough - a stalled encode, a suspended machine - may have had its job
+    /// swept back to the queue and handed to somebody else while it was still
+    /// running. The output is already in the library by then, so there is
+    /// nothing to recover and nothing to retry; the only thing left to decide is
+    /// what the worker does next, and the answer is take the next job. Reporting
+    /// it as an error made the worker log a failure and sleep on a run that
+    /// succeeded.
+    ///
+    /// The rename is what asks the question, so the answer cannot be out of
+    /// date: it moves the file or it says there was no file. `_completed` is
+    /// created first so that a `NotFound` can only be the job, never the
+    /// destination directory.
+    ///
+    /// What it still cannot say is whether the job it moved is *this* worker's.
+    /// A sweep's copy claimed by somebody else in between is renamed into
+    /// `_completed` just as willingly, because nothing in a job file or beside
+    /// it identifies which worker holds it. That worker's own `complete` then
+    /// reports `Lost` in turn - which, since its output is in the library too,
+    /// costs a duplicate encode already spent and nothing else.
+    ///
+    /// The heartbeat is removed only on the path that moved the job. On the lost
+    /// path it belongs to whoever holds the claim now, and deleting it would
+    /// leave that worker judged by its job file's mtime alone and swept off a
+    /// job it is still running.
+    pub async fn complete(mut self) -> Result<CompletionDisposition> {
         self.stop_heartbeat();
+
         let completed_path = self.queue.completed_dir.join(&self.job_name);
-        async_fs::rename(&self.in_progress_path, completed_path).await?;
-        let _ = async_fs::remove_file(heartbeat_path_for(&self.in_progress_path)).await;
-        debug!("Marked job as completed: {}", self.job_name);
-        Ok(())
+        if let Some(parent) = completed_path.parent() {
+            async_fs::create_dir_all(parent).await?;
+        }
+
+        match async_fs::rename(&self.in_progress_path, &completed_path).await {
+            Ok(()) => {
+                let _ = async_fs::remove_file(heartbeat_path_for(&self.in_progress_path)).await;
+                debug!("Marked job as completed: {}", self.job_name);
+                Ok(CompletionDisposition::Recorded)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(CompletionDisposition::Lost),
+            // A work root that has dropped out is not a lost race, and saying so
+            // would hide it.
+            Err(e) => Err(anyhow!(
+                "Could not record {} as completed: {e}",
+                self.job_name
+            )),
+        }
     }
 
     /// Stop refreshing the heartbeat.
@@ -1238,6 +1291,56 @@ mod tests {
             "nor left behind mid-move"
         );
         assert!(queued_path.exists(), "the sweep's copy is the only one");
+    }
+
+    /// The same race on the other side: the worker was late rather than dead,
+    /// the encode succeeded, and by the time it goes to record that, a sweep has
+    /// put the job back in the queue.
+    ///
+    /// The output is already in the library, so there is nothing here for the
+    /// worker to do about it and nothing for it to stop for. It says so and
+    /// carries on, and it leaves the heartbeat alone: that file speaks for
+    /// whoever holds the claim now, and removing it would leave the next worker
+    /// judged by its job file's mtime alone.
+    #[test]
+    async fn a_worker_whose_job_was_swept_away_reports_it_rather_than_failing() {
+        let temp_dir = TempDir::new().unwrap();
+        let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        queue.init().await.unwrap();
+
+        let job = Job::new(
+            PathBuf::from("show.mkv"),
+            MediaFileType::Mkv,
+            Operation::Reencode { channels: None },
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            temp_dir.path(),
+        );
+        queue.enqueue_job(&job).await.unwrap();
+        let claimed = queue.claim_job(None).await.unwrap().unwrap();
+        let job_name = claimed.job_name().to_string();
+        let in_progress_path = queue.in_progress_dir.join(&job_name);
+
+        // A sweep judged this worker gone and put its job back in the queue.
+        let queued_path = queue.queue_dir.join(&job_name);
+        std::fs::rename(&in_progress_path, &queued_path).unwrap();
+
+        let disposition = claimed.complete().await.unwrap();
+
+        assert_eq!(
+            disposition,
+            CompletionDisposition::Lost,
+            "the job was not this worker's to record against"
+        );
+        assert!(
+            !queue.completed_dir.join(&job_name).exists(),
+            "and nothing was conjured into _completed from a claim that had gone"
+        );
+        assert!(queued_path.exists(), "the sweep's copy is the only one");
+        assert!(
+            heartbeat_of(&in_progress_path).exists(),
+            "the heartbeat belongs to whoever claims the job next, not to this worker"
+        );
     }
 
     /// A mover killed between taking a job and putting it down leaves it under

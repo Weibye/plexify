@@ -137,6 +137,17 @@ then re-given it to somebody else takes that worker's claim, because nothing in 
 beside it says which worker holds it. These windows are why the staging name a finished encode
 is copied under carries the id of the worker that copied it.
 
+**Losing that race is a disposition, not an error**, and on both sides: `fail` returns
+`FailureDisposition::Lost` and `complete` returns `CompletionDisposition::Lost` when the rename
+finds nothing to move. Neither is a reason for `work` to stop or to sleep on a retry — the
+output of a lost completion is already in the library, and the job itself now belongs to a
+worker that will finish it or fail it. Both keep `NotFound` separate from every other error,
+because a work root that has dropped out is not a race and reporting it as one hides it;
+`complete` creates `_completed` first so that a `NotFound` can only be the job. The lost path
+also leaves the heartbeat alone, since it now speaks for whoever holds the claim, and deleting
+it would leave that worker judged by its job file's mtime alone and swept off a job it is
+still running.
+
 **The work root is not the media root.** `JobQueue::new` takes both. `--work-dir`/`-w`
 controls the queue location and **defaults to the current working directory**, not to the
 media directory. This trips people up constantly: running `scan` from two different shells
