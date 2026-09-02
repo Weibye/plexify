@@ -261,9 +261,8 @@ pub(super) fn sort_key(path: &str) -> Option<super::EpisodeSortKey> {
     Some(super::EpisodeSortKey {
         series_directory: std::iter::once(root_name)
             .chain(above_season.iter())
-            .copied()
-            .collect::<Vec<_>>()
-            .join("/"),
+            .map(|component| (*component).to_string())
+            .collect(),
         season,
         episode,
     })

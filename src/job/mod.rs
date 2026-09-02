@@ -1467,7 +1467,7 @@ mod tests {
         );
 
         let key = job.episode_sort_key(&media_root).unwrap();
-        assert_eq!(key.series_directory, "Series/Breaking Bad");
+        assert_eq!(key.series_directory, group("Series/Breaking Bad"));
         assert_eq!(key.season, 1);
         assert_eq!(key.episode, 3);
     }
@@ -1493,7 +1493,7 @@ mod tests {
         let key = job.episode_sort_key(&media_root).unwrap();
         assert_eq!(
             key.series_directory,
-            "Series/Breaking Bad (2008) {tvdb-296861}"
+            group("Series/Breaking Bad (2008) {tvdb-296861}")
         );
         assert_eq!(key.season, 1);
         assert_eq!(key.episode, 1);
@@ -1518,7 +1518,7 @@ mod tests {
         );
 
         let key = job.episode_sort_key(&media_root).unwrap();
-        assert_eq!(key.series_directory, "Anime/Attack on Titan");
+        assert_eq!(key.series_directory, group("Anime/Attack on Titan"));
         assert_eq!(key.season, 1);
         assert_eq!(key.episode, 5);
     }
@@ -1542,7 +1542,7 @@ mod tests {
         let key = job.episode_sort_key(&media_root).unwrap();
         assert_eq!(
             key.series_directory,
-            "Series/Critical Role (2015) {tvdb-296861}"
+            group("Series/Critical Role (2015) {tvdb-296861}")
         );
         assert_eq!(key.season, 1);
         assert_eq!(key.episode, 12);
@@ -1565,6 +1565,11 @@ mod tests {
         );
 
         assert!(job.episode_sort_key(&media_root).is_none());
+    }
+
+    /// A group written the way a path reads, for an assertion to state.
+    fn group(directories: &str) -> Vec<String> {
+        directories.split('/').map(str::to_string).collect()
     }
 
     /// The sort key for a library-relative path, as a scan would queue it.
@@ -1592,7 +1597,7 @@ mod tests {
     #[test]
     fn a_sort_key_reads_a_path_with_native_separators() {
         let expected = EpisodeSortKey {
-            series_directory: "Series/Elementary".to_string(),
+            series_directory: group("Series/Elementary"),
             season: 6,
             episode: 8,
         };
@@ -1624,7 +1629,7 @@ mod tests {
         assert_eq!(
             unpadded,
             Some(EpisodeSortKey {
-                series_directory: "Series/Elementary".to_string(),
+                series_directory: group("Series/Elementary"),
                 season: 6,
                 episode: 8,
             })
@@ -1639,7 +1644,7 @@ mod tests {
         assert_eq!(
             specials,
             Some(EpisodeSortKey {
-                series_directory: "Series/Firefly".to_string(),
+                series_directory: group("Series/Firefly"),
                 season: 0,
                 episode: 1,
             })
@@ -1655,7 +1660,7 @@ mod tests {
         // which makes every real root below it read as a tree nested into itself
         // and costs the metadata for the entire library at once.
         let expected = EpisodeSortKey {
-            series_directory: "Series/Elementary".to_string(),
+            series_directory: group("Series/Elementary"),
             season: 1,
             episode: 1,
         };
@@ -1689,7 +1694,7 @@ mod tests {
         assert_eq!(
             episode,
             Some(EpisodeSortKey {
-                series_directory: "Anime/Naruto".to_string(),
+                series_directory: group("Anime/Naruto"),
                 season: 1,
                 episode: 1,
             })
@@ -1754,14 +1759,10 @@ mod tests {
             // The group is where the parse says the file is - the root and the
             // directories above the season directory - rather than the series
             // name the parse recovered from the file.
-            let expected: Vec<&str> = std::iter::once(episode.root.as_str())
-                .chain(episode.directories.iter().map(String::as_str))
+            let expected: Vec<String> = std::iter::once(episode.root.as_str().to_string())
+                .chain(episode.directories.iter().cloned())
                 .collect();
-            assert_eq!(
-                key.series_directory,
-                expected.join("/"),
-                "group for '{path}'"
-            );
+            assert_eq!(key.series_directory, expected, "group for '{path}'");
         }
     }
 
@@ -1794,7 +1795,7 @@ mod tests {
             (
                 "Series/S01E01/Season 01/S01E01 - x.mkv",
                 EpisodeSortKey {
-                    series_directory: "Series/S01E01".to_string(),
+                    series_directory: group("Series/S01E01"),
                     season: 1,
                     episode: 1,
                 },
@@ -1802,7 +1803,7 @@ mod tests {
             (
                 "Series/Elementary/Season 01/Elementary - S01E13.5 - Recap.mkv",
                 EpisodeSortKey {
-                    series_directory: "Series/Elementary".to_string(),
+                    series_directory: group("Series/Elementary"),
                     season: 1,
                     episode: 13,
                 },
@@ -1810,7 +1811,7 @@ mod tests {
             (
                 "Series/Veronica Mars/Series/Season 01/Veronica Mars - S01E01 - Pilot.mkv",
                 EpisodeSortKey {
-                    series_directory: "Series/Veronica Mars/Series".to_string(),
+                    series_directory: group("Series/Veronica Mars/Series"),
                     season: 1,
                     episode: 1,
                 },
