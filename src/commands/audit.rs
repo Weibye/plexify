@@ -830,7 +830,11 @@ mod tests {
 
         let mut file = std::fs::File::create(path).unwrap();
         file.write_all(head).unwrap();
-        file.set_len(apparent).unwrap();
+        // NEGATIVE CONTROL - writing the extension out instead of leaving it a
+        // hole. Must turn the Linux job red; if it does not, the tests prove
+        // nothing. Never merge.
+        file.write_all(&vec![0u8; (apparent as usize) - head.len()])
+            .unwrap();
         file.sync_all().unwrap();
         drop(file);
 
