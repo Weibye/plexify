@@ -527,7 +527,7 @@ pub fn series_directory_disagreement(relative_path: &Path) -> Option<SeriesDirec
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EpisodeSortKey {
     /// The library-relative directory chain above the season directory, root
-    /// included - `Series/Breaking Bad (2008)`.
+    /// included - `["Series", "Breaking Bad (2008)"]`.
     ///
     /// **Where the file is, not what it is called.** The rendered series name is
     /// the wrong key to group by in both directions. It drops the year, so
@@ -537,7 +537,17 @@ pub struct EpisodeSortKey {
     /// room for another series to sort between them. The directory is one string
     /// for the whole season in the second case and two different strings in the
     /// first, which is exactly the other way round from what the name gives.
-    pub series_directory: String,
+    ///
+    /// **The components are held apart because string order on a joined path is
+    /// not tree order.** One series produces two groups when a subdirectory
+    /// holding episodes has no season directory above it - `Doctor Who/Extras`
+    /// beside `Doctor Who` - and the contiguity the prioritiser offers needs
+    /// those two adjacent. Joined, they are not: `/` is `0x2F`, so a sibling
+    /// differing by any character below it - a space, `-`, `.` - sorts between
+    /// `Series/Doctor Who` and `Series/Doctor Who/Extras`. Compared element-wise
+    /// the separator does not compete with the characters inside a name, and the
+    /// shorter chain is a prefix of the longer one, so nothing can come between.
+    pub series_directory: Vec<String>,
     /// The season the *file's* marker claims, not its directory's - the same
     /// choice `render` makes, so a misfiled episode is ordered where it belongs.
     pub season: u32,
@@ -1013,6 +1023,11 @@ mod tests {
         sort_key(Path::new(path)).unwrap_or_else(|| panic!("no sort key for {path}"))
     }
 
+    /// A group written the way a path reads, for an assertion to state.
+    fn group(directories: &str) -> Vec<String> {
+        directories.split('/').map(str::to_string).collect()
+    }
+
     /// Issue #138: the year is what tells two shows of one name apart, and it
     /// lives on the directory precisely because the canonical *filename* does
     /// not carry it. Grouping by the rendered name throws it away and leaves the
@@ -1066,7 +1081,7 @@ mod tests {
     /// missing season directory all describe one series.
     #[test]
     fn the_season_directory_is_not_part_of_the_group() {
-        let expected = "Series/Critical Role";
+        let expected = group("Series/Critical Role");
 
         for path in [
             "Series/Critical Role/Season 1/Critical Role - S01E12 - Kraghammer.mkv",
@@ -1077,6 +1092,37 @@ mod tests {
         ] {
             assert_eq!(key(path).series_directory, expected, "for {path}");
         }
+    }
+
+    /// Issue #191: the contiguity `--priority episode` offers rests on every
+    /// file of one series producing the same group, and a subdirectory holding
+    /// episodes with no season directory above them produces a longer one. Two
+    /// groups of one series are still adjacent when they are compared
+    /// component-wise; compared as joined strings they are not, because `/` is
+    /// `0x2F` and a sibling name differing by any character below it - a space,
+    /// `-`, `.` - sorts between them.
+    #[test]
+    fn a_sibling_directory_cannot_split_a_series_in_two() {
+        let proper = key("Series/Doctor Who/Season 01/Doctor Who - S01E01 - Rose.mkv");
+        let extras = key("Series/Doctor Who/Extras/Doctor Who - S01E01 - Rose.mkv");
+        let sibling = key(
+            "Series/Doctor Who - Confidential/Season 01/Doctor Who Confidential - S01E01 - Bringing Back the Doctor.mkv",
+        );
+
+        let mut sorted = vec![sibling.clone(), extras.clone(), proper.clone()];
+        sorted.sort();
+
+        let position = |wanted: &EpisodeSortKey| {
+            sorted
+                .iter()
+                .position(|key| key == wanted)
+                .expect("every key sorted is one of the three")
+        };
+        assert_eq!(
+            position(&proper).abs_diff(position(&extras)),
+            1,
+            "one series must be contiguous, and {sorted:?} puts another between its two groups"
+        );
     }
 
     /// Everything the queue orders, it orders by the marker in the filename -

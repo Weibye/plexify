@@ -497,10 +497,21 @@ by the marker. The rendered series name is wrong as a key in both directions: it
 year, so `Breaking Bad (2008)` and `Breaking Bad (2020)` become one indistinguishable group;
 and it is taken from the filename, so one directory holding both `Show - Long Name - S01E13`
 and `S01E14` becomes two groups with room for another series to sort between them. The
-directory is one string in the second case and two in the first, which is the other way round
+directory is one group in the second case and two in the first, which is the other way round
 from what the name gives. The season directory is excluded because it is what the marker
 orders *within*, and the root is included because a series of one name under `Series` and
 under `Anime` is two series.
+
+**The group is that chain as components, not as a joined path, because string order on a
+joined path is not tree order.** One series still produces two groups where a subdirectory
+holds episodes with no season directory above them — `Doctor Who/Extras` beside `Doctor Who`,
+since there is then no season directory to cut the chain at — and the contiguity the
+prioritiser offers needs those two adjacent. Joined they are not: `/` is `0x2F`, so a sibling
+series named the first plus any character below it — a space, `-`, `.` — sorts between
+`Series/Doctor Who` and `Series/Doctor Who/Extras`, and splits one series in two. Compared
+element-wise the separator never competes with the characters inside a name, and the shorter
+chain is a prefix of the longer one, so nothing can come between them. Keep the group a
+`Vec<String>`; a display string beside it is only safe while nothing orders by it.
 
 `sort_key` reads the path itself rather than calling `parse`, and that is deliberate rather
 than duplication: routing it through `parse` is what coupled the two decisions in the first
