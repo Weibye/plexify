@@ -138,15 +138,23 @@ beside it says which worker holds it. These windows are why the staging name a f
 is copied under carries the id of the worker that copied it.
 
 **Losing that race is a disposition, not an error**, and on both sides: `fail` returns
-`FailureDisposition::Lost` and `complete` returns `CompletionDisposition::Lost` when the rename
-finds nothing to move. Neither is a reason for `work` to stop or to sleep on a retry — the
+`FailureDisposition::Lost` and `complete` returns `CompletionDisposition::Lost` when the file
+is not there to move. Neither is a reason for `work` to stop or to sleep on a retry — the
 output of a lost completion is already in the library, and the job itself now belongs to a
-worker that will finish it or fail it. Both keep `NotFound` separate from every other error,
-because a work root that has dropped out is not a race and reporting it as one hides it;
-`complete` creates `_completed` first so that a `NotFound` can only be the job. The lost path
-also leaves the heartbeat alone, since it now speaks for whoever holds the claim, and deleting
-it would leave that worker judged by its job file's mtime alone and swept off a job it is
-still running.
+worker that will finish it or fail it. The lost path leaves the heartbeat alone, since it now
+speaks for whoever holds the claim, and deleting it would leave that worker judged by its job
+file's mtime alone and swept off a job it is still running.
+
+**Neither may spell "not there" as `ErrorKind::NotFound`.** `queue::is_absent` is that
+definition, shared with `status`, and it is why the kind is not enough: Windows reports an
+unreachable share as `NotFound` too, so the kind alone files a work root that has dropped out
+as a job somebody else took — silently, on the platform where a shared work root is most
+likely. `complete`'s rename and the open `take_for_move` marks with both go through it. What
+`is_absent` gives is the network failures it knows about, not a proof there are no others, so
+a caller may conclude "this path is absent" and may not go on to conclude *which* path was.
+`complete` deliberately does not create `_completed` first to narrow that: a work root
+somebody is clearing would then look like one that is fine, and the job stays in
+`_in_progress` for the sweep either way.
 
 **The work root is not the media root.** `JobQueue::new` takes both. `--work-dir`/`-w`
 controls the queue location and **defaults to the current working directory**, not to the

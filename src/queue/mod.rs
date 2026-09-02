@@ -760,6 +760,60 @@ fn quiet_for(seen: Option<SystemTime>, stale_after: Duration) -> bool {
     }
 }
 
+/// Whether a failed filesystem operation means "there is nothing at that path"
+/// or "we could not get to it".
+///
+/// This is the single definition of that distinction, and every place in the
+/// queue that treats a missing file as an ordinary outcome has to use it. The
+/// three of them ask it for the same reason: losing a race to another worker is
+/// routine and is reported as a disposition, while a work root that has dropped
+/// out is an error, and answering the second with the first hides an outage
+/// behind a shrug. CLAUDE.md designs for many workers on one shared work root,
+/// so that is not a hypothetical.
+///
+/// It cannot rest on the error kind alone. Off Windows it can: a mount that has
+/// gone away reports a connection or IO failure, and never `NotFound`.
+///
+/// Windows folds the entire network-error family into `NotFound`. A work root on
+/// a host that is not answering fails with `ERROR_BAD_NETPATH`, which
+/// `io::Error` reports as `ErrorKind::NotFound` with raw code 53, and a share
+/// that does not resolve gives `ERROR_BAD_NET_NAME` as `NotFound` with 67 - both
+/// indistinguishable by kind from a path that was looked up and found missing.
+/// So on Windows the raw code is the only evidence there is, and these are the
+/// codes that mean the path was never resolved.
+///
+/// The list is what is known to arrive this way, not a proof that nothing else
+/// does, so a caller may say "this is absent" and must not go on to say "and
+/// therefore that other thing is what is missing".
+///
+/// This is the same split as `FFmpegProcessor::ffmpeg_command`: both worker
+/// platforms matter, and neither branch is the general case.
+#[cfg(windows)]
+pub(crate) fn is_absent(error: &std::io::Error) -> bool {
+    /// Windows errors that arrive as `NotFound` but mean the path could not be
+    /// resolved over the network, not that nothing is there.
+    const UNREACHABLE: &[i32] = &[
+        51,   // ERROR_REM_NOT_LIST: the remote computer is not available
+        53,   // ERROR_BAD_NETPATH: the network path was not found
+        54,   // ERROR_NETWORK_BUSY
+        55,   // ERROR_DEV_NOT_EXIST: the network resource is no longer available
+        64,   // ERROR_NETNAME_DELETED: the share went away
+        67,   // ERROR_BAD_NET_NAME: the network name cannot be found
+        1231, // ERROR_NETWORK_UNREACHABLE
+        1232, // ERROR_HOST_UNREACHABLE
+    ];
+
+    error.kind() == std::io::ErrorKind::NotFound
+        && !error
+            .raw_os_error()
+            .is_some_and(|code| UNREACHABLE.contains(&code))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn is_absent(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+}
+
 /// Mark a job as being attended to, without reading or replacing it.
 ///
 /// Opening for write cannot create the file, so this fails rather than
@@ -769,13 +823,16 @@ fn quiet_for(seen: Option<SystemTime>, stale_after: Duration) -> bool {
 /// `Ok(false)` means the job is not there, which is the ordinary way to lose a
 /// race. Anything else is an error, and stays one: on a network work root a
 /// refused open is a work root that has dropped out, and reporting that as
-/// another worker having been quicker would hide it.
+/// another worker having been quicker would hide it. That is what [`is_absent`]
+/// is for, and why the test cannot be `ErrorKind::NotFound` - which is also the
+/// kind Windows gives a share that is not answering, so the kind alone says the
+/// job is gone on exactly the setup this function's caution is written for.
 async fn mark_attended(path: &std::path::Path) -> Result<bool> {
     let path = path.to_path_buf();
     let marked = tokio::task::spawn_blocking(move || {
         let file = match std::fs::File::options().write(true).open(&path) {
             Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) if is_absent(&e) => return Ok(false),
             Err(e) => return Err(e),
         };
         file.set_times(std::fs::FileTimes::new().set_modified(SystemTime::now()))?;
@@ -900,9 +957,22 @@ impl<'a> ClaimedJob<'a> {
     /// succeeded.
     ///
     /// The rename is what asks the question, so the answer cannot be out of
-    /// date: it moves the file or it says there was no file. `_completed` is
-    /// created first so that a `NotFound` can only be the job, never the
-    /// destination directory.
+    /// date: it moves the file or it says there was nothing to move. What it
+    /// does not say is *which* path was missing. A `clean` that removed
+    /// `_completed` out from under a running worker therefore reads as a lost
+    /// claim, and the job file stays in `_in_progress` for the next sweep to
+    /// requeue - one re-encode that `output_exists` then short-circuits.
+    /// Creating the destination first would narrow that, and is deliberately not
+    /// done: it would make a work root somebody is clearing look like one that is
+    /// fine, and it cannot make the absence unambiguous anyway, because
+    /// [`is_absent`] recognises the network failures it knows about rather than
+    /// proving there are no others.
+    ///
+    /// [`is_absent`] is what decides, and the test cannot be
+    /// `ErrorKind::NotFound`: Windows reports an unanswering share as `NotFound`
+    /// too, so the kind alone would file a work root that has dropped out as a
+    /// job somebody else finished - on the platform where a shared work root is
+    /// most likely.
     ///
     /// What it still cannot say is whether the job it moved is *this* worker's.
     /// A sweep's copy claimed by somebody else in between is renamed into
@@ -919,9 +989,6 @@ impl<'a> ClaimedJob<'a> {
         self.stop_heartbeat();
 
         let completed_path = self.queue.completed_dir.join(&self.job_name);
-        if let Some(parent) = completed_path.parent() {
-            async_fs::create_dir_all(parent).await?;
-        }
 
         match async_fs::rename(&self.in_progress_path, &completed_path).await {
             Ok(()) => {
@@ -929,7 +996,7 @@ impl<'a> ClaimedJob<'a> {
                 debug!("Marked job as completed: {}", self.job_name);
                 Ok(CompletionDisposition::Recorded)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(CompletionDisposition::Lost),
+            Err(e) if is_absent(&e) => Ok(CompletionDisposition::Lost),
             // A work root that has dropped out is not a lost race, and saying so
             // would hide it.
             Err(e) => Err(anyhow!(
@@ -1340,6 +1407,65 @@ mod tests {
         assert!(
             heartbeat_of(&in_progress_path).exists(),
             "the heartbeat belongs to whoever claims the job next, not to this worker"
+        );
+    }
+
+    /// A work root that has dropped out is not a job somebody else finished.
+    ///
+    /// Windows reports an unreachable share as `ErrorKind::NotFound`, so a
+    /// `complete` testing the kind alone files a transient outage as `Lost` -
+    /// the worker shrugs, moves on, and the encode it just finished is recorded
+    /// nowhere. This is the same mapping `status` already had to defend against,
+    /// asserted here against the real filesystem rather than a constructed
+    /// error, so it fails if the rename ever stops going through [`is_absent`].
+    ///
+    /// Serialised with the other test that probes an unresolvable UNC host:
+    /// two threads asking the SMB client for a host that is not there at the
+    /// same time get a different failure from either asking alone, and the raw
+    /// code is the whole subject here.
+    #[cfg(windows)]
+    #[serial_test::serial(unc_probe)]
+    #[test]
+    async fn an_unreachable_work_root_is_an_error_and_not_a_lost_claim() {
+        let temp_dir = TempDir::new().unwrap();
+        let unreachable = PathBuf::from(r"\\no-such-host-xyz\plexify-queue");
+        let queue = JobQueue::new(temp_dir.path().to_path_buf(), unreachable);
+
+        // A claim held on a work root that has since stopped answering. Built
+        // here rather than claimed, because nothing can be claimed on a share
+        // that is not there - which is the point.
+        let held_on_a_share_that_is_down = || {
+            let job = Job::new(
+                PathBuf::from("show.mkv"),
+                MediaFileType::Mkv,
+                Operation::Reencode { channels: None },
+                QualitySettings::default(),
+                PostProcessingSettings::default(),
+                temp_dir.path(),
+            );
+            let job_name = job.job_filename();
+            ClaimedJob {
+                queue: &queue,
+                in_progress_path: queue.in_progress_dir.join(&job_name),
+                job_name,
+                job,
+                heartbeat: None,
+            }
+        };
+
+        let completed = held_on_a_share_that_is_down().complete().await;
+        assert!(
+            completed.is_err(),
+            "an unreachable work root must be reported, not read as a claim \
+             another worker took: {completed:?}"
+        );
+
+        // The same trap sits under `fail`, in the open `take_for_move` marks
+        // with, and it is the same answer there.
+        let failed = held_on_a_share_that_is_down().fail("ffmpeg gave up").await;
+        assert!(
+            failed.is_err(),
+            "nor may a failure be filed as a claim another worker took: {failed:?}"
         );
     }
 
