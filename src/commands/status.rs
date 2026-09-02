@@ -19,7 +19,9 @@ use tokio::fs as async_fs;
 
 use crate::job::Job;
 use crate::paths::to_forward_slashes;
-use crate::queue::{heartbeat_path_for, last_activity, JobQueue, MAX_ATTEMPTS, STALE_AFTER};
+use crate::queue::{
+    heartbeat_path_for, is_absent, last_activity, JobQueue, MAX_ATTEMPTS, STALE_AFTER,
+};
 
 /// Report the state of a work root's queue.
 pub struct StatusCommand {
@@ -295,51 +297,6 @@ async fn job_files(directory: &Path) -> Result<Option<Vec<PathBuf>>> {
     }
 
     Ok(Some(paths))
-}
-
-/// Whether a failed read means "there is no such directory" or "we could not
-/// get to it".
-///
-/// The distinction is the whole of the difference between an empty report and
-/// an error, so it cannot rest on the error kind alone. Off Windows it can: a
-/// mount that has gone away reports a connection or IO failure, and never
-/// `NotFound`.
-///
-/// Windows folds the entire network-error family into `NotFound`. A work root on
-/// a host that is not answering fails with `ERROR_BAD_NETPATH`, which
-/// `io::Error` reports as `ErrorKind::NotFound` with raw code 53, and a share
-/// that does not resolve gives `ERROR_BAD_NET_NAME` as `NotFound` with 67 - both
-/// indistinguishable by kind from the `_queue` directory of a work root nothing
-/// has scanned into yet. So on Windows the raw code is the only evidence there
-/// is, and these are the codes that mean the path was never resolved rather than
-/// looked up and found missing.
-///
-/// This is the same split as `FFmpegProcessor::ffmpeg_command`: both worker
-/// platforms matter, and neither branch is the general case.
-#[cfg(windows)]
-fn is_absent(error: &std::io::Error) -> bool {
-    /// Windows errors that arrive as `NotFound` but mean the path could not be
-    /// resolved over the network, not that nothing is there.
-    const UNREACHABLE: &[i32] = &[
-        51,   // ERROR_REM_NOT_LIST: the remote computer is not available
-        53,   // ERROR_BAD_NETPATH: the network path was not found
-        54,   // ERROR_NETWORK_BUSY
-        55,   // ERROR_DEV_NOT_EXIST: the network resource is no longer available
-        64,   // ERROR_NETNAME_DELETED: the share went away
-        67,   // ERROR_BAD_NET_NAME: the network name cannot be found
-        1231, // ERROR_NETWORK_UNREACHABLE
-        1232, // ERROR_HOST_UNREACHABLE
-    ];
-
-    error.kind() == std::io::ErrorKind::NotFound
-        && !error
-            .raw_os_error()
-            .is_some_and(|code| UNREACHABLE.contains(&code))
-}
-
-#[cfg(not(windows))]
-fn is_absent(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::NotFound
 }
 
 /// Why a queue directory could not be listed, said in full.
@@ -997,7 +954,12 @@ mod tests {
     /// unreachable share as a work root nothing has scanned into. This asserts
     /// against the real filesystem rather than a constructed error, so it fails
     /// if that mapping is ever what the obvious fix assumed it was.
+    ///
+    /// Serialised with the queue's own UNC probe: two threads asking the SMB
+    /// client for a host that is not there at the same time get a different
+    /// failure from either asking alone, and the raw code is the whole subject.
     #[cfg(windows)]
+    #[serial_test::serial(unc_probe)]
     #[test]
     fn a_windows_network_path_that_does_not_resolve_is_unreachable_not_absent() {
         let unreachable = std::fs::read_dir(r"\\no-such-host-xyz\plexify-queue\_queue")

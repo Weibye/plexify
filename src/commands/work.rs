@@ -7,7 +7,7 @@ use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::ffmpeg::FFmpegProcessor;
-use crate::queue::{FailureDisposition, JobQueue, STALE_AFTER};
+use crate::queue::{CompletionDisposition, FailureDisposition, JobQueue, STALE_AFTER};
 use crate::JobPriority;
 
 /// Command to process jobs from the queue
@@ -198,7 +198,7 @@ impl WorkCommand {
                     "⏭️ Output already exists, nothing to do: {:?}",
                     job.full_output_path(media_root)
                 );
-                claimed_job.complete().await?;
+                report_completion(&job_name, claimed_job.complete().await?);
                 return Ok(true);
             }
 
@@ -242,7 +242,7 @@ impl WorkCommand {
                     }
 
                     job_pb.finish_with_message(format!("✅ Completed: {}", job_name));
-                    claimed_job.complete().await?;
+                    report_completion(&job_name, claimed_job.complete().await?);
                 }
                 Err(e) => {
                     job_pb.finish_with_message(format!("❌ Failed: {}", job_name));
@@ -288,6 +288,23 @@ impl WorkCommand {
         } else {
             Ok(false) // No job available
         }
+    }
+}
+
+/// Say what became of a finished job, and take neither outcome as a reason to
+/// stop working.
+///
+/// A claim swept out from under a worker that was late rather than dead is a
+/// job somebody else now owns, and the encode this worker just finished is
+/// already in the library. There is nothing to retry and nothing to recover, so
+/// the worker says what happened and goes back for the next job. Treating it as
+/// an error made a successful run log a failure and then sleep on it.
+fn report_completion(job_name: &str, disposition: CompletionDisposition) {
+    if disposition == CompletionDisposition::Lost {
+        warn!(
+            "{job_name} was taken back by a sweep while this worker was running it; \
+             the output is in place but the completion was recorded against another claim."
+        );
     }
 }
 
