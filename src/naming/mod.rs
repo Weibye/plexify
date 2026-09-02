@@ -545,8 +545,10 @@ pub struct EpisodeSortKey {
     /// those two adjacent. Joined, they are not: `/` is `0x2F`, so a sibling
     /// differing by any character below it - a space, `-`, `.` - sorts between
     /// `Series/Doctor Who` and `Series/Doctor Who/Extras`. Compared element-wise
-    /// the separator does not compete with the characters inside a name, and the
-    /// shorter chain is a prefix of the longer one, so nothing can come between.
+    /// the boundary between two components is not a character a name can sort
+    /// under, so a difference deeper in the chain never outranks one higher up -
+    /// which is what the two groups of a series need, whether the sibling's
+    /// chain is shorter, longer, or the same length.
     pub series_directory: Vec<String>,
     /// The season the *file's* marker claims, not its directory's - the same
     /// choice `render` makes, so a misfiled episode is ordered where it belongs.
@@ -1096,9 +1098,9 @@ mod tests {
 
     /// Issue #191: the contiguity `--priority episode` offers rests on every
     /// file of one series producing the same group, and a subdirectory holding
-    /// episodes with no season directory above them produces a longer one. Two
-    /// groups of one series are still adjacent when they are compared
-    /// component-wise; compared as joined strings they are not, because `/` is
+    /// episodes with no season directory above them produces a different one.
+    /// Two groups of one series still sort together when they are compared
+    /// component-wise; compared as joined strings they do not, because `/` is
     /// `0x2F` and a sibling name differing by any character below it - a space,
     /// `-`, `.` - sorts between them.
     #[test]
@@ -1109,19 +1111,17 @@ mod tests {
             "Series/Doctor Who - Confidential/Season 01/Doctor Who Confidential - S01E01 - Bringing Back the Doctor.mkv",
         );
 
-        let mut sorted = vec![sibling.clone(), extras.clone(), proper.clone()];
-        sorted.sort();
-
-        let position = |wanted: &EpisodeSortKey| {
-            sorted
-                .iter()
-                .position(|key| key == wanted)
-                .expect("every key sorted is one of the three")
-        };
-        assert_eq!(
-            position(&proper).abs_diff(position(&extras)),
-            1,
-            "one series must be contiguous, and {sorted:?} puts another between its two groups"
+        // The whole order, stated as strict comparisons, because adjacency does
+        // not discriminate and equality does not either: a key that dropped the
+        // group would make all three equal, and equal keys stay in the order
+        // they were given in - which a sorted vector then reads back as a pass.
+        assert!(
+            proper < extras,
+            "the two groups of one series must order together: {proper:?} then {extras:?}"
+        );
+        assert!(
+            extras < sibling,
+            "another series must sort outside both, not between them: {extras:?} then {sibling:?}"
         );
     }
 

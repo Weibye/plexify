@@ -509,9 +509,11 @@ since there is then no season directory to cut the chain at — and the contigui
 prioritiser offers needs those two adjacent. Joined they are not: `/` is `0x2F`, so a sibling
 series named the first plus any character below it — a space, `-`, `.` — sorts between
 `Series/Doctor Who` and `Series/Doctor Who/Extras`, and splits one series in two. Compared
-element-wise the separator never competes with the characters inside a name, and the shorter
-chain is a prefix of the longer one, so nothing can come between them. Keep the group a
-`Vec<String>`; a display string beside it is only safe while nothing orders by it.
+element-wise the boundary between two components is not a character a name can sort under, so
+a difference deeper in the chain never outranks one higher up. That is what the two groups of
+a series need, and it is not only about a chain being a prefix of another: `Series/a/a` and
+`Series/a b/a` are the same length and flip the same way. Keep the group a `Vec<String>`; a
+display string beside it is only safe while nothing orders by it.
 
 `sort_key` reads the path itself rather than calling `parse`, and that is deliberate rather
 than duplication: routing it through `parse` is what coupled the two decisions in the first
