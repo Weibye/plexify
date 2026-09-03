@@ -34,6 +34,12 @@ it where it was stated — in the issue comment, in the artifact — and say whe
 came from. At least three of this project's better findings came out of a figure that would
 not reconcile.
 
+**Dispatch from a current tree.** `git fetch` and put the working branch on `origin/main`
+before the `Agent` call, not after the agents report. An agent reasoning against code that has
+already moved re-derives a conclusion the merge has invalidated, and the review round-trip that
+catches it costs more than the fetch. The exception is a task that needs the older tree —
+reproducing a report against the commit it was filed on, or a bisect.
+
 **The oracle is CI, not this laptop.** See the quality-gate section of `CLAUDE.md`. Check the
 run on the PR before calling anything finished.
 
