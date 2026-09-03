@@ -408,6 +408,20 @@ pub enum Unresolvable {
     },
     /// The path does not start at a known library root.
     OutsideLibrary,
+    /// The name carries a marker a downloader leaves on a file it has not
+    /// finished writing - `.f247`, `.temp`, `.part`.
+    ///
+    /// This is a refusal by [`parse`] rather than a filter somewhere else
+    /// because the fault is a *field being invented*: `f247` is a yt-dlp format
+    /// id, and read as the episode title it becomes a name that renders to a
+    /// canonical destination. Nothing downstream can catch that - the
+    /// destination came out of `render` and is well-formed - and the rename is
+    /// what destroys the evidence that the file is a fragment.
+    DownloadFragment {
+        /// The marker as it appears, `.f247`, so the report names what it saw
+        /// rather than restating the rule.
+        marker: String,
+    },
     /// An episode file with no recognisable season/episode marker.
     NoEpisodeMarker,
     /// A marker naming a fraction of an episode, such as `S01E13.5`.
@@ -449,6 +463,9 @@ impl Unresolvable {
                     .map(|root| root.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
+            ),
+            Unresolvable::DownloadFragment { marker } => format!(
+                "'{marker}' is a marker a downloader leaves on a file it has not finished writing, not part of a title; renaming it into the library would leave a fragment that nothing can tell from a finished file"
             ),
             Unresolvable::NoEpisodeMarker => {
                 "no season and episode marker could be found in the name".to_string()
@@ -967,6 +984,12 @@ mod tests {
             "Elementary - S01E01-E02.5 - Pilot.mkv",
             "Elementary - S01E01-02 - Pilot.mkv",
             "Elementary - S01E01 - E02 Is A Title.mkv",
+            // A downloader's marker, in the two places one sits. Both refuse,
+            // and refusing is what this property accepts - what it would catch
+            // is the opposite failure, a name accepted here whose destination
+            // the same rule then refuses.
+            "Elementary - S01E01 (1080p60).f247.webm",
+            "Elementary - S01E01 - Pilot.temp.mkv",
         ];
 
         let mut proposals = 0;
@@ -996,6 +1019,40 @@ mod tests {
         assert!(
             proposals > 0,
             "the corpus proposed nothing, so it proved nothing"
+        );
+    }
+
+    /// The report keeps the file and loses the proposal, which is the whole
+    /// point: `fix` reads `renames()` and never sees an `Unresolvable`, while the
+    /// reader still gets the path and a reason naming the marker.
+    #[test]
+    fn a_download_fragment_is_put_in_front_of_a_person_instead_of_renamed() {
+        let fragment = Path::new(
+            "Series/Super Best Friends Play - FFX/Super Best Friends Play - Final Fantasy X - S01E39 (720p30).f247.webm",
+        );
+
+        let Assessment::Unresolvable(reason) = assess(fragment) else {
+            panic!(
+                "a fragment must not earn a destination: {:?}",
+                assess(fragment)
+            );
+        };
+        assert!(
+            reason.reason().contains(".f247"),
+            "the reason has to name what it saw: {}",
+            reason.reason()
+        );
+
+        // The completed episode beside it is untouched.
+        assert_eq!(
+            assess(Path::new(
+                "Series/Super Best Friends Play - FFX/Super Best Friends Play - Final Fantasy X - S01E13 (1080p60).webm"
+            )),
+            Assessment::Rename {
+                destination:
+                    "Series/Super Best Friends Play - FFX/Season 01/Super Best Friends Play - Final Fantasy X - S01E13 [1080p60].webm"
+                        .to_string()
+            }
         );
     }
 
