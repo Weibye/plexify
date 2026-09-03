@@ -42,6 +42,12 @@ pub enum IssueKind {
 ///
 /// A note proposes nothing and nothing acts on one. It exists because the
 /// report is read by a person who can see what the tool cannot.
+///
+/// A note is not a substitute for a verdict either, so the same path can carry
+/// both: a file sitting in a disagreeing series directory can still need a
+/// rename for a reason that has nothing to do with the directory. A note must
+/// therefore never state what the report as a whole proposes for its path -
+/// only the report knows that, and only by reading its own [`ValidationReport::issues`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ValidationNote {
     /// The file as it exists, relative to the media root, with `/` separators.
@@ -53,16 +59,21 @@ pub struct ValidationNote {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum NoteKind {
     /// The series directory holding this file names a different series than
-    /// the file does. Neither name is assumed correct, so nothing is proposed.
+    /// the file does. Neither name is assumed correct, so the directory is
+    /// left alone.
     SeriesDirectoryDisagrees { directory: String, series: String },
 }
 
 impl NoteKind {
     /// A one-line explanation, for the validation report.
+    ///
+    /// It says what was observed and what is left alone because of it, and
+    /// stops there. What the report proposes for the file is a separate
+    /// question with a separate answer - see [`ValidationReport::proposal_for`].
     pub fn explain(&self) -> String {
         match self {
             NoteKind::SeriesDirectoryDisagrees { directory, series } => format!(
-                "the directory says '{directory}' and the file says '{series}'; nothing is proposed, because the path does not say which is right"
+                "the directory says '{directory}' and the file says '{series}'; the directory is left as it is, because the path does not say which is right"
             ),
         }
     }
@@ -97,6 +108,19 @@ impl ValidationReport {
         self.issues
             .iter()
             .filter(|issue| matches!(issue.kind, IssueKind::NeedsDecision { .. }))
+    }
+
+    /// What this report proposes for a path, if anything.
+    ///
+    /// A note and an issue are answers to different questions, so one path can
+    /// carry both. Anything rendering a note has to ask this rather than assume
+    /// the answer: a note that asserts nothing was proposed contradicts the
+    /// renames listed above it in the same report.
+    pub fn proposal_for(&self, path: &str) -> Option<&IssueKind> {
+        self.issues
+            .iter()
+            .find(|issue| issue.path == path)
+            .map(|issue| &issue.kind)
     }
 }
 
@@ -372,6 +396,11 @@ impl ValidateCommand {
     /// Deliberately separate from `assess_file`: a file can be canonical and
     /// still carry a note, and a file can need a rename *and* carry one, so a
     /// note is never one of the outcomes an assessment chooses between.
+    ///
+    /// The one overlap that cannot occur is a note on a path reported as
+    /// `NeedsDecision`, and that holds only because both functions call the same
+    /// pure `parse` on the same string, so a path one refuses the other refuses
+    /// too. A `NoteKind` that read the path itself instead would not inherit it.
     fn note_for(&self, relative_path: &std::path::Path) -> Option<ValidationNote> {
         let disagreement = series_directory_disagreement(relative_path)?;
 
@@ -501,7 +530,7 @@ impl ValidateCommand {
         let _ = writeln!(out, "✏️  Renames proposed: {}", renames.len());
         let _ = writeln!(out, "🤔 Needing a decision: {}", decisions.len());
         if !report.notes.is_empty() {
-            let _ = writeln!(out, "📝 Noted, nothing proposed: {}", report.notes.len());
+            let _ = writeln!(out, "📝 Also noted: {}", report.notes.len());
         }
         let _ = writeln!(
             out,
@@ -541,11 +570,26 @@ impl ValidateCommand {
         }
 
         if !report.notes.is_empty() {
-            let _ = writeln!(out, "\n📝 Noted, and nothing proposed:");
-            let _ = writeln!(out, "───────────────────────────────");
+            let _ = writeln!(out, "\n📝 Also noted:");
+            let _ = writeln!(out, "──────────────");
             for note in &report.notes {
                 let _ = writeln!(out, "\n  {}", note.path);
                 let _ = writeln!(out, "  {}", note.kind.explain());
+                // The note said what it observed; the report says what it
+                // proposes for the same file, which is a different answer and
+                // is not always "nothing".
+                match report.proposal_for(&note.path) {
+                    Some(IssueKind::Rename { destination }) => {
+                        let _ = writeln!(out, "  this file is still proposed for rename:");
+                        let _ = writeln!(out, "→ {destination}");
+                    }
+                    Some(IssueKind::NeedsDecision { reason }) => {
+                        let _ = writeln!(out, "  this file also needs a decision: {reason}");
+                    }
+                    None => {
+                        let _ = writeln!(out, "  nothing is proposed for this file.");
+                    }
+                }
             }
         }
 
@@ -1008,14 +1052,109 @@ mod tests {
 
         let rendered = ValidateCommand::new(media_root.to_path_buf()).render_report(&report);
         assert!(
-            rendered.contains("Noted, and nothing proposed"),
+            rendered.contains("Also noted:"),
             "a library with nothing to rename must still show its notes: {rendered}"
         );
+        assert!(rendered.contains("nothing is proposed for this file."));
         assert!(rendered.contains("'Super Best Friends Play - FFX'"));
         assert!(
             !rendered.contains("Re-run with --fix"),
             "a note is not something --fix carries out: {rendered}"
         );
+    }
+
+    /// A note and an issue answer different questions about one file, so the
+    /// two must never contradict each other in the same report. The note is
+    /// about the *directory*, which is left alone; what happens to the *file*
+    /// comes from the report's own issues, and here it is a rename.
+    #[tokio::test]
+    async fn a_noted_file_that_is_also_renamed_says_so() {
+        let temp = TempDir::new().unwrap();
+        let media_root = temp.path();
+
+        // Two faults at once: the directory names a different series, and the
+        // season directory and marker are both off canonical form.
+        let season = media_root.join("Series/FFX/Season 1");
+        fs::create_dir_all(&season).unwrap();
+        fs::write(season.join("Final Fantasy X - s01e13 - Zanarkand.webm"), "").unwrap();
+
+        let report = ValidateCommand::new(media_root.to_path_buf())
+            .execute()
+            .await
+            .unwrap();
+
+        let note = match report.notes.as_slice() {
+            [note] => note.clone(),
+            other => panic!("expected exactly one note, got {other:?}"),
+        };
+        let destination = only_destination(&report);
+        assert_eq!(
+            report.proposal_for(&note.path),
+            Some(&IssueKind::Rename {
+                destination: destination.clone()
+            }),
+            "the noted path is the one being renamed, or this test measures nothing"
+        );
+
+        let rendered = ValidateCommand::new(media_root.to_path_buf()).render_report(&report);
+        assert!(
+            !rendered.contains("nothing is proposed"),
+            "the report proposes a rename for this very path: {rendered}"
+        );
+        assert!(
+            rendered.contains("this file is still proposed for rename:"),
+            "the note must say what was proposed for its path: {rendered}"
+        );
+        assert!(
+            rendered.matches(&destination).count() >= 2,
+            "the destination belongs beside the note as well as in the rename list: {rendered}"
+        );
+    }
+
+    /// The report-wide form of the same property: nothing in `notes` may claim
+    /// something `issues` contradicts. Rendering a note reads `proposal_for`,
+    /// so the only way the two can disagree is a noted path the report says is
+    /// undecidable - which `note_for` cannot produce, because both it and
+    /// `assess_file` refuse on the same `parse`.
+    #[tokio::test]
+    async fn no_noted_path_is_also_undecidable() {
+        let temp = TempDir::new().unwrap();
+        let media_root = temp.path();
+
+        // A spread of shapes: canonical, renameable, undecidable, and each of
+        // the first two in a directory that disagrees with its files.
+        for (directory, file) in [
+            ("Series/Breaking Bad/Season 01", "Breaking Bad - S01E01.mkv"),
+            ("Series/FFX/Season 1", "Final Fantasy X - s01e13.webm"),
+            ("Series/FFX/Season 01", "Final Fantasy X - S01E14.webm"),
+            ("Series/Elementary/Season 02", "Elementary - S02E05.5.mkv"),
+            ("Series/ELM/Season 02", "Elementary - S02E06.5.mkv"),
+        ] {
+            let season = media_root.join(directory);
+            fs::create_dir_all(&season).unwrap();
+            fs::write(season.join(file), "").unwrap();
+        }
+
+        let report = ValidateCommand::new(media_root.to_path_buf())
+            .execute()
+            .await
+            .unwrap();
+
+        assert!(!report.notes.is_empty(), "the fixture must produce notes");
+        assert!(
+            report.needing_decision().next().is_some(),
+            "the fixture must produce an undecidable path too"
+        );
+
+        for note in &report.notes {
+            assert!(
+                !matches!(
+                    report.proposal_for(&note.path),
+                    Some(IssueKind::NeedsDecision { .. })
+                ),
+                "a path cannot be both noted and undecidable: {note:?}"
+            );
+        }
     }
 
     /// A note is an observation, not a proposal, so nothing in `fix` reads it.
