@@ -628,6 +628,12 @@ attach `.context(...)` and trust that the cause underneath still reaches the use
 - Integration tests build isolated trees with `tempfile::TempDir`. Tests that depend on
   process-wide state use `serial_test`.
 
+## The fleet
+
+Three roles work this repository — NEXUS in the main session, VESPER and ORION as subagents
+defined in `.claude/agents/`. `docs/FLEET.md` describes who they are, the standing rules they
+work under, and how to re-seed a session after context is cleared.
+
 ## Pull requests
 
 Transient information — "X is now faster", "this fixes the bug from last week" — belongs in
