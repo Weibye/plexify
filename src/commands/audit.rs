@@ -427,17 +427,17 @@ impl AuditCommand {
                 let _ = writeln!(out, "────────────────────────────────────");
                 let _ = writeln!(
                     out,
-                    "   {} file(s) are shorter on disk than they claim to be - {:.1} GB in all.\n   FFprobe reads the absent parts as zeros, so the verdicts above do not see this.\n   A file still being written looks the same, so nothing here is treated as damage.",
+                    "   {} file(s) are shorter on disk than they claim to be - {} in all.\n   FFprobe reads the absent parts as zeros, so the verdicts above do not see this.\n   A file still being written looks the same, so nothing here is treated as damage.",
                     missing.len(),
-                    total as f64 / 1e9,
+                    in_scale(total),
                 );
                 for (entry, bytes) in missing {
                     let _ = writeln!(
                         out,
-                        "   {:3.0}% of this file is not on disk  ({:6.1} GB of {:6.1} GB)  {}{}",
+                        "   {:3.0}% of this file is not on disk  ({:>9} of {:>9})  {}{}",
                         percent(bytes as usize, entry.size_bytes.max(1) as usize),
-                        bytes as f64 / 1e9,
-                        entry.size_bytes as f64 / 1e9,
+                        in_scale(bytes),
+                        in_scale(entry.size_bytes),
                         entry.path,
                         in_flight_caveat(entry.modified),
                     );
@@ -582,6 +582,29 @@ fn in_flight_caveat(modified: Option<SystemTime>) -> &'static str {
         "  (written just now - may still be arriving)"
     } else {
         ""
+    }
+}
+
+/// Where a byte count stops being said in megabytes.
+///
+/// Not `1e9`, so that the 50 KB below it which would round to `1000.0 MB` is
+/// said as `1.0 GB` instead and no column ever holds both spellings of the
+/// same magnitude.
+const GB_FROM: u64 = 999_950_000;
+
+/// A byte count with its own unit, so the caller cannot fix one for a column.
+///
+/// The unit is chosen per value rather than per column because the values in
+/// one column differ by orders of magnitude - a library holds 33 MB episodes
+/// and 4.5 GB features - and a unit that suits either end prints the other as
+/// zero. There is deliberately no unit below MB: `SHORTFALL_FLOOR_BYTES` holds
+/// every figure this renders at or above one mebibyte, so nothing reachable
+/// rounds to `0.0 MB`. Width is the caller's, so prose does not carry padding.
+fn in_scale(bytes: u64) -> String {
+    if bytes >= GB_FROM {
+        format!("{:.1} GB", bytes as f64 / 1e9)
+    } else {
+        format!("{:.1} MB", bytes as f64 / 1e6)
     }
 }
 
@@ -891,6 +914,39 @@ mod tests {
         assert_eq!(Allocation::Unmeasurable.shortfall(4 << 30), None);
     }
 
+    /// The population this renders, and the two boundaries between the units.
+    #[test]
+    fn a_size_is_said_in_the_unit_that_leaves_it_some_digits() {
+        // The real library from issue #201: ten small files and one large one,
+        // every one of which printed as `0.0 GB` or `0.1 GB` before.
+        assert_eq!(in_scale(33_009_664), "33.0 MB");
+        assert_eq!(in_scale(39_419_904), "39.4 MB");
+        assert_eq!(in_scale(107_479_040), "107.5 MB");
+        assert_eq!(in_scale(4_525_286_741), "4.5 GB");
+        assert_eq!(in_scale(240_000_000), "240.0 MB");
+
+        // The floor: no caller can go below one mebibyte, and one mebibyte is
+        // still a figure rather than a zero.
+        assert_eq!(in_scale(SHORTFALL_FLOOR_BYTES), "1.0 MB");
+
+        // The unit boundary, and the sliver below it that must not be spelled
+        // `1000.0 MB` in a column whose next row says `1.0 GB`.
+        assert_eq!(in_scale(GB_FROM - 1), "999.9 MB");
+        assert_eq!(in_scale(GB_FROM), "1.0 GB");
+        assert_eq!(in_scale(1_000_000_000), "1.0 GB");
+
+        // Not reachable through the report, but the function is total.
+        assert_eq!(in_scale(0), "0.0 MB");
+        assert_eq!(in_scale(u64::MAX), "18446744073.7 GB");
+
+        // A varying unit is only tolerable because the column is a fixed width
+        // the value fits in. This is the half of that the report cannot assert
+        // off Unix, where the section it belongs to never renders.
+        for bytes in [0, SHORTFALL_FLOOR_BYTES, GB_FROM - 1, GB_FROM, 1 << 40] {
+            assert_eq!(format!("{:>9}", in_scale(bytes)).len(), 9, "{bytes}");
+        }
+    }
+
     #[test]
     fn the_in_flight_caveat_is_attached_to_a_line_that_may_be_read_on_its_own() {
         let now = SystemTime::now();
@@ -1037,6 +1093,11 @@ mod tests {
         let rendered = command.render_report(&report);
         assert!(rendered.contains("not on disk"), "{rendered}");
         assert!(rendered.contains("half-there.mp4"), "{rendered}");
+        // A 32 MiB hole is the size the whole section exists to report, so it
+        // is stated rather than rounded away. The figures themselves are not
+        // asserted: the fixture's own size is an FFmpeg build's business, and
+        // only the unit the row lands in is this test's.
+        assert!(rendered.contains(" MB of "), "{rendered}");
     }
 
     /// A platform with no `st_blocks` says it did not look. Reporting 0%
