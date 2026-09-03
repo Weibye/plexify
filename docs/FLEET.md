@@ -34,6 +34,12 @@ it where it was stated — in the issue comment, in the artifact — and say whe
 came from. At least three of this project's better findings came out of a figure that would
 not reconcile.
 
+**Dispatch from a current tree.** `git fetch` and put the working branch on `origin/main`
+before the `Agent` call, not after the agents report. An agent reasoning against code that has
+already moved re-derives a conclusion the merge has invalidated, and the review round-trip that
+catches it costs more than the fetch. The exception is a task that needs the older tree —
+reproducing a report against the commit it was filed on, or a bisect.
+
 **The oracle is CI, not this laptop.** See the quality-gate section of `CLAUDE.md`. Check the
 run on the PR before calling anything finished.
 
@@ -43,7 +49,11 @@ run against the user's library without the user saying so in that session.
 
 **The Pi is `pi@192.168.68.54` (citadel), passwordless SSH from this machine.** Work on it is
 permitted, but **ask first if the local time is between 19:00 and 23:30 Oslo** — the media
-server is in use then. `plexmon.py` and `profile_library.py` live on it; the Plex token is
+server is in use then. This machine's wall clock already *is* Oslo time, so read `date` and
+stop; converting it is what goes wrong. The zone it prints is mislabelled and
+`TZ=Europe/Oslo date` answers two hours early, which reads a quiet-hours request as clear.
+The shares `M:` and `N:` are the same disks over SMB, so a read-only `validate` is covered by
+this too. `plexmon.py` and `profile_library.py` live on it; the Plex token is
 read through plexmon's own discovery and never printed or put on a command line.
 
 ## How work flows
