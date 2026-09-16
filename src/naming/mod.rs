@@ -507,6 +507,10 @@ impl Unresolvable {
 /// and a filename can simply be wrong - so this is a note on a file and never a
 /// proposal. Nothing here renames a series directory: that would move every
 /// file in it on evidence that does not support the move.
+///
+/// A difference of punctuation alone is decidable, and never reaches this: the
+/// parser takes the directory's spelling then, so the file is proposed a rename
+/// to it and the two agree afterwards.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeriesDirectoryDisagreement {
     /// The series directory as it is on disk.
@@ -954,6 +958,12 @@ mod tests {
             "Veronica Mars S02E04 (2004)",
             "Veronica Mars S02E04-S02E05",
             "Show.S01",
+            // Directories spelling the filename's series with different
+            // punctuation, whose spelling the parse adopts, and one differing
+            // by case alone, whose spelling it must not.
+            "Elementary!",
+            "E-lementary (2012)",
+            "elementary",
         ];
         let season_directories = [
             "",
@@ -990,6 +1000,9 @@ mod tests {
             // the same rule then refuses.
             "Elementary - S01E01 (1080p60).f247.webm",
             "Elementary - S01E01 - Pilot.temp.mkv",
+            // Against `S.W.A.T`, a name the directory punctuates and the file
+            // does not.
+            "SWAT - S01E01.mkv",
         ];
 
         let mut proposals = 0;
@@ -1067,6 +1080,76 @@ mod tests {
                 series: "Super Best Friends Play - Final Fantasy X".to_string(),
             })
         );
+    }
+
+    /// Issue #209: the filename lost the hyphen that separates production from
+    /// show, and its directory still has it.
+    #[test]
+    fn a_series_name_differing_from_its_directory_by_punctuation_takes_the_directory_s() {
+        let path = Path::new(
+            "Series/Super Best Friends Play - Bloodborne/Super Best Friends Play Bloodborne - S01E01 (720p30).webm",
+        );
+
+        let destination = "Series/Super Best Friends Play - Bloodborne/Season 01/Super Best Friends Play - Bloodborne - S01E01 [720p30].webm";
+        assert_eq!(
+            assess(path),
+            Assessment::Rename {
+                destination: destination.to_string()
+            }
+        );
+        assert_eq!(assess(Path::new(destination)), Assessment::Canonical);
+        assert_eq!(series_directory_disagreement(path), None);
+        assert_eq!(series_directory_disagreement(Path::new(destination)), None);
+    }
+
+    #[test]
+    fn a_series_name_differing_from_its_directory_by_more_than_punctuation_is_kept() {
+        for (path, series) in [
+            // Different words: the filename's is the better name and must survive.
+            (
+                "Series/Super Best Friends Play - FFX/Season 01/Super Best Friends Play - Final Fantasy X - S01E13.webm",
+                "Super Best Friends Play - Final Fantasy X",
+            ),
+            // Case alone is not a disagreement, so the directory's capitals are
+            // not adopted - here they are the worse spelling.
+            (
+                "Anime/Fullmetal Alchemist BrotherHood/Season 01/Fullmetal Alchemist Brotherhood - S01E01.mkv",
+                "Fullmetal Alchemist Brotherhood",
+            ),
+            (
+                "Anime/Made In Abyss/Season 01/Made in Abyss - S01E01.mkv",
+                "Made in Abyss",
+            ),
+            // A case difference outside ASCII is still only case.
+            (
+                "Anime/Élite BrotherHood/Season 01/élite Brotherhood - S01E01.mkv",
+                "élite Brotherhood",
+            ),
+            // Punctuation the file has and the directory lacks is kept.
+            (
+                "Anime/SteinsGate/Season 01/Steins;Gate - S01E01.mkv",
+                "Steins;Gate",
+            ),
+            (
+                "Series/Marvels Agents of SHIELD/Season 01/Marvel's Agents of S.H.I.E.L.D. - S01E01.mkv",
+                "Marvel's Agents of S.H.I.E.L.D",
+            ),
+            // An accent written as a separate combining character is not
+            // punctuation, whichever side holds it.
+            (
+                "Series/Pokemon/Season 01/Poke\u{301}mon - S01E01.mkv",
+                "Poke\u{301}mon",
+            ),
+            (
+                "Series/Poke\u{301}mon/Season 01/Pokemon - S01E01.mkv",
+                "Pokemon",
+            ),
+        ] {
+            match parse(path) {
+                Ok(MediaName::Episode(episode)) => assert_eq!(episode.series, series, "for {path}"),
+                other => panic!("expected an episode for {path}, got {other:?}"),
+            }
+        }
     }
 
     #[test]
