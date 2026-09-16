@@ -128,6 +128,13 @@ fn year_marker() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"\b(19\d{2}|20\d{2})\b").unwrap())
 }
 
+/// Trailing bracketed or parenthesised groups on a filename stem - `[1080p]`,
+/// `(720p30)`, or several of them.
+fn trailing_groups() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?:\s*(?:\[[^\]]*\]|\([^)]*\)))+\s*$").unwrap())
+}
+
 /// Trailing `(2001)` and `{tvdb-81189}` on a series directory name, in any
 /// combination - `Breaking Bad (2008) {tvdb-81189}` carries both.
 fn directory_annotations() -> &'static Regex {
@@ -156,6 +163,16 @@ pub fn parse(path: &str) -> Result<MediaName, Unresolvable> {
     }
 
     let (filename, directories) = below_root.split_last().ok_or(Unresolvable::NotAMediaFile)?;
+
+    // Before anything is read out of the name, because what makes this worth
+    // refusing is that the rest of the name is *fine*: the series, the marker and
+    // the quality are all where they belong, and only the token in the title's
+    // place is a downloader's bookkeeping. Ahead of the root branch, since a film
+    // is downloaded the same way an episode is.
+    if let Some(marker) = download_marker(filename) {
+        return Err(Unresolvable::DownloadFragment { marker });
+    }
+
     let (stem, extension) = split_extension(filename)?;
 
     if root.is_episodic() {
@@ -172,6 +189,81 @@ fn split_extension(filename: &str) -> Result<(&str, &str), Unresolvable> {
             Ok((stem, extension))
         }
         _ => Err(Unresolvable::NotAMediaFile),
+    }
+}
+
+/// The marker a downloader leaves on a file it has not finished writing, if the
+/// name carries one.
+///
+/// Two shapes, and they sit in different places:
+///
+/// - a **secondary extension** on the stem, `<name>.f247.webm` (yt-dlp writes one
+///   file per format id before muxing them) and `<name>.temp.webm` (the mux
+///   target itself);
+/// - a **terminal extension**, `.part`, `.ytdl`, `.part-Frag12`.
+///
+/// Only the first is reachable through `validate` today, because the second is
+/// not a media extension and never gets collected. It is here anyway: the rule
+/// is a property of the name, and leaving it to one caller's extension list is
+/// how the next caller inherits the bug.
+///
+/// **The list is what has been observed, and does not grow on speculation.** The
+/// argument is `BITMAP_SUBTITLE_CODECS`' one in reverse: there, an unrecognised
+/// codec is mapped because being wrong costs a job that can be re-run. Here,
+/// being wrong by refusing a real file costs a line in a report, and being wrong
+/// by renaming a fragment costs the only evidence that an episode is broken
+/// rather than absent. So a name that is only *probably* debris is still refused,
+/// and a shape nobody has seen is still not matched.
+///
+/// Matching is case-sensitive, which is the one narrowing worth having: yt-dlp
+/// writes `f` and `temp` in lower case, and requiring that keeps a dot-separated
+/// release whose title ends in `The.Temp` out of the rule. `temp` in a spaced
+/// title - `S01E04 - The Temp` - was never at risk, since there is no dot in
+/// front of it.
+///
+/// It is tested against the stem with any trailing `[1080p]`/`(720p30)` group
+/// removed as well as against the stem itself. That is not about matching more
+/// debris; it is what keeps the module's round trip intact. `render` writes
+/// quality in exactly that position, so a title ending in `.temp` would render to
+/// a destination this function then refuses - a file moved once and reported the
+/// next run. Refusing it at the source instead means `render` can emit nothing
+/// `parse` will not take back.
+fn download_marker(filename: &str) -> Option<String> {
+    let (stem, extension) = filename.rsplit_once('.')?;
+
+    if extension == "part" || extension == "ytdl" || is_fragment_index(extension) {
+        return Some(format!(".{extension}"));
+    }
+
+    let bare = trailing_groups().replace(stem, "");
+
+    for candidate in [stem, bare.as_ref()] {
+        if let Some((_, last)) = candidate.rsplit_once('.') {
+            if last == "temp" || is_format_id(last) {
+                return Some(format!(".{last}"));
+            }
+        }
+    }
+
+    None
+}
+
+/// `f247` - a yt-dlp format id, written as a secondary extension on the file
+/// holding that one format.
+fn is_format_id(token: &str) -> bool {
+    match token.strip_prefix('f') {
+        Some(digits) => {
+            (1..=4).contains(&digits.len()) && digits.bytes().all(|byte| byte.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
+/// `part-Frag12` - one piece of a fragmented download.
+fn is_fragment_index(token: &str) -> bool {
+    match token.strip_prefix("part-Frag") {
+        Some(digits) => !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()),
+        None => false,
     }
 }
 
@@ -900,6 +992,107 @@ mod tests {
         assert!(
             doubles > 0,
             "the corpus held no double episode, so it proved nothing"
+        );
+    }
+
+    /// The five files the library actually holds, from one directory, plus the
+    /// three terminal forms the same downloader writes.
+    ///
+    /// Each one parses without this rule: the series, the marker and the quality
+    /// are all in place, and only the token where the title belongs is a format
+    /// id. That is what makes it dangerous rather than merely untidy - the
+    /// destination `render` builds from it is a perfectly canonical episode name.
+    #[test]
+    fn a_downloader_s_marker_is_refused_rather_than_read_as_a_title() {
+        let observed = [
+            (
+                "Series/Super Best Friends Play - FFX/Super Best Friends Play - Final Fantasy X - S01E39 (720p30).f247.webm",
+                ".f247",
+            ),
+            (
+                "Series/Super Best Friends Play - FFX/Super Best Friends Play - Final Fantasy X - S01E39 (720p30).f251.webm",
+                ".f251",
+            ),
+            (
+                "Series/Super Best Friends Play - FFX/Super Best Friends Play - Final Fantasy X - S01E17 (1080p60).f303.webm",
+                ".f303",
+            ),
+            (
+                "Series/Super Best Friends Play - FFX/Super Best Friends Play - Final Fantasy X - S01E39 (720p30).temp.webm",
+                ".temp",
+            ),
+            // Not seen in the library, and refused on the same terms. These end
+            // the whole filename rather than sitting before the extension.
+            ("Series/Show/Season 01/Show - S01E01.mkv.part", ".part"),
+            ("Series/Show/Season 01/Show - S01E01.mkv.ytdl", ".ytdl"),
+            (
+                "Series/Show/Season 01/Show - S01E01.mkv.part-Frag12",
+                ".part-Frag12",
+            ),
+            // A film is downloaded the same way, and the refusal is ahead of the
+            // branch that tells the two apart.
+            (
+                "Movies/The Dark Knight (2008)/The Dark Knight (2008).f303.webm",
+                ".f303",
+            ),
+        ];
+
+        for (path, marker) in observed {
+            assert_eq!(
+                parse(path),
+                Err(Unresolvable::DownloadFragment {
+                    marker: marker.to_string()
+                }),
+                "{path}"
+            );
+        }
+    }
+
+    /// The words themselves are ordinary, and the rule is about where a dot is.
+    #[test]
+    fn a_title_holding_temp_or_part_is_still_a_title() {
+        assert_eq!(
+            episode("Series/Show/Season 01/Show - S01E04 - The Temp.mkv")
+                .title
+                .as_deref(),
+            Some("The Temp")
+        );
+        assert_eq!(
+            episode("Series/Show/Season 01/Show - S01E05 - Part Two.mkv")
+                .title
+                .as_deref(),
+            Some("Part Two")
+        );
+        // A dot-separated release whose last word happens to be one of them.
+        // Case is the only thing separating this from a yt-dlp mux target, and
+        // it is enough: yt-dlp writes `temp` in lower case.
+        assert_eq!(
+            episode("Series/Show/Season 01/Show.S01E06.The.Temp.mkv")
+                .title
+                .as_deref(),
+            Some("The Temp")
+        );
+    }
+
+    /// The name this rule is knowingly wrong about, and the reason it is refused
+    /// anyway.
+    ///
+    /// `.temp` before a trailing `[1080p]` is indistinguishable from a title
+    /// whose last word ends in a literal `.temp`, and no reading of the text
+    /// separates them. Refusing costs a line in the report; renaming costs the
+    /// evidence that an episode is broken rather than absent.
+    ///
+    /// Testing the stem with the group removed is also what keeps `render`'s
+    /// output parseable: accepted here, the title would be `My Foo.temp`, and the
+    /// destination `Show - S01E07 - My Foo.temp.mkv` is a name this same rule
+    /// refuses - so `--fix` would move the file once and report it the next run.
+    #[test]
+    fn a_marker_behind_a_quality_group_is_refused_at_the_source() {
+        assert_eq!(
+            parse("Series/Show/Season 01/Show - S01E07 - My Foo.temp [1080p].mkv"),
+            Err(Unresolvable::DownloadFragment {
+                marker: ".temp".to_string()
+            })
         );
     }
 
