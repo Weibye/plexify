@@ -102,7 +102,11 @@ Constraints that are easy to get wrong:
   looks for the season anywhere in the chain rather than only at the end.
 - The series name comes from the **file**, not its directory; the directory is consulted only
   when the filename carries no name at all. A directory may be an abbreviation of the series,
-  or simply wrong, and rewriting files to match it would spread that.
+  or simply wrong, and rewriting files to match it would spread that. The one exception is a
+  difference of **punctuation alone** (`Show Name` under `Show - Name`): the directory's
+  spelling is taken, because the file carries nothing it lacks. It is gated on the directory
+  disagreeing at all, and a difference of case is not a disagreement - so `BrotherHood` on a
+  directory never overwrites `Brotherhood` in a file.
 
 Two heuristics are judgement calls worth knowing about, both driven by the cases below: a
 leading roman numeral is dropped from an episode title, and a shouted trailing token is read

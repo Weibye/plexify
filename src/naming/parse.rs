@@ -338,7 +338,8 @@ fn parse_episode(
 
     // The name in the file wins over the name of the directory holding it: a
     // directory may be an abbreviation of the series, or plain wrong, and
-    // rewriting a file to match a directory would spread that.
+    // rewriting a file to match a directory would spread that. The one
+    // exception, a difference of punctuation alone, is taken below.
     let mut series = clean_name(&stem[..whole_marker.start()]);
     if series.is_empty() {
         // The filename carried no name at all, so the directory is the only
@@ -352,6 +353,36 @@ fn parse_episode(
     }
     if series.is_empty() {
         return Err(Unresolvable::NoSeriesName);
+    }
+
+    // The one case where the directory's spelling beats the file's: the two
+    // disagree, and the disagreement is punctuation alone. `Super Best Friends
+    // Play Bloodborne` under `Super Best Friends Play - Bloodborne` carries no
+    // information its directory lacks, and the separator it lost is structure -
+    // production, then show - so adopting the directory repairs the name
+    // without inventing anything in it. Where the names differ in their letters
+    // (`FFX` against `Final Fantasy X`) nothing here applies, and the note says
+    // so instead.
+    //
+    // This is gated on the same test the note uses, and it has to be. Folding
+    // case in the comparison below is only safe because a case-only difference
+    // never reaches it: `series_directory_disagreement` deliberately does not
+    // call that a disagreement, and without the gate this would rewrite
+    // `Fullmetal Alchemist Brotherhood` to a directory's `BrotherHood`. A
+    // case-sensitive comparison would reach the same files today by never
+    // noticing the case-only groups at all, which is right by luck.
+    //
+    // Two genuinely different series whose names differ only in punctuation
+    // would be merged by this. None could be found in the library this was
+    // measured on, which is weaker than showing none can exist.
+    if let Some(directory) = directories.last() {
+        let stated = series_name_from_directory(directory);
+        if !stated.is_empty()
+            && !stated.eq_ignore_ascii_case(&series)
+            && same_letters(&stated, &series)
+        {
+            series = stated;
+        }
     }
 
     let (title, quality) = parse_title_and_quality(&stem[whole_marker.end()..]);
@@ -447,6 +478,17 @@ pub(super) fn series_name_from_directory(directory: &str) -> String {
     let without_annotations = directory_annotations().replace(directory, "");
 
     clean_name(&episode_marker().replace_all(&without_annotations, ""))
+}
+
+/// Whether two names spell the same words, ignoring case, spacing and punctuation.
+fn same_letters(left: &str, right: &str) -> bool {
+    fn letters(name: &str) -> impl Iterator<Item = char> + '_ {
+        name.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+    }
+
+    letters(left).eq(letters(right))
 }
 
 fn parse_season_directory(component: &str) -> Option<SeasonDirectory> {
