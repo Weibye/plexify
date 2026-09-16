@@ -356,21 +356,27 @@ fn parse_episode(
     }
 
     // The one case where the directory's spelling beats the file's: the two
-    // disagree, and the disagreement is punctuation alone. `Super Best Friends
-    // Play Bloodborne` under `Super Best Friends Play - Bloodborne` carries no
-    // information its directory lacks, and the separator it lost is structure -
-    // production, then show - so adopting the directory repairs the name
-    // without inventing anything in it. Where the names differ in their letters
-    // (`FFX` against `Final Fantasy X`) nothing here applies, and the note says
-    // so instead.
+    // disagree, and the directory is the file's name with punctuation added.
+    // `Super Best Friends Play Bloodborne` under `Super Best Friends Play -
+    // Bloodborne` carries no information its directory lacks, and the separator
+    // it lost is structure - production, then show - so adopting the directory
+    // repairs the name without inventing anything in it. Where the names differ
+    // in their letters (`FFX` against `Final Fantasy X`) nothing here applies,
+    // and the note says so instead.
+    //
+    // **Added, never removed.** Punctuation the file has and the directory lacks
+    // is information the directory would throw away: `Steins;Gate` under
+    // `SteinsGate`, `Marvel's` under `Marvels`. A name that both gains and loses
+    // punctuation (`A.B` under `A - B`) therefore stays a note too; that is a
+    // note nobody acts on, and the alternative is a rename nobody asked for.
     //
     // This is gated on the same test the note uses, and it has to be. Folding
-    // case in the comparison below is only safe because a case-only difference
+    // ASCII case in the comparison is only safe because a case-only difference
     // never reaches it: `series_directory_disagreement` deliberately does not
     // call that a disagreement, and without the gate this would rewrite
-    // `Fullmetal Alchemist Brotherhood` to a directory's `BrotherHood`. A
-    // case-sensitive comparison would reach the same files today by never
-    // noticing the case-only groups at all, which is right by luck.
+    // `Fullmetal Alchemist Brotherhood` to a directory's `BrotherHood`. The fold
+    // is ASCII for the same reason the gate is - a fold wider than the gate's
+    // lets a case-only difference in `É` through it.
     //
     // Two genuinely different series whose names differ only in punctuation
     // would be merged by this. None could be found in the library this was
@@ -379,7 +385,7 @@ fn parse_episode(
         let stated = series_name_from_directory(directory);
         if !stated.is_empty()
             && !stated.eq_ignore_ascii_case(&series)
-            && same_letters(&stated, &series)
+            && only_adds_punctuation(&series, &stated)
         {
             series = stated;
         }
@@ -480,15 +486,26 @@ pub(super) fn series_name_from_directory(directory: &str) -> String {
     clean_name(&episode_marker().replace_all(&without_annotations, ""))
 }
 
-/// Whether two names spell the same words, ignoring case, spacing and punctuation.
-fn same_letters(left: &str, right: &str) -> bool {
-    fn letters(name: &str) -> impl Iterator<Item = char> + '_ {
-        name.chars()
-            .filter(|c| c.is_alphanumeric())
-            .flat_map(char::to_lowercase)
+/// Whether `longer` is `shorter` with ASCII punctuation or whitespace inserted,
+/// letters compared without regard to ASCII case.
+///
+/// Only ASCII punctuation counts as insertable, so a combining accent or any
+/// other character the directory holds and the file does not is a difference
+/// in the name rather than in its punctuation.
+fn only_adds_punctuation(shorter: &str, longer: &str) -> bool {
+    let mut remaining = shorter.chars().peekable();
+
+    for c in longer.chars() {
+        match remaining.peek() {
+            Some(next) if next.eq_ignore_ascii_case(&c) => {
+                remaining.next();
+            }
+            _ if c.is_ascii_punctuation() || c.is_whitespace() => {}
+            _ => return false,
+        }
     }
 
-    letters(left).eq(letters(right))
+    remaining.next().is_none()
 }
 
 fn parse_season_directory(component: &str) -> Option<SeasonDirectory> {

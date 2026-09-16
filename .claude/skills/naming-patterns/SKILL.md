@@ -103,8 +103,10 @@ Constraints that are easy to get wrong:
 - The series name comes from the **file**, not its directory; the directory is consulted only
   when the filename carries no name at all. A directory may be an abbreviation of the series,
   or simply wrong, and rewriting files to match it would spread that. The one exception is a
-  difference of **punctuation alone** (`Show Name` under `Show - Name`): the directory's
-  spelling is taken, because the file carries nothing it lacks. It is gated on the directory
+  directory that is the filename's name **with punctuation added** (`Show Name` under
+  `Show - Name`): the directory's spelling is taken, because the file carries nothing it
+  lacks. Punctuation the file has and the directory lacks (`Steins;Gate` under `SteinsGate`)
+  is never removed. It is gated on the directory
   disagreeing at all, and a difference of case is not a disagreement - so `BrotherHood` on a
   directory never overwrites `Brotherhood` in a file.
 

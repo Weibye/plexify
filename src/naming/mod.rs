@@ -1120,6 +1120,30 @@ mod tests {
                 "Anime/Made In Abyss/Season 01/Made in Abyss - S01E01.mkv",
                 "Made in Abyss",
             ),
+            // A case difference outside ASCII is still only case.
+            (
+                "Anime/Élite BrotherHood/Season 01/élite Brotherhood - S01E01.mkv",
+                "élite Brotherhood",
+            ),
+            // Punctuation the file has and the directory lacks is kept.
+            (
+                "Anime/SteinsGate/Season 01/Steins;Gate - S01E01.mkv",
+                "Steins;Gate",
+            ),
+            (
+                "Series/Marvels Agents of SHIELD/Season 01/Marvel's Agents of S.H.I.E.L.D. - S01E01.mkv",
+                "Marvel's Agents of S.H.I.E.L.D",
+            ),
+            // An accent written as a separate combining character is not
+            // punctuation, whichever side holds it.
+            (
+                "Series/Pokemon/Season 01/Poke\u{301}mon - S01E01.mkv",
+                "Poke\u{301}mon",
+            ),
+            (
+                "Series/Poke\u{301}mon/Season 01/Pokemon - S01E01.mkv",
+                "Pokemon",
+            ),
         ] {
             match parse(path) {
                 Ok(MediaName::Episode(episode)) => assert_eq!(episode.series, series, "for {path}"),
