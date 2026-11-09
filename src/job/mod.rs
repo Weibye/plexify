@@ -455,7 +455,6 @@ impl Job {
         post_processing: PostProcessingSettings,
         media_root: &Path,
     ) -> Self {
-        // Convert relative path to absolute path
         let absolute_input_path = if input_path.is_absolute() {
             input_path
         } else {
@@ -1894,6 +1893,16 @@ mod tests {
         let native = Job::id_for_input(&Path::new("C:/media").join("Series").join("show.mkv"));
 
         assert_eq!(forward, native);
+    }
+
+    /// Every other id test compares two ids, so a change to the namespace or to
+    /// how the path is normalised would re-key every queued job and still pass.
+    #[test]
+    fn job_id_is_stable_across_releases() {
+        assert_eq!(
+            Job::id_for_input(Path::new("/media/show.mkv")),
+            "f178086d-9e85-5d19-9e03-0f555472c142"
+        );
     }
 
     #[test]
