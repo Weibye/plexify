@@ -8,11 +8,14 @@
 name = "chromecast-gen2-3"
 device = "Chromecast gen 2/3, Plex receiver app, Plex Media Server on a Pi 4"
 
+# Containers are keyed by FFprobe's whole `format_name`, one entry per demuxer,
+# and an entry is `observed` only if every format its demuxer reads was
+# measured (D29).
 [containers.accepts]
-observed = ["mov", "mp4", "m4a"]
-# The receiver app is fed by the server, and nobody has watched it take either
-# of these directly.
-assumed = ["matroska", "webm"]
+# No QuickTime, M4A or 3GP file is recorded as played here, and each reads
+# through the same demuxer as an MP4. The receiver app is fed by the server,
+# and nobody has watched it take an MKV or a WebM directly.
+assumed = ["mov,mp4,m4a,3gp,3g2,mj2", "matroska,webm"]
 
 # AVI is left unlisted rather than rejected: it was measured stalling on the
 # LG, and nothing has been tried here. An unlisted container is refused on an

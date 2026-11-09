@@ -846,7 +846,7 @@ mod tests {
         let lg = PlaybackTarget::builtin("lg-cx-webos").unwrap().unwrap();
 
         let with_audio = |codec: &str, channels: u32| MediaProbe {
-            container: Some("mov,mp4,m4a".to_string()),
+            container: Some("mov,mp4,m4a,3gp,3g2,mj2".to_string()),
             video: Some(VideoStream {
                 codec: "h264".to_string(),
                 profile: Some("high".to_string()),
@@ -947,7 +947,7 @@ mod tests {
         let lg = PlaybackTarget::builtin("lg-cx-webos").unwrap().unwrap();
 
         let probe = MediaProbe {
-            container: Some("mov,mp4,m4a".to_string()),
+            container: Some("mov,mp4,m4a,3gp,3g2,mj2".to_string()),
             video: Some(VideoStream {
                 codec: "h264".to_string(),
                 profile: Some("high".to_string()),
@@ -1004,7 +1004,7 @@ mod tests {
             .unwrap();
 
         let probe = MediaProbe {
-            container: Some("mov,mp4,m4a".to_string()),
+            container: Some("mov,mp4,m4a,3gp,3g2,mj2".to_string()),
             video: Some(VideoStream {
                 codec: "h264".to_string(),
                 profile: Some("high".to_string()),
@@ -1060,7 +1060,7 @@ mod tests {
         let lg = PlaybackTarget::builtin("lg-cx-webos").unwrap().unwrap();
 
         let conforming = || MediaProbe {
-            container: Some("mov,mp4,m4a".to_string()),
+            container: Some("mov,mp4,m4a,3gp,3g2,mj2".to_string()),
             video: Some(VideoStream {
                 codec: "h264".to_string(),
                 profile: Some("high".to_string()),
