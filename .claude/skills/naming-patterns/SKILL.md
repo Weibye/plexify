@@ -1,6 +1,6 @@
 ---
 name: naming-patterns
-description: How plexify decides whether a media path is correctly named, and how to add or change a supported layout. Use when touching the validate command, the NamingPatterns table, episode or season parsing, or any work on renaming and normalising library files.
+description: How plexify decides whether a media path is correctly named, and how to add or change a supported layout. Use when touching the validate command, naming parse or render, episode or season parsing, or any work on renaming and normalising library files.
 ---
 
 # Naming patterns
