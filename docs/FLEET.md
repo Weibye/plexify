@@ -22,17 +22,11 @@ independent; the notification comes back when they finish.
 
 ## Standing rules
 
-**Succinctness is a requirement, not a style note.** Fewer words from all three roles, and
-less code. A patch smaller than the explanation of why it is needed is usually right.
+The principles and working rules in `CLAUDE.md` apply to all three roles. These are the ones
+specific to working as a fleet.
 
-**Every agent's work is read by the other one.** Nothing merges on the word of the agent that
-wrote it. This has caught things no test and no lint did, and it is the reason the review bar
-sits where it does.
-
-**Publish corrections.** When a number that was already stated turns out to be wrong, correct
-it where it was stated — in the issue comment, in the artifact — and say where the wrong one
-came from. At least three of this project's better findings came out of a figure that would
-not reconcile.
+**Every agent's work is read by another one.** Nothing merges on the word of the agent that
+wrote it. This has caught things no test and no lint did.
 
 **Dispatch from a current tree.** `git fetch` and put the working branch on `origin/main`
 before the `Agent` call, not after the agents report. An agent reasoning against code that has
@@ -40,12 +34,8 @@ already moved re-derives a conclusion the merge has invalidated, and the review 
 catches it costs more than the fetch. The exception is a task that needs the older tree —
 reproducing a report against the commit it was filed on, or a bisect.
 
-**The oracle is CI, not this laptop.** See the quality-gate section of `CLAUDE.md`. Check the
-run on the PR before calling anything finished.
-
-**Never point a run at the real library.** `work` deletes or disables sources and `--fix`
-moves files. Build a throwaway tree (`.claude/skills/media-fixture`). `validate --fix` is not
-run against the user's library without the user saying so in that session.
+**`validate --fix` is not run against the user's library** without the user saying so in that
+session.
 
 **The Pi is `pi@192.168.68.54` (citadel), passwordless SSH from this machine.** Work on it is
 permitted, but **ask first if the local time is between 19:00 and 23:30 Oslo** — the media

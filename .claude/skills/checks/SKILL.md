@@ -5,16 +5,7 @@ description: Run plexify's full CI quality gate locally - build, test, format, c
 
 # Checks
 
-Runs the same four jobs CI runs. Work is not finished until all four pass.
-
-```bash
-cargo build
-cargo test
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features
-```
-
-Run all four even if an earlier one fails, so the report covers everything rather than
+Run the four gate commands from `CLAUDE.md`. Run all four even if an earlier one fails, so the report covers everything rather than
 stopping at the first problem. Then state plainly which passed and which did not, and paste
 the actual failure output — never summarise a failure as a pass.
 
@@ -31,15 +22,15 @@ this one red.
 repository they have reliably meant a refactor landed only halfway, with a new abstraction
 built and the old call sites never migrated.
 
-**Security audit** is the fourth CI job (`rustsec/audit-check`) and has no local equivalent.
-It only runs on the PR, so a green local run does not guarantee a green PR.
+**Then check the PR's CI.** It runs on Ubuntu with a different FFmpeg, plus a dependency
+audit that has no local equivalent. A green local run is not a finished change.
 
 ## Flaky tests
 
 `cargo test` runs tests in parallel threads of a single process, and this codebase reads
 FFMPEG-prefixed environment variables as process-wide global state. A test touching those
-variables without holding `ENV_TEST_MUTEX` (`src/job/mod.rs`) will pass in isolation and fail
-intermittently in a full run.
+variables without `#[serial(env)]` will pass in isolation and fail intermittently in a full
+run.
 
 If a test fails, re-run it two ways before concluding anything:
 
