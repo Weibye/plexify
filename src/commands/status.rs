@@ -327,7 +327,7 @@ fn unreachable_directory(directory: &Path, error: &std::io::Error) -> anyhow::Er
 async fn read_job(path: &Path) -> std::result::Result<Option<Job>, String> {
     let content = match async_fs::read_to_string(path).await {
         Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if is_absent(&e) => return Ok(None),
         Err(e) => return Err(format!("could not be read: {e}")),
     };
 
@@ -914,6 +914,17 @@ mod tests {
             read_job(&corrupt).await.is_err(),
             "a job file that is present and unparseable is still unreadable"
         );
+    }
+
+    /// A job on a share that is down did not move on. Windows reports both as
+    /// `NotFound`, which is why this goes through `is_absent`.
+    #[cfg(windows)]
+    #[serial_test::serial(unc_probe)]
+    #[tokio::test]
+    async fn a_job_on_an_unreachable_share_is_not_one_that_moved_on() {
+        let unreachable = Path::new(r"\\no-such-host-xyz\plexify-queue\_in_progress\a.job");
+        let read = read_job(unreachable).await;
+        assert!(read.is_err(), "{read:?}");
     }
 
     /// A work root that cannot be reached is not an empty one.
