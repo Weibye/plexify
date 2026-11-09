@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
@@ -7,6 +7,7 @@ use walkdir::WalkDir;
 
 use crate::ignore::IgnoreFilter;
 use crate::job::{MediaFileType, Operation};
+use crate::naming::scope_for;
 use crate::probe::probe;
 use crate::queue::JobQueue;
 use crate::target::{evaluate, PlaybackTarget};
@@ -66,14 +67,13 @@ impl ScanCommand {
         info!("🔎 Scanning directory: {:?}", self.media_root);
         info!("📁 Recursively scanning all subdirectories...");
 
-        // Initialize ignore filter
-        let ignore_filter = match IgnoreFilter::new(self.media_root.clone()) {
-            Ok(filter) => Some(filter),
-            Err(e) => {
-                warn!("Failed to load .plexifyignore patterns: {}", e);
-                None
-            }
-        };
+        // A rule at the library root governs every scan inside it, so the root is
+        // found from an absolute path and the walk uses that same spelling for the
+        // filter to match. Jobs still record paths against `media_root` as given.
+        let scan_root = std::path::absolute(&self.media_root)
+            .with_context(|| format!("could not resolve {}", self.media_root.display()))?;
+        let scope = scope_for(&scan_root);
+        let ignore_filter = IgnoreFilter::for_scope(scope.library_root, &scope.scan_path)?;
 
         let queue = JobQueue::new(self.media_root.clone(), self.work_root.clone());
         queue.init().await?;
@@ -94,25 +94,21 @@ impl ScanCommand {
         scan_pb.enable_steady_tick(std::time::Duration::from_millis(120));
 
         // Walk through the directory to find media files
-        for entry in WalkDir::new(&self.media_root)
+        for entry in WalkDir::new(&scan_root)
             .follow_links(false)
             .into_iter()
             .filter_entry(|e| {
                 let path = e.path();
 
                 // Always allow the root directory
-                if path == self.media_root {
+                if path == scan_root {
                     return true;
                 }
 
                 // Check if we should skip this directory and all its contents
-                if path.is_dir() {
-                    if let Some(ref filter) = ignore_filter {
-                        if filter.should_skip_dir(path) {
-                            debug!("🚫 Skipping entire directory: {:?}", path);
-                            return false; // This will cause WalkDir to skip the directory
-                        }
-                    }
+                if path.is_dir() && ignore_filter.should_skip_dir(path) {
+                    debug!("🚫 Skipping entire directory: {:?}", path);
+                    return false; // This will cause WalkDir to skip the directory
                 }
 
                 true // Allow files and non-ignored directories
@@ -122,18 +118,16 @@ impl ScanCommand {
             let path = entry.path();
 
             // Check if this individual path should be ignored
-            if let Some(ref filter) = ignore_filter {
-                if filter.should_ignore(path) {
-                    debug!("🚫 Ignoring path: {:?}", path);
-                    ignored_count += 1;
-                    // Skip this entry completely
-                    continue;
-                }
+            if ignore_filter.should_ignore(path) {
+                debug!("🚫 Ignoring path: {:?}", path);
+                ignored_count += 1;
+                // Skip this entry completely
+                continue;
             }
 
             // Track directories being scanned for better user feedback
-            if path.is_dir() && path != self.media_root {
-                if let Ok(relative_dir) = path.strip_prefix(&self.media_root) {
+            if path.is_dir() && path != scan_root {
+                if let Ok(relative_dir) = path.strip_prefix(&scan_root) {
                     if !directories_scanned.contains(relative_dir) {
                         directories_scanned.insert(relative_dir.to_path_buf());
                         scan_pb.set_message(format!("Scanning: {:?}", relative_dir));
@@ -150,7 +144,7 @@ impl ScanCommand {
                 }
 
                 if let Ok(file_type) = JobProcessor::determine_file_type(path) {
-                    if let Ok(relative_path) = path.strip_prefix(&self.media_root) {
+                    if let Ok(relative_path) = path.strip_prefix(&scan_root) {
                         media_files.push((relative_path.to_path_buf(), file_type));
                     }
                 }
@@ -955,5 +949,49 @@ mod tests {
         // Should create jobs for: Series/show.mkv, Series/important.mkv, movie.mkv (3 jobs)
         // Should ignore: test.tmp (root pattern), Series/old/episode.mkv (nested pattern)
         assert_eq!(job_count, 3);
+    }
+
+    #[tokio::test]
+    async fn a_scan_of_one_show_obeys_the_library_roots_rules() {
+        let temp_dir = TempDir::new().unwrap();
+        let library = temp_dir.path().join("library");
+        let show = library.join("Series/Show");
+        fs::create_dir_all(show.join("Extras")).unwrap();
+        fs::write(library.join(".plexifyignore"), "Extras/\n").unwrap();
+        fs::write(show.join("Extras/bonus.mkv"), "").unwrap();
+
+        let work = temp_dir.path().join("work");
+        fs::create_dir_all(&work).unwrap();
+        ScanCommand::new(show, work.clone(), None, &[])
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        assert!(queued_jobs(&work).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_scan_refuses_to_run_without_its_ignore_rules() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+        fs::create_dir_all(media_root.join("Extras")).unwrap();
+        fs::write(media_root.join("Extras/bonus.mkv"), "").unwrap();
+        // A Latin-1 'é' makes the whole file unreadable as UTF-8.
+        fs::write(media_root.join(".plexifyignore"), b"Extras/\n# caf\xe9\n").unwrap();
+
+        let result = ScanCommand::new(
+            media_root.to_path_buf(),
+            media_root.to_path_buf(),
+            None,
+            &[],
+        )
+        .unwrap()
+        .execute()
+        .await;
+
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(message.contains(".plexifyignore"), "{message}");
+        assert!(!media_root.join("_queue").exists(), "nothing was queued");
     }
 }

@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use glob::Pattern;
 use std::collections::HashMap;
 use std::fs;
@@ -83,54 +83,69 @@ impl IgnoreFilter {
     }
 
     /// Load every ignore file inside the subtree being walked.
+    ///
+    /// A directory that cannot be read may hold a `.plexifyignore`, so it is an
+    /// error rather than a gap. An ignored directory is pruned instead of read,
+    /// which is also how an unreadable one such as `lost+found` is excluded: its
+    /// rules could never apply, because everything beneath it is already ignored.
+    /// A directory's own rules are loaded as it is entered, so they decide which
+    /// of its children are pruned.
     fn load_ignore_files_under(&mut self, scan_path: &Path) -> Result<()> {
         use walkdir::WalkDir;
 
-        for entry in WalkDir::new(scan_path)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if path.is_file() && path.file_name() == Some(".plexifyignore".as_ref()) {
-                self.load_ignore_file(path)?;
+        let mut walk = WalkDir::new(scan_path).follow_links(false).into_iter();
+        while let Some(entry) = walk.next() {
+            let entry = entry.with_context(|| {
+                format!(
+                    "could not look for .plexifyignore files in {}",
+                    scan_path.display()
+                )
+            })?;
+            if !entry.file_type().is_dir() {
+                continue;
+            }
+
+            let dir = entry.path();
+            if dir != scan_path && self.should_skip_dir(dir) {
+                walk.skip_current_dir();
+                continue;
+            }
+
+            let candidate = dir.join(".plexifyignore");
+            if candidate.is_file() {
+                self.load_ignore_file(&candidate)?;
             }
         }
 
         Ok(())
     }
 
-    /// Load patterns from a single .plexifyignore file
+    /// Load patterns from a single .plexifyignore file.
+    ///
+    /// Every failure is an error: a rule that is silently dropped lets `work`
+    /// transcode, or `validate --fix` rename, a file the user excluded.
     fn load_ignore_file(&mut self, ignore_file: &Path) -> Result<()> {
         let dir = ignore_file.parent().unwrap_or(&self.root).to_path_buf();
-        let content = fs::read_to_string(ignore_file)?;
+        let content = fs::read_to_string(ignore_file)
+            .with_context(|| format!("could not read {}", ignore_file.display()))?;
 
         let patterns: Vec<IgnorePattern> = content
             .lines()
             .enumerate()
-            .filter_map(|(line_num, line)| {
-                let trimmed = line.trim();
-
-                // Skip empty lines and comments
-                if trimmed.is_empty() || trimmed.starts_with('#') {
-                    return None;
-                }
-
-                match IgnorePattern::new(trimmed) {
-                    Ok(pattern) => Some(pattern),
-                    Err(e) => {
-                        debug!(
-                            "Invalid pattern '{}' in {}:{}: {}",
-                            trimmed,
-                            ignore_file.display(),
-                            line_num + 1,
-                            e
-                        );
-                        None
-                    }
-                }
+            .map(|(line_num, line)| (line_num, line.trim()))
+            // Skip empty lines and comments
+            .filter(|(_, trimmed)| !trimmed.is_empty() && !trimmed.starts_with('#'))
+            .map(|(line_num, trimmed)| {
+                IgnorePattern::new(trimmed).with_context(|| {
+                    format!(
+                        "{}:{}: invalid pattern '{}'",
+                        ignore_file.display(),
+                        line_num + 1,
+                        trimmed
+                    )
+                })
             })
-            .collect();
+            .collect::<Result<_>>()?;
 
         if !patterns.is_empty() {
             debug!(
@@ -587,5 +602,94 @@ mod tests {
         let filter = IgnoreFilter::new(root.to_path_buf()).unwrap();
 
         assert!(filter.should_ignore(&deep.join("episode.mkv")));
+    }
+
+    #[test]
+    fn an_invalid_pattern_is_refused_with_its_file_and_line() {
+        let temp_dir = TempDir::new().unwrap();
+        let ignore_file = temp_dir.path().join(".plexifyignore");
+        fs::write(&ignore_file, "# rules\nDownloads/\nzz[\n").unwrap();
+
+        let error = IgnoreFilter::new(temp_dir.path().to_path_buf()).unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!("{}:3", ignore_file.display())),
+            "names the file and line: {message}"
+        );
+        assert!(message.contains("'zz['"), "names the pattern: {message}");
+    }
+
+    #[test]
+    fn an_unreadable_ignore_file_is_refused_with_its_name() {
+        let temp_dir = TempDir::new().unwrap();
+        let ignore_file = temp_dir.path().join(".plexifyignore");
+        // A Latin-1 'é', which is not UTF-8.
+        fs::write(&ignore_file, b"Downloads/\n# caf\xe9\n").unwrap();
+
+        let error = IgnoreFilter::new(temp_dir.path().to_path_buf()).unwrap_err();
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&ignore_file.display().to_string()),
+            "names the file: {message}"
+        );
+    }
+
+    /// Make `dir` unreadable, or report that this process can read it anyway
+    /// (as root can), in which case there is nothing to test.
+    #[cfg(unix)]
+    fn lock(dir: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
+        let locked = fs::read_dir(dir).is_err();
+        if !locked {
+            eprintln!("skipping: this process can read a mode 000 directory");
+        }
+        locked
+    }
+
+    #[cfg(unix)]
+    fn unlock(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_that_cannot_be_searched_for_rules_is_an_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let locked = temp_dir.path().join("Series/Locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join(".plexifyignore"), "*.mkv\n").unwrap();
+        if !lock(&locked) {
+            return;
+        }
+
+        let result = IgnoreFilter::new(temp_dir.path().to_path_buf());
+        unlock(&locked);
+
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(
+            message.contains(&locked.display().to_string()),
+            "names the directory: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_ignored_directory_is_not_searched_for_rules() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join(".plexifyignore"), "lost+found/\n").unwrap();
+        let locked = temp_dir.path().join("lost+found");
+        fs::create_dir_all(&locked).unwrap();
+        if !lock(&locked) {
+            return;
+        }
+
+        let result = IgnoreFilter::new(temp_dir.path().to_path_buf());
+        unlock(&locked);
+
+        assert!(result.unwrap().should_skip_dir(&locked));
     }
 }
