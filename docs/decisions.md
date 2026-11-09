@@ -453,3 +453,42 @@ WebM, and left the LG's assumed `webm` unreachable.
   are refused on an assumption.
 - Guarded by `a_webm_on_the_lg_is_unverified` and
   `the_mp4_demuxer_passes_the_chromecast_only_on_an_assumption`.
+
+## 30. A finished job does not keep its input out of the queue
+
+**Supersedes** the second consequence of 2, which said `job_exists` checks all four
+directories.
+
+**Decision.** `job_exists` consults `_queue`, `_in_progress` with its `.taken` name, and
+`_failed`. It never consults `_completed`. Recorded 2026-11-09.
+
+**Why.** A finished input is kept out of a scan by its output existing (see 10) or its
+source being disabled. If the output is later deleted, the file should be queued again
+rather than remembered as done forever. A parked job is the opposite case: a re-scan must
+not walk it back in to fail again, so moving it out of `_failed` by hand is what asks for a
+retry. A job under its `.taken` name is mid-move, and counting it keeps free the name the
+sweep returns it to.
+
+**Consequences.** Guarded by `test_job_exists_covers_in_progress_jobs`,
+`a_failing_job_is_retried_and_then_parked` and `a_job_held_mid_move_still_counts_as_queued`.
+
+## 31. Only fix and undo give a library file another media name
+
+**Supersedes** the title of 23, which said only fix and undo move library files.
+
+**Decision.** `fix.rs` and `undo.rs` are the only code that renames a library file to a
+different media name. `work` also writes to the library, through `FFmpegProcessor` in
+`ffmpeg/`, in two ways only:
+- `move_to_destination` adds the new output and its subtitle sidecars (see 10).
+- `disable_source_files` appends `.disabled` to the source and its `.vtt`.
+
+Recorded 2026-11-09.
+
+**Why.** Delivering an output and retiring its source are what `work` is for. Neither puts
+an existing file under a name Plex reads as something else, which is the move that can go
+unnoticed (principle 6) and the one 23's safeguards exist for.
+
+**Consequences.**
+- A change that gives a library file a new media name belongs in `fix.rs`, with 23's
+  rechecks and record.
+- No test guards where library writes happen. Review holds it.

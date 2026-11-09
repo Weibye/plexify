@@ -54,7 +54,7 @@ Break one of these only through a new decision.
   per-worker `.partial` and rename into place (D10).
 - **A destination comes from `naming::render`**, never from editing the source string
   (D19).
-- **Only `fix.rs` and `undo.rs` move library files** (D23).
+- **Only `fix.rs` and `undo.rs` give a library file another media name** (D23, D31).
 - **Logs go to stderr, and stdout carries only what a command means to print**
   (D24).
 - **Paths are compared library-relative with `/` separators** (`paths::to_forward_slashes`).
@@ -71,8 +71,7 @@ Break one of these only through a new decision.
   `targets/*.toml` say what each client accepts.
 
 Every command is a struct in `src/commands/` with `new` and `async execute`, wired into
-`Commands` in `main.rs`. A module must be listed in both `lib.rs` and `main.rs`. The stack
-is tokio, `anyhow` with `.context`, and `tracing`.
+`Commands` in `main.rs`. The stack is tokio, `anyhow` with `.context`, and `tracing`.
 
 ## Working here
 
