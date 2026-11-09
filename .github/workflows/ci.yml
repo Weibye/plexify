@@ -175,8 +175,10 @@ jobs:
           exit 1
         fi
 
+    # `qemu-user` rather than `qemu-user-static`: on Ubuntu 26.04 the latter is
+    # only a virtual package, and apt will not choose one of its providers.
     - name: Install qemu
-      run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+      run: sudo apt-get update && sudo apt-get install -y qemu-user
 
     # Linking is not running. This executes the ARM64 binary on an x86 runner so
     # that "it builds" and "it starts" are two separate claims and the second
@@ -185,8 +187,8 @@ jobs:
     - name: Run it
       run: |
         binary=target/aarch64-unknown-linux-musl/release/plexify
-        qemu-aarch64-static "$binary" --version
-        qemu-aarch64-static "$binary" audit --help > /dev/null
+        qemu-aarch64 "$binary" --version
+        qemu-aarch64 "$binary" audit --help > /dev/null
 
     - name: Upload
       uses: actions/upload-artifact@v7
