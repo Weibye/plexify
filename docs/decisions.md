@@ -434,3 +434,22 @@ Detailed rationale belongs where it is looked up when an area changes.
 - A new decision is appended here, not written into `CLAUDE.md`.
 - `copilot-instructions.md` and `CONTRIBUTING.md` point at `CLAUDE.md` instead of
   repeating it.
+
+## 29. A container claim covers its whole demuxer
+
+**Decision.** A target's containers are keyed by FFprobe's whole `format_name`, one entry
+per demuxer, and matched as one string. An entry is `observed` only if every format that
+demuxer reads was measured on the device. Recorded 2026-11-09.
+
+**Why.** FFprobe names the demuxer, not the format: an MKV and a WebM are both
+`matroska,webm`, and an MP4 and a QuickTime file are both `mov,mp4,m4a,3gp,3g2,mj2`.
+Accepting a file when any one of those names matched let a measured MKV vouch for every
+WebM, and left the LG's assumed `webm` unreachable.
+
+**Consequences.**
+- No shipped container acceptance is `observed`: neither demuxer has had every format it
+  reads measured.
+- An entry that is not a whole `format_name`, such as `mp4`, matches nothing, and its files
+  are refused on an assumption.
+- Guarded by `a_webm_on_the_lg_is_unverified` and
+  `the_mp4_demuxer_passes_the_chromecast_only_on_an_assumption`.

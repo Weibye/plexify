@@ -22,9 +22,14 @@
 name = "lg-cx-webos"
 device = "LG CX OLED, Plex webOS app, Plex Media Server on a Pi 4"
 
+# Containers are keyed by FFprobe's whole `format_name`, one entry per demuxer,
+# and an entry is `observed` only if every format its demuxer reads was
+# measured (D29).
 [containers.accepts]
-observed = ["mov", "mp4", "m4a", "matroska"]
-assumed = ["webm"]
+# An MP4 and an MKV were watched Direct Playing (the AC3 and EAC3 sessions
+# below). No QuickTime, M4A, 3GP or WebM file has been, and each reads through
+# one of those two demuxers.
+assumed = ["mov,mp4,m4a,3gp,3g2,mj2", "matroska,webm"]
 
 [containers.rejects]
 # Measured, and not a decode failure: the app plays this video fine and then

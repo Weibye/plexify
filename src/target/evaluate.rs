@@ -278,42 +278,21 @@ pub fn evaluate(probe: &MediaProbe, target: &PlaybackTarget) -> Conformance {
 /// The container a client cannot index is as unplayable as a codec it cannot
 /// decode, and costs a copy into a different one to fix.
 ///
-/// FFprobe reports every format a demuxer answers to, so one MP4 arrives as
-/// `mov,mp4,m4a,3gp,3g2,mj2`. The file conforms if any of those names does.
+/// FFprobe names the demuxer, not the format: an MP4 and a QuickTime file both
+/// arrive as `mov,mp4,m4a,3gp,3g2,mj2`. Nothing here can tell them apart, so
+/// the claim is about the whole name and is matched as one (D29).
 fn container(probe: &MediaProbe, target: &PlaybackTarget, findings: &mut Findings) {
     let Some(container) = &probe.container else {
         findings.unread(Field::Container, None);
         return;
     };
 
-    let names: Vec<&str> = container
-        .split(',')
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .collect();
-
-    let accepted = names
-        .iter()
-        .filter_map(|name| {
-            let (plays, source) = target.containers.verdict(name);
-            plays.then_some((source, *name))
-        })
-        .min();
-
-    match accepted {
-        Some((source, name)) => {
-            findings.check((true, source), Field::Container, name.to_string(), None)
-        }
-        None => {
-            let source = names
-                .iter()
-                .map(|name| target.containers.verdict(name).1)
-                .min()
-                .unwrap_or(Provenance::Assumed);
-
-            findings.check((false, source), Field::Container, container.clone(), None);
-        }
-    }
+    findings.check(
+        target.containers.verdict(container),
+        Field::Container,
+        container.clone(),
+        None,
+    );
 }
 
 fn video(probe: &MediaProbe, target: &PlaybackTarget, findings: &mut Findings) {
@@ -561,7 +540,7 @@ mod tests {
     /// What plexify's own transcoder is supposed to produce.
     fn plexify_output() -> MediaProbe {
         MediaProbe {
-            container: Some("mov,mp4,m4a".to_string()),
+            container: Some("mov,mp4,m4a,3gp,3g2,mj2".to_string()),
             video: Some(VideoStream {
                 codec: "h264".to_string(),
                 profile: Some("high".to_string()),
@@ -756,16 +735,42 @@ mod tests {
         assert_eq!(container.source, Provenance::Assumed);
     }
 
-    /// FFprobe reports every format a demuxer answers to, so a match on any
-    /// one of them is a match.
-    #[test]
-    fn a_container_is_accepted_on_any_name_its_demuxer_answers_to() {
-        let mut probe = plexify_output();
-        probe.container = Some("mov,mp4,m4a,3gp,3g2,mj2".to_string());
-        assert_eq!(evaluate(&probe, &chromecast()).cost(), None);
+    fn container_is_unverified(verdict: &Conformance, name: &str) -> bool {
+        verdict
+            .unverified()
+            .iter()
+            .any(|finding| finding.field == Field::Container && finding.value == name)
+    }
 
+    /// FFprobe names an MKV and a WebM alike. An MKV has been watched playing
+    /// on the LG and a WebM has not, so a WebM plays on an assumption.
+    #[test]
+    fn a_webm_on_the_lg_is_unverified() {
+        let mut probe = plexify_output();
         probe.container = Some("matroska,webm".to_string());
-        assert_eq!(evaluate(&probe, &lg()).cost(), None);
+
+        let verdict = evaluate(&probe, &lg());
+
+        assert_eq!(verdict.cost(), None);
+        assert!(
+            container_is_unverified(&verdict, "matroska,webm"),
+            "{:?}",
+            verdict.unverified()
+        );
+    }
+
+    /// A QuickTime file reads through the same demuxer as an MP4, and nobody
+    /// has tried one on the Chromecast.
+    #[test]
+    fn the_mp4_demuxer_passes_the_chromecast_only_on_an_assumption() {
+        let verdict = evaluate(&plexify_output(), &chromecast());
+
+        assert_eq!(verdict.cost(), None);
+        assert!(
+            container_is_unverified(&verdict, "mov,mp4,m4a,3gp,3g2,mj2"),
+            "{:?}",
+            verdict.unverified()
+        );
     }
 
     /// A field the probe could not read is the definition of an unverified
