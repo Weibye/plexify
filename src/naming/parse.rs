@@ -473,20 +473,37 @@ fn parse_movie(
         .find(stem)
         .map(|found| found.as_str().to_lowercase());
 
+    // A bare year is told from a title word only by where it sits, and a name
+    // holding two - `Blade.Runner.2049.2017` - does not say which is which.
+    // Taking the first would record the wrong year and cut the title at it, and
+    // that result renders and parses back stably, so nothing later would notice.
+    let file_year = match parenthesised_year().find(stem) {
+        Some(found) => Some(found),
+        None => {
+            let bare: Vec<_> = year_marker().find_iter(stem).collect();
+            if bare.len() > 1 {
+                return Err(Unresolvable::MoreThanOneYear {
+                    years: bare
+                        .iter()
+                        .filter_map(|found| found.as_str().parse().ok())
+                        .collect(),
+                });
+            }
+            bare.first().copied()
+        }
+    };
+
     // A film's own name carries its year; the directory usually repeats it. When
     // both say so and they disagree, one of them is wrong about which film this
     // is, and nothing in the path says which.
-    let from_file = parenthesised_year()
-        .find(stem)
-        .or_else(|| year_marker().find(stem))
-        .and_then(|found| {
-            found
-                .as_str()
-                .trim_matches(|c| c == '(' || c == ')')
-                .parse::<u32>()
-                .ok()
-                .map(|year| (year, found))
-        });
+    let from_file = file_year.and_then(|found| {
+        found
+            .as_str()
+            .trim_matches(|c| c == '(' || c == ')')
+            .parse::<u32>()
+            .ok()
+            .map(|year| (year, found))
+    });
 
     // Only a year the directory states the way a film directory states one. A
     // collection directory such as `Marvel 2012 Collection` is naming something
@@ -1162,6 +1179,38 @@ mod tests {
             other => panic!("expected a movie, got {other:?}"),
         };
         assert_eq!(from_directory.year, 2008);
+    }
+
+    /// Taking the first of two bare years renders and parses back stably, so
+    /// the round-trip tests accept it; only asking for the refusal catches it.
+    #[test]
+    fn refuses_a_film_name_holding_more_than_one_bare_year() {
+        for (name, years) in [
+            (
+                "Movies/Sci-Fi/Blade.Runner.2049.2017.1080p.BluRay.x264-SPARKS.mkv",
+                vec![2049, 2017],
+            ),
+            (
+                "Movies/Sci-Fi/2001.A.Space.Odyssey.1968.1080p.BluRay.x264.mkv",
+                vec![2001, 1968],
+            ),
+        ] {
+            assert_eq!(
+                parse(name),
+                Err(Unresolvable::MoreThanOneYear { years }),
+                "for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_film_with_one_bare_year_still_parses() {
+        let movie = match parse("Movies/Unsorted/Movie 2008.mkv") {
+            Ok(MediaName::Movie(movie)) => movie,
+            other => panic!("expected a movie, got {other:?}"),
+        };
+        assert_eq!(movie.title, "Movie");
+        assert_eq!(movie.year, 2008);
     }
 
     #[test]

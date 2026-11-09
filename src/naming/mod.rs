@@ -439,6 +439,9 @@ pub enum Unresolvable {
     NoReleaseYear,
     /// The file and the directory holding it name different years.
     ConflictingYear { directory: u32, file: u32 },
+    /// A movie file whose name holds more than one bare year, so which is the
+    /// release year and which belongs to the title is a guess.
+    MoreThanOneYear { years: Vec<u32> },
     /// The path has no filename, or a filename with no extension.
     NotAMediaFile,
 }
@@ -490,6 +493,14 @@ impl Unresolvable {
             }
             Unresolvable::ConflictingYear { directory, file } => format!(
                 "the directory says {directory} and the file says {file}; which is right is not recoverable from the path"
+            ),
+            Unresolvable::MoreThanOneYear { years } => format!(
+                "the name holds more than one year ({}); which is the release year and which belongs to the title is not recoverable from the name; writing the release year in parentheses settles it",
+                years
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             Unresolvable::NoReleaseYear => {
                 "no release year in the name; the year cannot be guessed".to_string()
