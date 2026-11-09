@@ -53,8 +53,8 @@ use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use plexify::commands::{
-    add::AddCommand, audit::AuditCommand, clean::CleanCommand, scan::ScanCommand,
-    status::StatusCommand, validate::ValidateCommand, work::WorkCommand,
+    add::AddCommand, audit::AuditCommand, clean::CleanCommand, job_processor::JobProcessorConfig,
+    scan::ScanCommand, status::StatusCommand, validate::ValidateCommand, work::WorkCommand,
 };
 use plexify::queue::QueueDirectory;
 use plexify::JobPriority;
@@ -219,7 +219,10 @@ async fn main() -> Result<()> {
                 "Starting add command for file: {:?}, work: {:?}, preset: {:?}",
                 file, work_root, preset
             );
-            AddCommand::new(file, work_root, preset).execute().await
+            match JobProcessorConfig::from_preset(preset.as_deref()) {
+                Ok(config) => AddCommand::new(file, work_root, config).execute().await,
+                Err(e) => Err(e),
+            }
         }
         Commands::Scan {
             path,
@@ -233,9 +236,14 @@ async fn main() -> Result<()> {
                 "Starting scan command for path: {:?}, work: {:?}, preset: {:?}, targets: {:?}",
                 path, work_root, preset, target
             );
-            ScanCommand::new(path, work_root, preset, &target)?
-                .execute()
-                .await
+            match JobProcessorConfig::from_preset(preset.as_deref()) {
+                Ok(config) => {
+                    ScanCommand::new(path, work_root, config, &target)?
+                        .execute()
+                        .await
+                }
+                Err(e) => Err(e),
+            }
         }
         Commands::Work {
             path,

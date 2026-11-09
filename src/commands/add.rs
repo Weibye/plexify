@@ -11,15 +11,15 @@ use super::job_processor::{operation_for, JobProcessResult, JobProcessor, JobPro
 pub struct AddCommand {
     file_path: PathBuf,
     work_root: PathBuf,
-    preset: Option<String>,
+    config: JobProcessorConfig,
 }
 
 impl AddCommand {
-    pub fn new(file_path: PathBuf, work_root: PathBuf, preset: Option<String>) -> Self {
+    pub fn new(file_path: PathBuf, work_root: PathBuf, config: JobProcessorConfig) -> Self {
         Self {
             file_path,
             work_root,
-            preset,
+            config,
         }
     }
 
@@ -53,9 +53,6 @@ impl AddCommand {
         let queue = JobQueue::new(media_root.clone(), self.work_root.clone());
         queue.init().await?;
 
-        // Get configuration settings for the job
-        let config = JobProcessorConfig::from_preset(self.preset.as_deref())?;
-
         // Get relative path from media root
         let relative_path = self
             .file_path
@@ -64,7 +61,7 @@ impl AddCommand {
             .to_path_buf();
 
         // Process the file
-        let processor = JobProcessor::new(&queue, &config, &media_root);
+        let processor = JobProcessor::new(&queue, &self.config, &media_root);
         // `add` names one file and asks no client about it, so the extension
         // decides. `scan --target` is where a conformance check belongs.
         let result = processor
@@ -113,6 +110,7 @@ impl AddCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job::QualityPreset;
     use std::fs;
     use tempfile::TempDir;
 
@@ -127,7 +125,7 @@ mod tests {
         fs::write(&webm_file, "").unwrap();
         fs::write(&vtt_file, "").unwrap();
 
-        let add_cmd = AddCommand::new(webm_file, temp_dir.path().to_path_buf(), None);
+        let add_cmd = AddCommand::new(webm_file, temp_dir.path().to_path_buf(), Default::default());
 
         let result = add_cmd.execute().await;
         assert!(result.is_ok());
@@ -153,7 +151,7 @@ mod tests {
         let mkv_file = media_path.join("video.mkv");
         fs::write(&mkv_file, "").unwrap();
 
-        let add_cmd = AddCommand::new(mkv_file, temp_dir.path().to_path_buf(), None);
+        let add_cmd = AddCommand::new(mkv_file, temp_dir.path().to_path_buf(), Default::default());
 
         let result = add_cmd.execute().await;
         assert!(result.is_ok());
@@ -179,7 +177,7 @@ mod tests {
         let webm_file = media_path.join("video.webm");
         fs::write(&webm_file, "").unwrap();
 
-        let add_cmd = AddCommand::new(webm_file, temp_dir.path().to_path_buf(), None);
+        let add_cmd = AddCommand::new(webm_file, temp_dir.path().to_path_buf(), Default::default());
 
         let result = add_cmd.execute().await;
         assert!(result.is_err());
@@ -194,7 +192,11 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let nonexistent_file = temp_dir.path().join("nonexistent.mkv");
 
-        let add_cmd = AddCommand::new(nonexistent_file, temp_dir.path().to_path_buf(), None);
+        let add_cmd = AddCommand::new(
+            nonexistent_file,
+            temp_dir.path().to_path_buf(),
+            Default::default(),
+        );
 
         let result = add_cmd.execute().await;
         assert!(result.is_err());
@@ -213,7 +215,7 @@ mod tests {
         let mp4_file = media_path.join("video.mp4");
         fs::write(&mp4_file, "").unwrap();
 
-        let add_cmd = AddCommand::new(mp4_file, temp_dir.path().to_path_buf(), None);
+        let add_cmd = AddCommand::new(mp4_file, temp_dir.path().to_path_buf(), Default::default());
 
         let result = add_cmd.execute().await;
         assert!(result.is_err());
@@ -235,7 +237,10 @@ mod tests {
         let add_cmd = AddCommand::new(
             mkv_file,
             temp_dir.path().to_path_buf(),
-            Some("quality".to_string()),
+            JobProcessorConfig {
+                quality_settings: QualityPreset::Quality.to_quality_settings(),
+                ..Default::default()
+            },
         );
 
         let result = add_cmd.execute().await;
@@ -261,7 +266,7 @@ mod tests {
         fs::write(&mkv_file, "").unwrap();
         fs::write(&mp4_file, "").unwrap();
 
-        let add_cmd = AddCommand::new(mkv_file, temp_dir.path().to_path_buf(), None);
+        let add_cmd = AddCommand::new(mkv_file, temp_dir.path().to_path_buf(), Default::default());
 
         let result = add_cmd.execute().await;
         assert!(result.is_ok());
@@ -286,7 +291,7 @@ mod tests {
         let dir_path = media_path.join("directory");
         fs::create_dir(&dir_path).unwrap();
 
-        let add_cmd = AddCommand::new(dir_path, temp_dir.path().to_path_buf(), None);
+        let add_cmd = AddCommand::new(dir_path, temp_dir.path().to_path_buf(), Default::default());
 
         let result = add_cmd.execute().await;
         assert!(result.is_err());
