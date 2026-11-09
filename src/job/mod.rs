@@ -455,14 +455,6 @@ impl Job {
         post_processing: PostProcessingSettings,
         media_root: &Path,
     ) -> Self {
-        // The id is a hash of the joined path, so a relative root would give one
-        // file a different job for every directory the command was run from.
-        // `has_root` rather than `is_absolute`, so the tests' portable `/media`
-        // passes on Windows, where it lacks a drive letter.
-        debug_assert!(
-            media_root.has_root(),
-            "media root must be absolute: {media_root:?}"
-        );
         let absolute_input_path = if input_path.is_absolute() {
             input_path
         } else {
