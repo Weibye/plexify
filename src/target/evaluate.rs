@@ -22,7 +22,6 @@ pub enum Cost {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Field {
     Container,
-    NoVideoStream,
     VideoCodec,
     VideoProfile,
     VideoLevel,
@@ -48,9 +47,8 @@ impl Field {
     /// A variant added here fails `every_field_is_reachable` until something
     /// produces it, which is the question worth asking of a new field: not
     /// "does anything read this" but "does the decision account for it".
-    pub const ALL: [Field; 12] = [
+    pub const ALL: [Field; 11] = [
         Field::Container,
-        Field::NoVideoStream,
         Field::VideoCodec,
         Field::VideoProfile,
         Field::VideoLevel,
@@ -70,8 +68,7 @@ impl Field {
     /// and copy the video across.
     pub fn cost(self) -> Cost {
         match self {
-            Field::NoVideoStream
-            | Field::VideoCodec
+            Field::VideoCodec
             | Field::VideoProfile
             | Field::VideoLevel
             | Field::BitDepth
@@ -89,7 +86,6 @@ impl Field {
     pub fn label(self) -> &'static str {
         match self {
             Field::Container => "container",
-            Field::NoVideoStream => "no video stream",
             Field::VideoCodec => "video codec",
             Field::VideoProfile => "video profile",
             Field::VideoLevel => "level",
@@ -229,6 +225,18 @@ impl Findings {
         );
     }
 
+    /// A property the target sets no bound on for this codec. Nothing refuses
+    /// it, and nothing measured that every value of it plays either, so it
+    /// passes on an assumption.
+    fn unbounded(&mut self, field: Field, value: Option<String>, claim: String) {
+        self.check(
+            (true, Provenance::Assumed),
+            field,
+            value.unwrap_or_else(|| "not reported".to_string()),
+            Some(claim),
+        );
+    }
+
     /// One value against one ceiling, recording an absent value rather than
     /// stepping over it.
     fn within(
@@ -299,12 +307,13 @@ fn video(probe: &MediaProbe, target: &PlaybackTarget, findings: &mut Findings) {
     let envelope = &target.video;
 
     let Some(video) = &probe.video else {
-        // Not a fixable property, but a file in a video library that has no
-        // video in it is not something to report as conforming either.
+        // No target says what a client does with a file that has no picture,
+        // and a re-encode cannot add one, so nothing here can be judged. It
+        // passes the way an unread field does: as an assumption, in sight.
         findings.check(
-            (false, Provenance::Observed),
-            Field::NoVideoStream,
-            "none".to_string(),
+            (true, Provenance::Assumed),
+            Field::VideoCodec,
+            "no video stream".to_string(),
             None,
         );
         return;
@@ -320,11 +329,9 @@ fn video(probe: &MediaProbe, target: &PlaybackTarget, findings: &mut Findings) {
 
     // Profile and level only mean something once the codec is one the client
     // decodes; "High profile AV1" is not a second reason, it is the same one.
-    // A codec the target does not constrain is not an unread field: there is
-    // no claim to be unsure about.
     if plays {
-        if let Some(accepted) = envelope.profiles.get(&video.codec) {
-            match &video.profile {
+        match envelope.profiles.get(&video.codec) {
+            Some(accepted) => match &video.profile {
                 Some(profile) => {
                     let source = accepted.provenance_of(profile);
                     findings.check(
@@ -335,17 +342,32 @@ fn video(probe: &MediaProbe, target: &PlaybackTarget, findings: &mut Findings) {
                     );
                 }
                 None => findings.unread(Field::VideoProfile, None),
-            }
+            },
+            None => findings.unbounded(
+                Field::VideoProfile,
+                video
+                    .profile
+                    .as_ref()
+                    .map(|profile| format!("{} {profile}", video.codec)),
+                format!("any {} profile", video.codec),
+            ),
         }
 
-        if let Some(limit) = envelope.max_level.get(&video.codec) {
-            findings.within(
+        match envelope.max_level.get(&video.codec) {
+            Some(limit) => findings.within(
                 video.level.map(|level| level.max(0) as u32),
                 limit,
                 Field::VideoLevel,
                 tenths,
                 format!("up to {}", tenths(limit.value)),
-            );
+            ),
+            // FFprobe's integer, as it reported it: the 41-is-4.1 reading is
+            // H.264's, and HEVC writes its levels on another scale.
+            None => findings.unbounded(
+                Field::VideoLevel,
+                video.level.map(|level| level.to_string()),
+                format!("any {} level", video.codec),
+            ),
         }
     }
 
@@ -576,13 +598,6 @@ mod tests {
     #[test]
     fn every_field_is_reachable() {
         let broken: Vec<(&str, MediaProbe)> = vec![
-            (
-                "no video",
-                MediaProbe {
-                    video: None,
-                    ..plexify_output()
-                },
-            ),
             (
                 "container",
                 MediaProbe {
@@ -1126,15 +1141,108 @@ mod tests {
         assert_eq!(evaluate(&probe, &chromecast()).cost(), None);
     }
 
+    fn unverified_claims(conformance: &Conformance) -> Vec<String> {
+        conformance
+            .unverified()
+            .iter()
+            .map(Finding::claim)
+            .collect()
+    }
+
+    /// A file with no picture has nothing a video check can judge, and no
+    /// target says what a client does with one. A re-encode cannot add the
+    /// missing stream, so it is not a fix to prescribe; the gap is shown
+    /// instead, beside every other field nothing was read for.
     #[test]
-    fn a_file_with_no_video_stream_is_reported_rather_than_passed() {
+    fn a_file_with_no_video_stream_is_unassessable_rather_than_refused() {
         let mut probe = plexify_output();
         probe.video = None;
 
         let verdict = evaluate(&probe, &chromecast());
 
-        assert_eq!(verdict.cost(), Some(Cost::Reencode));
-        assert_eq!(verdict.reasons()[0].field, Field::NoVideoStream);
+        assert_eq!(verdict.cost(), None, "{:?}", claims(&verdict));
+        assert!(
+            unverified_claims(&verdict).contains(&"video codec: no video stream".to_string()),
+            "{:?}",
+            unverified_claims(&verdict)
+        );
+    }
+
+    /// The LG's envelope bounds neither MPEG-4 Part 2 profiles nor HEVC
+    /// levels. A pass with no bound to check against is a belief about every
+    /// profile and level, and none of them was measured.
+    #[test]
+    fn a_profile_or_level_the_target_does_not_bound_passes_on_an_assumption() {
+        let xvid = with_video(|video| {
+            video.codec = "mpeg4".to_string();
+            video.profile = Some("advanced simple profile".to_string());
+            video.level = Some(5);
+        });
+        let verdict = evaluate(&xvid, &lg());
+
+        assert_eq!(verdict.cost(), None, "{:?}", claims(&verdict));
+        let unverified = unverified_claims(&verdict);
+        assert!(
+            unverified.contains(&"video profile: any mpeg4 profile".to_string()),
+            "{unverified:?}"
+        );
+        assert!(
+            unverified.contains(&"level: any mpeg4 level".to_string()),
+            "{unverified:?}"
+        );
+    }
+
+    /// Above the highest value seen playing, nothing was measured, so a
+    /// refusal there is an assumption whatever the cap's own `source` says.
+    #[test]
+    fn a_refusal_above_what_was_observed_is_an_assumption() {
+        let mut target = lg();
+        target.video.max_level.insert(
+            "h264".to_string(),
+            Limit {
+                value: 41,
+                source: Provenance::Observed,
+                observed_up_to: Some(31),
+                note: None,
+            },
+        );
+
+        let verdict = evaluate(&with_video(|video| video.level = Some(50)), &target);
+
+        let level = verdict
+            .reasons()
+            .iter()
+            .find(|reason| reason.field == Field::VideoLevel)
+            .expect("5.0 is above the cap");
+        assert_eq!(level.source, Provenance::Assumed);
+    }
+
+    /// Both LG readings behind its audio codecs were stereo Direct Plays, so
+    /// stereo is measured and anything wider is not.
+    #[test]
+    fn stereo_on_the_lg_is_measured_and_surround_is_not() {
+        let stereo = evaluate(&plexify_output(), &lg());
+        assert!(
+            !stereo
+                .unverified()
+                .iter()
+                .any(|finding| finding.field == Field::AudioChannels),
+            "{:?}",
+            unverified_claims(&stereo)
+        );
+
+        let mut surround = plexify_output();
+        surround.audio[0].channels = Some(6);
+        let surround = evaluate(&surround, &lg());
+        assert_eq!(surround.cost(), None);
+        assert!(
+            surround
+                .unverified()
+                .iter()
+                .any(|finding| finding.field == Field::AudioChannels && finding.value == "6"),
+            "{:?}",
+            unverified_claims(&surround)
+        );
     }
 
     /// The expensive verdict wins: a file that needs its video re-encoded is

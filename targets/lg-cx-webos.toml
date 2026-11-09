@@ -70,9 +70,9 @@ vp9.assumed = ["profile 0", "profile 2"]
 h264 = { value = 51, source = "assumed" }
 
 [audio]
-# Untouched by the measurements below: both of them were stereo. Nothing
-# multichannel has been played on this app.
-max_channels = { value = 6, source = "assumed", note = "the panel's decoder spec; the two AC3/EAC3 Direct Plays measured on 2026-09-01 were both 2-channel" }
+# Both measurements below were stereo Direct Plays with the audio copied, so
+# two channels are observed. Nothing multichannel has been played on this app.
+max_channels = { value = 6, source = "assumed", observed_up_to = 2, note = "the panel's decoder spec; the two AC3/EAC3 Direct Plays measured on 2026-09-01 were both 2-channel" }
 
 [audio.codecs.accepts]
 # AC3 and EAC3 measured 2026-09-01 with the app's video quality set to
@@ -87,8 +87,8 @@ max_channels = { value = 6, source = "assumed", note = "the panel's decoder spec
 # the receiver app transcodes AC3 in every layout, the panel decodes it. A
 # per-target envelope exists so two devices are allowed to differ.
 #
-# Both readings were stereo, so they say nothing about a layout. That claim is
-# `max_channels` above and is still assumed.
+# Both readings were stereo, so they say nothing about a wider layout. That
+# claim is `max_channels` above, and is assumed above two channels.
 observed = ["aac", "ac3", "eac3"]
 assumed = ["mp3", "flac"]
 

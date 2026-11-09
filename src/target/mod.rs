@@ -116,7 +116,8 @@ pub struct Limit {
     pub source: Provenance,
     /// The highest value seen to play. A cap can be a guess while the range
     /// below some point in it is measured - the Chromecast's reference-frame
-    /// cap is the spec's 8, but only 5 has been watched working.
+    /// cap is the spec's 8, but only 5 has been watched working. Above this,
+    /// nothing was measured, so a pass or a refusal there is an assumption.
     #[serde(default)]
     pub observed_up_to: Option<u32>,
     #[serde(default)]
@@ -126,18 +127,19 @@ pub struct Limit {
 impl Limit {
     /// Whether the value fits, and how good the belief behind that answer is.
     pub fn verdict(&self, value: u32) -> (bool, Provenance) {
-        let measured = self.observed_up_to.unwrap_or(match self.source {
-            Provenance::Observed => self.value,
-            Provenance::Assumed => 0,
-        });
+        let measured = match self.observed_up_to {
+            Some(highest) => value <= highest,
+            None => self.source == Provenance::Observed,
+        };
 
-        if value <= measured {
-            (true, Provenance::Observed)
-        } else if value <= self.value {
-            (true, Provenance::Assumed)
-        } else {
-            (false, self.source)
-        }
+        (
+            value <= self.value,
+            if measured {
+                Provenance::Observed
+            } else {
+                Provenance::Assumed
+            },
+        )
     }
 }
 
@@ -165,11 +167,13 @@ pub struct PlaybackTarget {
 #[serde(deny_unknown_fields)]
 pub struct VideoEnvelope {
     pub codecs: Support,
-    /// Accepted profiles per codec. A codec with no entry is unconstrained,
-    /// which is not the same as a codec with an empty one.
+    /// Accepted profiles per codec. A codec with no entry is unbounded: every
+    /// profile passes, on an assumption. A codec with an empty one refuses
+    /// every profile.
     #[serde(default)]
     pub profiles: BTreeMap<String, ClaimSet>,
-    /// Level ceiling per codec, in FFprobe's integer form: 41 is 4.1.
+    /// Level ceiling per codec, in FFprobe's integer form: 41 is 4.1. A codec
+    /// with no entry passes every level, on an assumption.
     #[serde(default)]
     pub max_level: BTreeMap<String, Limit>,
     pub max_bit_depth: Limit,
