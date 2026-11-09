@@ -665,22 +665,27 @@ enum SubtitleSource {
     Embedded(SubtitleSelection),
 }
 
-/// Every stream an output takes: the picture from input 0, the sound from
-/// `audio_input`, and the subtitle streams that can be carried from
-/// `subtitle_input`.
+/// Every stream an output takes: the picture from input 0, every audio track
+/// from `source`, the one an added track is derived from, and `subtitles`.
 ///
 /// Input 0 is the source for a one-pass encode and the list of chunks for the
 /// join that follows a chunked one, and in both it is where the picture comes
 /// from. On the one-pass path everything is input 0; the join takes only the
 /// picture from the chunks, and reads the sound and the subtitles from the
 /// source.
-fn media_and_subtitle_mappings(
-    audio_input: usize,
-    subtitle_input: usize,
-    selection: &SubtitleSelection,
-) -> Vec<String> {
-    let mut mappings = vec!["0:v".to_string(), format!("{audio_input}:a")];
-    mappings.extend(selection.mappings(subtitle_input));
+///
+/// The derived track is mapped after the copies, which is what makes
+/// `-c:a:{originals}` name it. First rather than loudest or longest, because
+/// the first audio track is the one a container conventionally leads with, and
+/// nothing here has measured a better rule. Every path maps through here
+/// because FFmpeg only warns about codec options for a track nothing mapped:
+/// the job succeeds, and the output lacks the track it was run to add.
+fn mappings(source: usize, adds_a_track: bool, subtitles: &[String]) -> Vec<String> {
+    let mut mappings = vec!["0:v".to_string(), format!("{source}:a")];
+    if adds_a_track {
+        mappings.push(format!("{source}:a:0"));
+    }
+    mappings.extend_from_slice(subtitles);
     mappings
 }
 
@@ -760,20 +765,6 @@ fn with_encoded_audio(
 /// is already inside the cap and nothing should be said about it.
 fn capped(cap: Option<u32>, carried: u32) -> Option<u32> {
     cap.filter(|cap| carried > *cap)
-}
-
-/// Every stream an output takes when a track is being added beside the
-/// originals: the picture, every audio track the source has, and the one the
-/// new track is derived from.
-///
-/// The derived track is mapped last so it lands after the copies, which is what
-/// makes `-c:a:{originals}` name it. First rather than loudest or longest,
-/// because the first audio track is the one a container conventionally leads
-/// with, and nothing here has measured a better rule.
-fn added_track_mappings(subtitle_input: usize, selection: &SubtitleSelection) -> Vec<String> {
-    let mut mappings = vec!["0:v".to_string(), "0:a".to_string(), "0:a:0".to_string()];
-    mappings.extend(selection.mappings(subtitle_input));
-    mappings
 }
 
 /// How a source is divided up for a resumable encode.
@@ -1092,41 +1083,36 @@ impl FFmpegProcessor {
         )
         .with_overwrite()
         .with_negative_composition_offsets()
+        .with_input(input_path)
         .with_output(output_path);
 
         let adds_a_track = job.operation.adds_an_audio_track() && !source_channels.is_empty();
 
-        // Add format-specific flags, inputs, and mappings
-        let ffmpeg_builder = match subtitles {
+        let (ffmpeg_builder, subtitle_mappings) = match subtitles {
             // A track the target burns into the picture is left out of the
             // codecs and the mappings both. Half of that is not enough: a
             // mapped subtitle stream with no subtitle codec fails the mux.
-            None if adds_a_track => ffmpeg_builder
-                .with_input(input_path)
-                .with_stream_mapping(&["0:v", "0:a", "0:a:0"]),
-            None => ffmpeg_builder
-                .with_input(input_path)
-                .with_stream_mapping(&["0:v", "0:a"]),
+            None => (ffmpeg_builder, Vec::new()),
             // The subtitle is the whole reason the second input is here, so it
             // is not optional.
-            Some(SubtitleSource::External(vtt_path)) => ffmpeg_builder
-                .with_subtitle_encoding()
-                .with_inputs(&[input_path, vtt_path.as_path()])
-                .with_stream_mapping(&["0:v", "0:a", "1:s"]),
+            Some(SubtitleSource::External(vtt_path)) => (
+                ffmpeg_builder
+                    .with_subtitle_encoding()
+                    .with_input(vtt_path.as_path()),
+                vec!["1:s".to_string()],
+            ),
             // Every stream, not the first of each: a second audio track is
             // usually a commentary or another language, and dropping it while
             // renaming the source to `.disabled` loses it for good. The
             // subtitle streams are named one by one because the source may
             // carry one MP4 cannot hold, and `0:s?` would take that one too.
-            Some(SubtitleSource::Embedded(selection)) if adds_a_track => ffmpeg_builder
-                .with_subtitle_encoding()
-                .with_input(input_path)
-                .with_stream_mapping(&added_track_mappings(0, selection)),
-            Some(SubtitleSource::Embedded(selection)) => ffmpeg_builder
-                .with_subtitle_encoding()
-                .with_input(input_path)
-                .with_stream_mapping(&media_and_subtitle_mappings(0, 0, selection)),
+            Some(SubtitleSource::Embedded(selection)) => (
+                ffmpeg_builder.with_subtitle_encoding(),
+                selection.mappings(0),
+            ),
         };
+        let ffmpeg_builder =
+            ffmpeg_builder.with_stream_mapping(&mappings(0, adds_a_track, &subtitle_mappings));
 
         self.run(ffmpeg_builder.build(), "conversion").await?;
 
@@ -1217,22 +1203,26 @@ impl FFmpegProcessor {
         .with_negative_composition_offsets()
         .with_output(output_path);
 
-        let mux_builder = match subtitles {
-            None => mux_builder.with_stream_mapping(&["0:v", "1:a"]),
+        let (mux_builder, subtitle_mappings) = match subtitles {
+            None => (mux_builder, Vec::new()),
             // The sidecar is a third input of its own: the source is already
             // input 1, and a WebM's subtitle is not in it.
-            Some(SubtitleSource::External(vtt_path)) => mux_builder
-                .with_subtitle_encoding()
-                .with_input(vtt_path.as_path())
-                .with_stream_mapping(&["0:v", "1:a", "2:s"]),
+            Some(SubtitleSource::External(vtt_path)) => (
+                mux_builder
+                    .with_subtitle_encoding()
+                    .with_input(vtt_path.as_path()),
+                vec!["2:s".to_string()],
+            ),
             // The same selection the one-pass encode was handed, read from the
             // source rather than from the chunks - which hold no subtitles,
             // because a subtitle event straddling a boundary would have been
             // cut in half by it.
-            Some(SubtitleSource::Embedded(selection)) => mux_builder
-                .with_subtitle_encoding()
-                .with_stream_mapping(&media_and_subtitle_mappings(1, 1, selection)),
+            Some(SubtitleSource::Embedded(selection)) => {
+                (mux_builder.with_subtitle_encoding(), selection.mappings(1))
+            }
         };
+        // Only a re-encode is chunked, and a re-encode adds no track.
+        let mux_builder = mux_builder.with_stream_mapping(&mappings(1, false, &subtitle_mappings));
 
         self.run(mux_builder.build(), "joining chunks").await?;
 
@@ -2366,7 +2356,7 @@ mod tests {
 
         let args = FFmpegCommandBuilder::new()
             .with_input("/in.mkv")
-            .with_stream_mapping(&media_and_subtitle_mappings(0, 0, &selection))
+            .with_stream_mapping(&mappings(0, false, &selection.mappings(0)))
             .with_output("/out.mp4")
             .build();
 
@@ -3331,8 +3321,9 @@ mod tests {
     /// this library holds and the chunk path seeks it: what `-ss` lands on in a
     /// VP8 stream is not what the MKV fixtures measure. `-deadline realtime
     /// -cpu-used 8` is libvpx's fastest setting, which is all a few seconds of
-    /// `testsrc` needs.
-    fn build_webm_source(path: &Path, seconds: u32) {
+    /// `testsrc` needs. The video codec is the caller's, because a remux
+    /// carries it into the MP4 untouched, and VP9 is the one an MP4 holds.
+    fn build_webm_source(path: &Path, seconds: u32, video_codec: &str) {
         let subtitles = path.with_extension("vtt");
         std::fs::write(
             &subtitles,
@@ -3357,7 +3348,7 @@ mod tests {
                 "-map",
                 "1:a",
                 "-c:v",
-                "libvpx",
+                video_codec,
                 "-deadline",
                 "realtime",
                 "-cpu-used",
@@ -3417,7 +3408,7 @@ mod tests {
 
         let temp = TempDir::new().unwrap();
         let input = temp.path().join("video.webm");
-        build_webm_source(&input, 6);
+        build_webm_source(&input, 6, "libvpx");
 
         let work_folder = temp.path().join("work");
         std::fs::create_dir_all(&work_folder).unwrap();
@@ -5366,6 +5357,44 @@ mod tests {
         assert!(
             tracks[1].starts_with("aac,2"),
             "a track derived from stereo is stereo, not 5.1 invented from it: {tracks:?}"
+        );
+    }
+
+    /// What `scan --target` makes of a VP9 and Opus WebM for a client that
+    /// refuses Opus. Its sidecar arrives as a second input, and the added track
+    /// has to be mapped there too: FFmpeg only warns about codec options for a
+    /// track nothing mapped, so the job would succeed and disable a source
+    /// whose replacement still does not play.
+    #[test]
+    fn a_webm_that_gains_a_track_writes_it_beside_its_sidecar() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let input = temp_dir.path().join("show.webm");
+        build_webm_source(&input, 2, "libvpx-vp9");
+
+        let job = Job::new(
+            input.clone(),
+            MediaFileType::WebM,
+            Operation::Remux {
+                audio: AudioAction::Add { channels: Some(2) },
+                subtitles: SubtitleAction::Keep,
+            },
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            temp_dir.path(),
+        );
+
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(FFmpegProcessor::new(false).process_job(&job, None, None))
+            .expect("adding a track should succeed");
+
+        assert_eq!(
+            stream_codecs(&job.output_path),
+            vec!["vp9", "opus", "aac", "mov_text"]
         );
     }
 
