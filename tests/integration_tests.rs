@@ -85,7 +85,6 @@ fn test_scan_and_clean_workflow() {
     let clean_output = Command::new(PLEXIFY_BIN)
         .args([
             "clean",
-            temp_path.to_str().unwrap(),
             "--work-dir",
             temp_path.to_str().unwrap(),
             // Scripted: there is no terminal to answer the confirmation, and
@@ -157,17 +156,6 @@ fn test_invalid_paths() {
     assert!(
         !work_output.status.success(),
         "Work should fail with invalid path"
-    );
-
-    // Test clean with non-existent directory
-    let clean_output = Command::new(PLEXIFY_BIN)
-        .args(["clean", "/non/existent/path"])
-        .output()
-        .expect("Failed to execute clean command");
-
-    assert!(
-        !clean_output.status.success(),
-        "Clean should fail with invalid path"
     );
 }
 
@@ -546,7 +534,6 @@ fn test_hierarchical_directory_scanning() {
     let clean_output = Command::new(PLEXIFY_BIN)
         .args([
             "clean",
-            temp_path.to_str().unwrap(),
             "--work-dir",
             temp_path.to_str().unwrap(),
             // Scripted: there is no terminal to answer the confirmation, and
@@ -1509,12 +1496,7 @@ fn clean_refuses_rather_than_blocking_when_there_is_no_terminal() {
     assert!(scan.status.success(), "Scan command failed");
 
     let mut child = Command::new(PLEXIFY_BIN)
-        .args([
-            "clean",
-            temp_path.to_str().unwrap(),
-            "--work-dir",
-            temp_path.to_str().unwrap(),
-        ])
+        .args(["clean", "--work-dir", temp_path.to_str().unwrap()])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1587,7 +1569,6 @@ fn clean_dry_run_reports_without_deleting() {
     let output = Command::new(PLEXIFY_BIN)
         .args([
             "clean",
-            temp_path.to_str().unwrap(),
             "--work-dir",
             temp_path.to_str().unwrap(),
             "--dry-run",

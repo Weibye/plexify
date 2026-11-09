@@ -25,13 +25,13 @@
 //! plexify status
 //!
 //! # Report what emptying the queue would delete, then ask
-//! plexify clean /path/to/media
+//! plexify clean
 //!
 //! # Report it and delete nothing
-//! plexify clean /path/to/media --dry-run
+//! plexify clean --dry-run
 //!
 //! # Empty one directory without being asked
-//! plexify clean /path/to/media --only completed --yes
+//! plexify clean --only completed --yes
 //!
 //! # Report what in the library is not in canonical form
 //! plexify validate /path/to/media
@@ -126,13 +126,11 @@ enum Commands {
     },
     /// Delete a work root's queue directories, after reporting what is in them
     Clean {
-        /// Path to the media directory
-        path: PathBuf,
         /// Path to the work directory (defaults to current working directory)
         #[arg(long, short = 'w')]
         work_dir: Option<PathBuf>,
-        /// Empty only these queue directories, instead of all four and the
-        /// worker log. Comma-separated: queue, in-progress, completed, failed
+        /// Empty only these queue directories, instead of all four.
+        /// Comma-separated: queue, in-progress, completed, failed
         #[arg(long, value_delimiter = ',', value_enum)]
         only: Vec<QueueDirectory>,
         /// Report what would be deleted and delete nothing
@@ -272,20 +270,15 @@ async fn main() -> Result<()> {
             }
         }
         Commands::Clean {
-            path,
             work_dir,
             only,
             dry_run,
             yes,
             force,
         } => {
-            let path = resolve(&path)?;
             let work_root = resolve(&work_dir.unwrap_or_else(|| ".".into()))?;
-            info!(
-                "Starting clean command for path: {:?}, work: {:?}",
-                path, work_root
-            );
-            CleanCommand::new(path, work_root)
+            info!("Starting clean command for work: {:?}", work_root);
+            CleanCommand::new(work_root)
                 .only(&only)
                 .dry_run(dry_run)
                 .assume_yes(yes)
