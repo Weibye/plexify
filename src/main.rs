@@ -46,9 +46,9 @@
 //! plexify undo plexify-fix-1787309398.json --apply
 //! ```
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -180,6 +180,18 @@ enum Commands {
     },
 }
 
+/// Make a path the user typed absolute, without touching the filesystem.
+///
+/// A job's id is derived from its input path, so a root that stays relative
+/// gives the same file a different id depending on where the command was run
+/// from, and one file can then be queued, and transcoded, twice. Resolve only
+/// what the user typed, never a name found by walking the library: on Windows
+/// `absolute` strips trailing dots and spaces, so a walked name ending in one
+/// would come out naming a different file.
+fn resolve(path: &Path) -> Result<PathBuf> {
+    std::path::absolute(path).with_context(|| format!("Cannot resolve {:?}", path))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Logs are diagnostics and go to stderr; stdout carries only what a command
@@ -203,7 +215,8 @@ async fn main() -> Result<()> {
             work_dir,
             preset,
         } => {
-            let work_root = work_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
+            let file = resolve(&file)?;
+            let work_root = resolve(&work_dir.unwrap_or_else(|| ".".into()))?;
             info!(
                 "Starting add command for file: {:?}, work: {:?}, preset: {:?}",
                 file, work_root, preset
@@ -216,7 +229,8 @@ async fn main() -> Result<()> {
             preset,
             target,
         } => {
-            let work_root = work_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
+            let path = resolve(&path)?;
+            let work_root = resolve(&work_dir.unwrap_or_else(|| ".".into()))?;
             info!(
                 "Starting scan command for path: {:?}, work: {:?}, preset: {:?}, targets: {:?}",
                 path, work_root, preset, target
@@ -231,7 +245,8 @@ async fn main() -> Result<()> {
             background,
             priority,
         } => {
-            let work_root = work_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
+            let path = resolve(&path)?;
+            let work_root = resolve(&work_dir.unwrap_or_else(|| ".".into()))?;
             info!(
                 "Starting work command for path: {:?}, work: {:?}, background: {}, priority: {:?}",
                 path, work_root, background, priority
@@ -241,7 +256,7 @@ async fn main() -> Result<()> {
                 .await
         }
         Commands::Status { work_dir } => {
-            let work_root = work_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
+            let work_root = resolve(&work_dir.unwrap_or_else(|| ".".into()))?;
             info!("Starting status command for work: {:?}", work_root);
 
             // No media path is asked for. Nothing this command reports is
@@ -264,7 +279,8 @@ async fn main() -> Result<()> {
             yes,
             force,
         } => {
-            let work_root = work_dir.unwrap_or_else(|| std::env::current_dir().unwrap());
+            let path = resolve(&path)?;
+            let work_root = resolve(&work_dir.unwrap_or_else(|| ".".into()))?;
             info!(
                 "Starting clean command for path: {:?}, work: {:?}",
                 path, work_root
