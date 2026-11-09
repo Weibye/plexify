@@ -32,8 +32,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::fix::{
-    absolute, emptied, is_same_file, rename, FailedMove, FixOutcome, PlannedMove, Refusal,
-    RefusalReason,
+    absolute, emptied, is_same_file, rename, write_new, FailedMove, FixOutcome, PlannedMove,
+    Refusal, RefusalReason,
 };
 use crate::paths::to_forward_slashes;
 
@@ -207,7 +207,7 @@ pub fn default_record_file() -> PathBuf {
 
 fn write_plan(plan: &UndoPlan, record_file: &Path) -> Result<()> {
     let contents = serde_json::to_string_pretty(plan)?;
-    fs::write(record_file, contents)
+    write_new(record_file, &contents)
         .with_context(|| format!("could not write the undo plan to {record_file:?}"))
 }
 
@@ -610,6 +610,62 @@ mod tests {
         let unfinished: UndoPlan =
             serde_json::from_str(&fs::read_to_string(&record_file).unwrap()).unwrap();
         assert_eq!(unfinished.moves.len(), 1, "it says what it meant to do");
+    }
+
+    #[test]
+    fn writes_its_plan_before_putting_anything_back() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        touch(
+            root,
+            "Series/Show/Season 1/Show - S01E01 Pilot.mkv",
+            "video",
+        );
+
+        let (record, plan_file) = fix(
+            root,
+            &[(
+                "Series/Show/Season 1/Show - S01E01 Pilot.mkv",
+                "Series/Show/Season 01/Show - S01E01 - Pilot.mkv",
+            )],
+        );
+
+        let undo = plan(&record, &plan_file);
+
+        assert!(apply(&undo, &root.join("missing/dir/undo.json")).is_err());
+        assert!(
+            absolute(root, "Series/Show/Season 01/Show - S01E01 - Pilot.mkv").exists(),
+            "nothing moves before the plan is on disk"
+        );
+    }
+
+    #[test]
+    fn never_overwrites_an_existing_record_file() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        touch(
+            root,
+            "Series/Show/Season 1/Show - S01E01 Pilot.mkv",
+            "video",
+        );
+
+        let (record, plan_file) = fix(
+            root,
+            &[(
+                "Series/Show/Season 1/Show - S01E01 Pilot.mkv",
+                "Series/Show/Season 01/Show - S01E01 - Pilot.mkv",
+            )],
+        );
+
+        let record_file = root.join("undo.json");
+        fs::write(&record_file, "an earlier run's record").unwrap();
+
+        assert!(apply(&plan(&record, &plan_file), &record_file).is_err());
+        assert_eq!(
+            fs::read_to_string(&record_file).unwrap(),
+            "an earlier run's record"
+        );
+        assert!(absolute(root, "Series/Show/Season 01/Show - S01E01 - Pilot.mkv").exists());
     }
 
     #[test]

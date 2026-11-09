@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -274,6 +275,14 @@ pub fn default_plan_file(created_unix_seconds: u64) -> PathBuf {
 }
 
 pub(crate) fn rename(source: &Path, destination: &Path) -> Result<()> {
+    // Checked here as well as in the plan: an earlier move in the same run may
+    // have taken this destination since, and on a case-insensitive filesystem
+    // two destinations that differ only in case are one file. `fs::rename`
+    // would replace it without a word.
+    if destination.exists() && !is_same_file(source, destination) {
+        anyhow::bail!("{destination:?} already exists; it will not be overwritten");
+    }
+
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("could not create directory {parent:?}"))?;
@@ -285,8 +294,20 @@ pub(crate) fn rename(source: &Path, destination: &Path) -> Result<()> {
 
 fn write_plan(plan: &FixPlan, plan_file: &Path) -> Result<()> {
     let contents = serde_json::to_string_pretty(plan)?;
-    fs::write(plan_file, contents)
+    write_new(plan_file, &contents)
         .with_context(|| format!("could not write the plan to {plan_file:?}"))
+}
+
+/// Write a file that must not already exist.
+///
+/// Plan files are named by the second, so two runs in the same second share a
+/// name, and overwriting would destroy the only record of the earlier run.
+pub(crate) fn write_new(path: &Path, contents: &str) -> std::io::Result<()> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?
+        .write_all(contents.as_bytes())
 }
 
 fn write_outcome(outcome: &FixOutcome, plan_file: &Path) -> Result<()> {
@@ -669,21 +690,63 @@ mod tests {
             )],
         );
         let plan = plan(&report);
-        let plan_file = temp.path().join("plan.json");
 
-        // The plan on its own describes the work without doing any of it.
-        write_plan(&plan, &plan_file).unwrap();
-        assert!(plan_file.exists());
+        // A plan that cannot be written stops the run before anything moves.
+        assert!(apply(&plan, &root.join("missing/dir/plan.json")).is_err());
         assert!(absolute(root, "Series/Show/Season 1/Show - S01E01 Pilot.mkv").exists());
 
+        // The plan on its own describes the work without doing any of it.
+        let intent_file = temp.path().join("intent.json");
+        write_plan(&plan, &intent_file).unwrap();
         let written: FixPlan =
-            serde_json::from_str(&fs::read_to_string(&plan_file).unwrap()).unwrap();
+            serde_json::from_str(&fs::read_to_string(&intent_file).unwrap()).unwrap();
         assert_eq!(written.moves, plan.moves);
 
+        let plan_file = temp.path().join("plan.json");
         let outcome = apply(&plan, &plan_file).unwrap();
         let recorded: FixOutcome =
             serde_json::from_str(&fs::read_to_string(&plan_file).unwrap()).unwrap();
         assert_eq!(recorded.applied, outcome.applied);
+    }
+
+    #[test]
+    fn never_overwrites_an_existing_plan_file() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.mkv");
+        let plan_file = root.join("plan.json");
+        fs::write(&plan_file, "an earlier run's record").unwrap();
+
+        let report = report(
+            root,
+            vec![rename_issue(
+                "Series/Show/Season 1/Show - S01E01 Pilot.mkv",
+                "Series/Show/Season 01/Show - S01E01 - Pilot.mkv",
+            )],
+        );
+
+        assert!(apply(&plan(&report), &plan_file).is_err());
+        assert_eq!(
+            fs::read_to_string(&plan_file).unwrap(),
+            "an earlier run's record"
+        );
+        assert!(absolute(root, "Series/Show/Season 1/Show - S01E01 Pilot.mkv").exists());
+    }
+
+    /// The last line of defence against overwriting, for fix and undo alike. A
+    /// plan checks destinations before the run starts; this holds while it runs.
+    #[test]
+    fn a_rename_onto_a_different_file_is_refused() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let source = root.join("a.mkv");
+        let destination = root.join("b.mkv");
+        fs::write(&source, "AAAA").unwrap();
+        fs::write(&destination, "BBBBBBBB").unwrap();
+
+        assert!(rename(&source, &destination).is_err());
+        assert_eq!(fs::read_to_string(&source).unwrap(), "AAAA");
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "BBBBBBBB");
     }
 
     #[test]
