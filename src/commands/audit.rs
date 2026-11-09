@@ -8,11 +8,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use walkdir::WalkDir;
 
 use crate::commands::validate::MEDIA_EXTENSIONS;
 use crate::ignore::IgnoreFilter;
+use crate::naming::scope_for;
 use crate::paths::to_forward_slashes;
 use crate::probe::probe;
 use crate::queue::QueueDirectory;
@@ -218,7 +219,7 @@ impl AuditCommand {
             self.scan_path, self.target.name
         );
 
-        let files = self.media_files();
+        let files = self.media_files()?;
         info!("🔍 Found {} media files, probing...", files.len());
 
         let progress = ProgressBar::new(files.len() as u64);
@@ -284,16 +285,12 @@ impl AuditCommand {
         }
     }
 
-    fn media_files(&self) -> Vec<PathBuf> {
-        let filter = match IgnoreFilter::new(self.scan_path.clone()) {
-            Ok(filter) => Some(filter),
-            Err(e) => {
-                warn!("Failed to load .plexifyignore patterns: {}", e);
-                None
-            }
-        };
+    fn media_files(&self) -> Result<Vec<PathBuf>> {
+        // A rule at the library root governs an audit of any directory inside it.
+        let scope = scope_for(&self.scan_path);
+        let filter = IgnoreFilter::for_scope(scope.library_root, &scope.scan_path)?;
 
-        WalkDir::new(&self.scan_path)
+        Ok(WalkDir::new(&self.scan_path)
             .follow_links(false)
             .into_iter()
             // Prune ignored subtrees rather than walking and discarding them.
@@ -311,19 +308,18 @@ impl AuditCommand {
                     return false;
                 }
 
-                match &filter {
-                    Some(filter) if filter.should_skip_dir(path) => {
-                        debug!("🚫 Skipping entire directory: {:?}", path);
-                        false
-                    }
-                    _ => true,
+                if filter.should_skip_dir(path) {
+                    debug!("🚫 Skipping entire directory: {:?}", path);
+                    return false;
                 }
+
+                true
             })
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.into_path())
             .filter(|path| {
                 !path.is_dir()
-                    && filter.as_ref().is_none_or(|f| !f.should_ignore(path))
+                    && !filter.should_ignore(path)
                     && path
                         .extension()
                         .map(|ext| {
@@ -332,7 +328,7 @@ impl AuditCommand {
                         })
                         .unwrap_or(false)
             })
-            .collect()
+            .collect())
     }
 
     pub fn print_report(&self, report: &AuditReport) {
@@ -1148,5 +1144,31 @@ mod tests {
         let command = AuditCommand::new(dir.path().to_path_buf(), "chromecast-gen2-3").unwrap();
 
         assert!(command.execute().await.unwrap().entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_audit_refuses_to_run_without_its_ignore_rules() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("extras")).unwrap();
+        std::fs::write(dir.path().join("extras/skipped.mp4"), "").unwrap();
+        std::fs::write(dir.path().join(".plexifyignore"), "extras/\nzz[\n").unwrap();
+
+        let command = AuditCommand::new(dir.path().to_path_buf(), "chromecast-gen2-3").unwrap();
+
+        let message = format!("{:#}", command.execute().await.unwrap_err());
+        assert!(message.contains("zz["), "{message}");
+    }
+
+    #[test]
+    fn an_audit_of_one_show_obeys_the_library_roots_rules() {
+        let dir = TempDir::new().unwrap();
+        let show = dir.path().join("Series/Show");
+        std::fs::create_dir_all(show.join("Extras")).unwrap();
+        std::fs::write(dir.path().join(".plexifyignore"), "Extras/\n").unwrap();
+        std::fs::write(show.join("Extras/bonus.mkv"), "").unwrap();
+
+        let command = AuditCommand::new(show, "chromecast-gen2-3").unwrap();
+
+        assert!(command.media_files().unwrap().is_empty());
     }
 }

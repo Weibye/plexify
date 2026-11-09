@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use walkdir::WalkDir;
 
 use crate::fix::FixOutcome;
@@ -209,14 +209,10 @@ impl ValidateCommand {
         // Rules belong to the library root even when the run is narrower, but only
         // the files above and inside the scanned subtree can affect it - see
         // `IgnoreFilter::for_scope`.
-        let ignore_filter =
-            match IgnoreFilter::for_scope(self.scope.library_root.clone(), &self.scope.scan_path) {
-                Ok(filter) => Some(filter),
-                Err(e) => {
-                    warn!("Failed to load .plexifyignore patterns: {}", e);
-                    None
-                }
-            };
+        let ignore_filter = Some(IgnoreFilter::for_scope(
+            self.scope.library_root.clone(),
+            &self.scope.scan_path,
+        )?);
 
         // Create a lookup set for media extensions for faster checks
         let media_extensions: std::collections::HashSet<&str> =
@@ -1635,5 +1631,26 @@ Series/Elementary/
             report.scanned_files, 0,
             "the root said to skip this series; scoping into it must not override that"
         );
+    }
+
+    #[tokio::test]
+    async fn a_validation_refuses_to_run_without_its_ignore_rules() {
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+        fs::create_dir_all(media_root.join("Downloads")).unwrap();
+        fs::write(media_root.join("Downloads/some.release.S01E01.mkv"), "").unwrap();
+        // A Latin-1 'é' makes the whole file unreadable as UTF-8.
+        fs::write(
+            media_root.join(".plexifyignore"),
+            b"Downloads/\n# caf\xe9\n",
+        )
+        .unwrap();
+
+        let result = ValidateCommand::new(media_root.to_path_buf())
+            .execute()
+            .await;
+
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(message.contains(".plexifyignore"), "{message}");
     }
 }
