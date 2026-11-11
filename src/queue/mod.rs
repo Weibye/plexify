@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use tokio::fs as async_fs;
@@ -175,16 +175,21 @@ impl JobQueue {
             return Ok(None);
         }
 
-        // Load all jobs and take a sort key from each
+        // Load all jobs and take a sort key from each. A file that has gone was
+        // claimed by another worker since the listing. One that does not parse
+        // is kept, with no key, so that claiming it reports it the way the
+        // first-available mode does rather than leaving it in the queue unsaid.
         let mut jobs_with_keys = Vec::new();
         for job_path in job_files {
-            // Try to read the job file
-            if let Ok(content) = async_fs::read_to_string(&job_path).await {
-                if let Ok(job) = serde_json::from_str::<Job>(&content) {
-                    let sort_key = job.episode_sort_key(&self.media_root);
-                    jobs_with_keys.push((job_path, job, sort_key));
-                }
-            }
+            let content = match async_fs::read_to_string(&job_path).await {
+                Ok(content) => content,
+                Err(e) if is_absent(&e) => continue,
+                Err(e) => return Err(e).with_context(|| format!("Could not read {job_path:?}")),
+            };
+            let sort_key = serde_json::from_str::<Job>(&content)
+                .ok()
+                .and_then(|job| job.episode_sort_key(&self.media_root));
+            jobs_with_keys.push((job_path, sort_key));
         }
 
         // Sort jobs by priority:
@@ -192,7 +197,7 @@ impl JobQueue {
         // 2. Within episodes: series directory, then season, then episode - the
         //    `EpisodeSortKey` ordering, so this is not a second description of it
         // 3. Everything with no key last, in the order it was read
-        jobs_with_keys.sort_by(|a, b| match (&a.2, &b.2) {
+        jobs_with_keys.sort_by(|a, b| match (&a.1, &b.1) {
             (Some(key_a), Some(key_b)) => key_a.cmp(key_b),
             (Some(_), None) => std::cmp::Ordering::Less, // Episode jobs first
             (None, Some(_)) => std::cmp::Ordering::Greater, // Episode jobs first
@@ -200,7 +205,7 @@ impl JobQueue {
         });
 
         // Try to claim jobs in priority order
-        for (job_path, _, _) in jobs_with_keys {
+        for (job_path, _) in jobs_with_keys {
             if let Some(claimed_job) = self.try_claim_job_file(&job_path).await? {
                 return Ok(Some(claimed_job));
             }
@@ -236,9 +241,11 @@ impl JobQueue {
                     anyhow!("Claimed {job_name} but could not write its heartbeat: {e}")
                 })?;
 
-                // Read and deserialize job content
-                let content = async_fs::read_to_string(&in_progress_path).await?;
-                let job: Job = serde_json::from_str(&content)?;
+                let content = async_fs::read_to_string(&in_progress_path)
+                    .await
+                    .with_context(|| format!("Could not read {in_progress_path:?}"))?;
+                let job: Job = serde_json::from_str(&content)
+                    .with_context(|| format!("{in_progress_path:?} is not a job file"))?;
 
                 Ok(Some(ClaimedJob {
                     queue: self,
@@ -248,10 +255,8 @@ impl JobQueue {
                     heartbeat: Some(spawn_heartbeat(heartbeat_path)),
                 }))
             }
-            Err(_) => {
-                // Job was claimed by another worker
-                Ok(None)
-            }
+            Err(e) if is_absent(&e) => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("Could not claim {job_path:?}")),
         }
     }
 
@@ -275,10 +280,10 @@ impl JobQueue {
     pub async fn job_exists(&self, job: &Job) -> Result<bool> {
         let job_filename = job.job_filename();
         let in_progress = self.in_progress_dir.join(&job_filename);
-        Ok(self.queue_dir.join(&job_filename).exists()
-            || taken_path_for(&in_progress).exists()
-            || in_progress.exists()
-            || self.failed_dir.join(&job_filename).exists())
+        Ok(is_present(&self.queue_dir.join(&job_filename)).await?
+            || is_present(&taken_path_for(&in_progress)).await?
+            || is_present(&in_progress).await?
+            || is_present(&self.failed_dir.join(&job_filename)).await?)
     }
 
     /// Return jobs abandoned in `_in_progress` to the queue.
@@ -299,17 +304,19 @@ impl JobQueue {
     pub async fn reclaim_stranded_jobs(&self, stale_after: Duration) -> Result<SweepOutcome> {
         let mut outcome = SweepOutcome::default();
 
-        if !self.in_progress_dir.exists() {
-            return Ok(outcome);
-        }
-
         // Collected on the way past, and used afterwards to tell a heartbeat
         // that still belongs to a job from one whose job is long gone.
         let mut stranded_jobs = Vec::new();
         let mut heartbeats = Vec::new();
         let mut taken = Vec::new();
 
-        let mut entries = async_fs::read_dir(&self.in_progress_dir).await?;
+        let mut entries = match async_fs::read_dir(&self.in_progress_dir).await {
+            Ok(entries) => entries,
+            Err(e) if is_absent(&e) => return Ok(outcome),
+            Err(e) => {
+                return Err(e).with_context(|| format!("Could not read {:?}", self.in_progress_dir))
+            }
+        };
         while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
             match path.extension().and_then(|ext| ext.to_str()) {
@@ -344,7 +351,11 @@ impl JobQueue {
                 }
                 // Another sweeper recovered it first, which is the same
                 // rename and so the same single winner.
-                Err(e) => debug!("Could not recover {path:?}: {e}"),
+                Err(e) if is_absent(&e) => debug!("Another sweeper recovered {path:?}"),
+                // Warned rather than returned, like a job that cannot be
+                // reclaimed below: one stuck file must not stop every worker
+                // from starting.
+                Err(e) => warn!("Could not recover {path:?}: {e}"),
             }
         }
 
@@ -362,7 +373,7 @@ impl JobQueue {
             let reclaimed = match self.reclaim_one(path, &job_name, stale_after).await {
                 Ok(reclaimed) => reclaimed,
                 Err(e) => {
-                    warn!("Could not reclaim {job_name}: {e}");
+                    warn!("Could not reclaim {job_name}: {e:#}");
                     continue;
                 }
             };
@@ -470,7 +481,9 @@ impl JobQueue {
             return Ok(Reclaimed::Lost);
         }
 
-        let content = async_fs::read_to_string(taken_path).await?;
+        let content = async_fs::read_to_string(taken_path)
+            .await
+            .with_context(|| format!("Could not read {taken_path:?}"))?;
 
         // A read that failed is worth another sweep - a network work root drops
         // out from under a worker now and then - but contents that are not a job
@@ -570,8 +583,10 @@ impl JobQueue {
     pub async fn clean(&self, directories: &[QueueDirectory]) -> Result<()> {
         for directory in directories {
             let path = self.path_of(*directory);
-            if path.exists() {
-                async_fs::remove_dir_all(path).await?;
+            match async_fs::remove_dir_all(path).await {
+                Ok(()) => {}
+                Err(e) if is_absent(&e) => {}
+                Err(e) => return Err(e).with_context(|| format!("Could not remove {path:?}")),
             }
         }
         Ok(())
@@ -764,8 +779,8 @@ fn quiet_for(seen: Option<SystemTime>, stale_after: Duration) -> bool {
 /// or "we could not get to it".
 ///
 /// This is the single definition of that distinction, and every place in the
-/// queue that treats a missing file as an ordinary outcome has to use it. The
-/// three of them ask it for the same reason: losing a race to another worker is
+/// queue that treats a missing file as an ordinary outcome has to use it. They
+/// all ask it for the same reason: losing a race to another worker is
 /// routine and is reported as a disposition, while a work root that has dropped
 /// out is an error, and answering the second with the first hides an outage
 /// behind a shrug. CLAUDE.md designs for many workers on one shared work root,
@@ -812,6 +827,17 @@ pub(crate) fn is_absent(error: &std::io::Error) -> bool {
 #[cfg(not(windows))]
 pub(crate) fn is_absent(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound
+}
+
+/// Whether anything is at `path`. `Path::exists` answers "no" to a path it
+/// could not reach, which on a shared work root reads an outage as an empty
+/// queue.
+async fn is_present(path: &std::path::Path) -> Result<bool> {
+    match async_fs::metadata(path).await {
+        Ok(_) => Ok(true),
+        Err(e) if is_absent(&e) => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("Could not check {path:?}")),
+    }
 }
 
 /// Mark a job as being attended to, without reading or replacing it.
@@ -870,7 +896,8 @@ async fn take_for_move(in_progress_path: &std::path::Path) -> Result<Option<Path
     match async_fs::rename(in_progress_path, &taken_path).await {
         Ok(_) => Ok(Some(taken_path)),
         // Somebody else took it between the mark and the rename.
-        Err(_) => Ok(None),
+        Err(e) if is_absent(&e) => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("Could not take {in_progress_path:?}")),
     }
 }
 
@@ -1987,6 +2014,117 @@ mod tests {
             .await
             .unwrap();
         assert!(swept.is_empty());
+    }
+
+    /// A work root that cannot be reached, built so the platform reports it as
+    /// something other than a missing path: on Windows an unresolvable share,
+    /// which arrives as `NotFound` with a network code, and elsewhere a path
+    /// through a regular file.
+    fn unreachable_work_root(temp_dir: &TempDir) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(r"\\no-such-host-xyz\plexify-queue")
+        } else {
+            let file = temp_dir.path().join("not-a-directory");
+            std::fs::write(&file, b"").unwrap();
+            file.join("work")
+        }
+    }
+
+    /// A work root that has dropped out is not an empty one. Read as empty, a
+    /// scan would queue files that already have jobs, a sweep would report
+    /// nothing stranded, and a clean would report nothing removed.
+    #[serial_test::serial(unc_probe)]
+    #[test]
+    async fn an_unreachable_work_root_is_an_error_and_not_an_empty_queue() {
+        let temp_dir = TempDir::new().unwrap();
+        let queue = JobQueue::new(
+            temp_dir.path().to_path_buf(),
+            unreachable_work_root(&temp_dir),
+        );
+        let job = Job::new(
+            PathBuf::from("show.mkv"),
+            MediaFileType::Mkv,
+            Operation::Reencode { channels: None },
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            temp_dir.path(),
+        );
+
+        let exists = queue.job_exists(&job).await;
+        assert!(exists.is_err(), "job_exists: {exists:?}");
+
+        let swept = queue.reclaim_stranded_jobs(Duration::from_secs(300)).await;
+        assert!(swept.is_err(), "reclaim_stranded_jobs: {swept:?}");
+
+        let cleaned = queue.clean(&QueueDirectory::ALL).await;
+        assert!(cleaned.is_err(), "clean: {cleaned:?}");
+    }
+
+    /// Only a job that is no longer there is a claim another worker took. Here
+    /// the rename fails because something is in the way, which no amount of
+    /// retrying will fix, and a worker that read it as a lost race would sleep
+    /// and try again forever without saying why.
+    #[test]
+    async fn a_claim_that_fails_for_another_reason_than_a_lost_race_is_an_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        queue.init().await.unwrap();
+        let job = Job::new(
+            PathBuf::from("show.mkv"),
+            MediaFileType::Mkv,
+            Operation::Reencode { channels: None },
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            temp_dir.path(),
+        );
+        queue.enqueue_job(&job).await.unwrap();
+        std::fs::create_dir(queue.in_progress_dir.join(job.job_filename())).unwrap();
+
+        let claimed = queue.claim_job(None).await;
+        assert!(claimed.is_err(), "{:?}", claimed.map(|c| c.is_some()));
+        assert!(queue.queue_dir.join(job.job_filename()).exists());
+    }
+
+    /// The same for the move a failure begins with.
+    #[test]
+    async fn a_failure_that_cannot_be_moved_is_an_error_and_not_a_lost_claim() {
+        let temp_dir = TempDir::new().unwrap();
+        let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        queue.init().await.unwrap();
+        let job = Job::new(
+            PathBuf::from("show.mkv"),
+            MediaFileType::Mkv,
+            Operation::Reencode { channels: None },
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            temp_dir.path(),
+        );
+        queue.enqueue_job(&job).await.unwrap();
+        let claimed = queue.claim_job(None).await.unwrap().unwrap();
+        let in_progress_path = queue.in_progress_dir.join(claimed.job_name());
+        std::fs::create_dir(taken_path_for(&in_progress_path)).unwrap();
+
+        let failed = claimed.fail("ffmpeg gave up").await;
+        assert!(failed.is_err(), "{failed:?}");
+        assert!(in_progress_path.exists(), "the claim is left where it was");
+    }
+
+    /// A job file in `_queue` that is not a job is reported by name, in either
+    /// claim mode, rather than left in the queue unmentioned.
+    #[test]
+    async fn a_queued_file_that_is_not_a_job_is_reported_by_name() {
+        for priority in [None, Some(crate::JobPriority::Episode)] {
+            let temp_dir = TempDir::new().unwrap();
+            let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+            queue.init().await.unwrap();
+            std::fs::write(queue.queue_dir.join("torn.job"), b"{\"id\": \"half a job").unwrap();
+
+            let message = match queue.claim_job(priority.clone()).await {
+                Err(e) => format!("{e:#}"),
+                Ok(claimed) => panic!("{priority:?}: claimed {:?}", claimed.is_some()),
+            };
+            assert!(message.contains("torn.job"), "{priority:?}: {message}");
+        }
     }
 
     #[test]

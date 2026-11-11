@@ -541,7 +541,7 @@ fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
 async fn job_files(directory: &Path) -> Result<Option<Vec<PathBuf>>> {
     let mut entries = match async_fs::read_dir(directory).await {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if crate::queue::is_absent(&e) => return Ok(None),
         Err(e) => return Err(anyhow!("Could not read {directory:?}: {e}")),
     };
 
@@ -954,6 +954,16 @@ mod tests {
             command.run(&mut Accepts { asked: false }).await.unwrap(),
             CleanOutcome::Removed(QueueDirectory::ALL.to_vec())
         );
+    }
+
+    /// A share that is down is not a work root with nothing in it. Windows
+    /// reports both as `NotFound`, which is why this goes through `is_absent`.
+    #[cfg(windows)]
+    #[serial_test::serial(unc_probe)]
+    #[tokio::test]
+    async fn an_unreachable_queue_directory_is_an_error_and_not_an_absent_one() {
+        let listed = job_files(Path::new(r"\\no-such-host-xyz\plexify-queue\_queue")).await;
+        assert!(listed.is_err(), "{listed:?}");
     }
 
     #[tokio::test]

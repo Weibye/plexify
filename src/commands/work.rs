@@ -147,7 +147,7 @@ impl WorkCommand {
                             }
                         }
                         Err(e) => {
-                            error!("Error processing job: {}", e);
+                            error!("Error processing job: {e:#}");
                             // Sleep a bit before retrying
                             tokio::time::sleep(Duration::from_secs(10)).await;
                         }
@@ -224,10 +224,10 @@ impl WorkCommand {
                         .move_to_destination(job, media_root, work_folder)
                         .await
                     {
-                        error!("Failed to move file from work folder: {}", e);
+                        error!("Failed to move file from work folder: {e:#}");
                         job_pb.finish_and_clear();
                         claimed_job
-                            .fail(&format!("failed to move output: {e}"))
+                            .fail(&format!("failed to move output: {e:#}"))
                             .await?;
                         return Ok(true);
                     }
@@ -236,7 +236,7 @@ impl WorkCommand {
                     if job.post_processing.disable_source_files {
                         job_pb.set_message("Cleaning up source files...");
                         if let Err(e) = processor.disable_source_files(job, media_root).await {
-                            warn!("Failed to disable source files: {}", e);
+                            warn!("Failed to disable source files: {e:#}");
                             // Continue anyway, the conversion was successful
                         }
                     }
@@ -246,12 +246,12 @@ impl WorkCommand {
                 }
                 Err(e) => {
                     job_pb.finish_with_message(format!("❌ Failed: {}", job_name));
-                    error!("❌ Conversion FAILED: {}", e);
+                    error!("❌ Conversion FAILED: {e:#}");
 
                     // `fail` consumes the claim, and `job` is borrowed from it.
                     let job = job.clone();
 
-                    match claimed_job.fail(&e.to_string()).await? {
+                    match claimed_job.fail(&format!("{e:#}")).await? {
                         FailureDisposition::Parked { attempts } => {
                             error!(
                                 "🚫 {job_name} failed {attempts} times and was moved to _failed; \
