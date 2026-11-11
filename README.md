@@ -127,8 +127,8 @@ plexify work /path/to/media --background
 # Process jobs with episode prioritization (series episodes first, in order)
 plexify work /path/to/media --priority episode
 
-# Clean up temporary files
-plexify clean /path/to/media
+# Empty the queue, after reporting what that deletes
+plexify clean
 
 # Report what in the library is not in canonical form
 plexify validate /path/to/media
@@ -374,9 +374,9 @@ what makes both workers share one queue.
 
 3. **Monitor**: Check logs for progress (logs output to stdout)
 
-4. **Clean**: Remove temporary files when done
+4. **Clean**: Empty the queue when done
 ```bash
-plexify clean /home/user/Videos --work-dir /home/user/plexify-queue
+plexify clean --work-dir /home/user/plexify-queue
 ```
 
 5. **Validate**: See what is not in canonical form, then fix it

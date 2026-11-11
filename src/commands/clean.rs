@@ -39,19 +39,11 @@ use tokio::fs as async_fs;
 use crate::job::Job;
 use crate::queue::{heartbeat_path_for, is_stale, JobQueue, QueueDirectory, STALE_AFTER};
 
-/// The worker log `work` writes beside the media root.
-const WORKER_LOG: &str = "_worker.log";
-
 /// Command to empty a work root's queue directories.
 pub struct CleanCommand {
-    media_root: PathBuf,
     work_root: PathBuf,
     /// Which queue directories to empty.
     targets: Vec<QueueDirectory>,
-    /// Whether `targets` is the full default set rather than an explicit
-    /// `--only`. Only a full clean takes the worker log with it; a run narrowed
-    /// to one queue directory should touch exactly that.
-    full: bool,
     dry_run: bool,
     assume_yes: bool,
     force: bool,
@@ -92,13 +84,11 @@ pub enum CleanOutcome {
 /// cut from `main`. When #144 lands, `CleanPlan` should be built from a
 /// `QueueStatus` rather than from its own walk - the counts, the claim liveness
 /// and the parked-job attempt counts all come from there - leaving only the
-/// worker log and the target selection here.
+/// target selection here.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CleanPlan {
     /// One entry per selected queue directory that exists on disk.
     pub directories: Vec<DirectoryPlan>,
-    /// The worker log, if a full clean would take it.
-    pub worker_log: Option<PathBuf>,
 }
 
 /// What one queue directory holds.
@@ -171,7 +161,7 @@ pub struct Parked {
 impl CleanPlan {
     /// Whether there is nothing at all to remove.
     pub fn is_empty(&self) -> bool {
-        self.directories.is_empty() && self.worker_log.is_none()
+        self.directories.is_empty()
     }
 
     /// Claims whose worker is still checking in.
@@ -252,13 +242,11 @@ impl Confirmation for TerminalConfirmation {
 }
 
 impl CleanCommand {
-    /// A full clean: all four queue directories, and the worker log.
-    pub fn new(media_root: PathBuf, work_root: PathBuf) -> Self {
+    /// A full clean: all four queue directories.
+    pub fn new(work_root: PathBuf) -> Self {
         Self {
-            media_root,
             work_root,
             targets: QueueDirectory::ALL.to_vec(),
-            full: true,
             dry_run: false,
             assume_yes: false,
             force: false,
@@ -274,7 +262,6 @@ impl CleanCommand {
             targets.sort();
             targets.dedup();
             self.targets = targets;
-            self.full = false;
         }
         self
     }
@@ -330,23 +317,14 @@ impl CleanCommand {
     /// machinery: the first refusal runs before the prompt, so the window it
     /// sees is a render and nothing else.
     pub async fn run<C: Confirmation>(&self, confirm: &mut C) -> Result<CleanOutcome> {
-        if !self.media_root.exists() {
-            return Err(anyhow!(
-                "Media directory does not exist: {:?}",
-                self.media_root
-            ));
-        }
-
-        if !self.media_root.is_dir() {
-            return Err(anyhow!("Path is not a directory: {:?}", self.media_root));
-        }
-
-        let queue = JobQueue::new(self.media_root.clone(), self.work_root.clone());
+        // No media root: nothing this command reads or deletes resolves against
+        // one, so the work root stands in for it.
+        let queue = JobQueue::new(self.work_root.clone(), self.work_root.clone());
         let plan = self.plan(&queue).await?;
 
         if plan.is_empty() {
             eprintln!(
-                "Nothing to clean: {} holds no queue directories and no worker log.",
+                "Nothing to clean: {} holds no queue directories.",
                 self.work_root.display()
             );
             return Ok(CleanOutcome::NothingToDo);
@@ -385,12 +363,6 @@ impl CleanCommand {
         self.refuse_live_claims(now.live_claims().count(), true)?;
 
         queue.clean(&self.targets).await?;
-
-        if let Some(worker_log) = &plan.worker_log {
-            async_fs::remove_file(worker_log)
-                .await
-                .with_context(|| format!("Could not remove the worker log: {worker_log:?}"))?;
-        }
 
         let removed: Vec<QueueDirectory> = plan.directories.iter().map(|d| d.directory).collect();
         eprintln!("Deleted.");
@@ -485,16 +457,7 @@ impl CleanCommand {
             directories.push(plan);
         }
 
-        // The worker log belongs to `work`, not to any one queue directory, so
-        // only a full clean takes it. A run narrowed with `--only` touches
-        // exactly what it names.
-        let worker_log = self.media_root.join(WORKER_LOG);
-        let worker_log = (self.full && worker_log.exists()).then_some(worker_log);
-
-        Ok(CleanPlan {
-            directories,
-            worker_log,
-        })
+        Ok(CleanPlan { directories })
     }
 
     /// The report, as printed.
@@ -505,8 +468,7 @@ impl CleanCommand {
         // current working directory. A user who is about to delete the wrong
         // queue is almost always in the wrong directory, and this is the line
         // that says so.
-        out.push_str(&format!("Work root:  {}\n", self.work_root.display()));
-        out.push_str(&format!("Media root: {}\n\n", self.media_root.display()));
+        out.push_str(&format!("Work root: {}\n\n", self.work_root.display()));
         out.push_str("clean will permanently delete:\n\n");
 
         for directory in &plan.directories {
@@ -516,13 +478,6 @@ impl CleanCommand {
                 directory.jobs,
                 plural(directory.jobs, "job", "jobs"),
                 consequence(directory.directory),
-            ));
-        }
-
-        if plan.worker_log.is_some() {
-            out.push_str(&format!(
-                "  {:<14} {:>4} {:<5} - {}\n",
-                WORKER_LOG, 1, "file", "the log `work` writes beside the media root",
             ));
         }
 
@@ -763,7 +718,7 @@ mod tests {
     }
 
     fn command_for(temp: &TempDir) -> CleanCommand {
-        CleanCommand::new(temp.path().to_path_buf(), temp.path().to_path_buf())
+        CleanCommand::new(temp.path().to_path_buf())
     }
 
     /// Whether the four queue directories still exist.
@@ -779,14 +734,6 @@ mod tests {
         let clean_cmd = command_for(&temp_dir).assume_yes(true);
 
         assert!(clean_cmd.execute().await.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_clean_nonexistent_directory() {
-        let clean_cmd =
-            CleanCommand::new(PathBuf::from("/nonexistent/path"), PathBuf::from("/tmp"));
-
-        assert!(clean_cmd.execute().await.is_err());
     }
 
     #[tokio::test]
@@ -884,9 +831,6 @@ mod tests {
     #[tokio::test]
     async fn the_skip_prompt_flag_deletes_without_asking() {
         let temp = populated_work_root().await;
-        async_fs::write(temp.path().join(WORKER_LOG), b"log" as &[u8])
-            .await
-            .unwrap();
         let command = command_for(&temp).assume_yes(true).force(true);
 
         // Nothing may consult the terminal on this path, so the double that
@@ -903,7 +847,27 @@ mod tests {
                 directory.on_disk_name()
             );
         }
-        assert!(!temp.path().join(WORKER_LOG).exists());
+    }
+
+    /// Nothing in plexify writes `_worker.log`, so a file by that name beside
+    /// the queue is the user's, and a clean that took it could only take theirs.
+    #[tokio::test]
+    async fn a_full_clean_removes_only_the_queue_directories() {
+        let temp = populated_work_root().await;
+        let theirs = temp.path().join("_worker.log");
+        async_fs::write(&theirs, b"a user's own notes" as &[u8])
+            .await
+            .unwrap();
+
+        command_for(&temp)
+            .assume_yes(true)
+            .force(true)
+            .run(&mut NoTerminal { asked: false })
+            .await
+            .unwrap();
+
+        assert!(!queue_dirs_exist(&temp));
+        assert!(theirs.exists(), "clean deleted a file plexify never wrote");
     }
 
     #[tokio::test]
@@ -995,9 +959,6 @@ mod tests {
     #[tokio::test]
     async fn only_narrows_the_run_to_what_it_names() {
         let temp = populated_work_root().await;
-        async_fs::write(temp.path().join(WORKER_LOG), b"log" as &[u8])
-            .await
-            .unwrap();
         let command = command_for(&temp)
             .only(&[QueueDirectory::Completed])
             .assume_yes(true);
@@ -1012,8 +973,6 @@ mod tests {
         assert!(temp.path().join("_queue").exists());
         assert!(temp.path().join("_in_progress").exists());
         assert!(temp.path().join("_failed").exists());
-        // A narrowed run is not a full clean, so the worker log stays.
-        assert!(temp.path().join(WORKER_LOG).exists());
     }
 
     /// An empty work root with one job waiting, so there is something to clean
