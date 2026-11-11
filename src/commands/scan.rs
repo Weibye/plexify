@@ -28,7 +28,7 @@ enum Resolution {
 pub struct ScanCommand {
     media_root: PathBuf,
     work_root: PathBuf,
-    preset: Option<String>,
+    config: JobProcessorConfig,
     /// The clients every queued file has to play on. Empty means none was
     /// named, and the extension decides as it did before.
     targets: Vec<PlaybackTarget>,
@@ -38,13 +38,13 @@ impl ScanCommand {
     pub fn new(
         media_root: PathBuf,
         work_root: PathBuf,
-        preset: Option<String>,
+        config: JobProcessorConfig,
         targets: &[String],
     ) -> Result<Self> {
         Ok(Self {
             media_root,
             work_root,
-            preset,
+            config,
             targets: targets
                 .iter()
                 .map(|spec| PlaybackTarget::load(spec))
@@ -191,9 +191,7 @@ impl ScanCommand {
             None
         };
 
-        // Get configuration settings for jobs
-        let config = JobProcessorConfig::from_preset(self.preset.as_deref())?;
-        let processor = JobProcessor::new(&queue, &config, &self.media_root);
+        let processor = JobProcessor::new(&queue, &self.config, &self.media_root);
 
         let resolutions = self.resolve(&media_files).await?;
         let mut conforming = 0;
@@ -339,10 +337,18 @@ fn resolve_one(path: &Path, targets: &[PlaybackTarget]) -> Resolution {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::{AudioAction, SubtitleAction};
+    use crate::job::{AudioAction, QualityPreset, SubtitleAction};
     use crate::target::Conformance;
     use std::fs;
     use tempfile::TempDir;
+
+    /// What `--preset quality` gives when no `FFMPEG_*` override is set.
+    fn quality() -> JobProcessorConfig {
+        JobProcessorConfig {
+            quality_settings: QualityPreset::Quality.to_quality_settings(),
+            ..Default::default()
+        }
+    }
 
     #[tokio::test]
     async fn test_scan_empty_directory() {
@@ -350,7 +356,7 @@ mod tests {
         let scan_cmd = ScanCommand::new(
             temp_dir.path().to_path_buf(),
             temp_dir.path().to_path_buf(),
-            None,
+            JobProcessorConfig::default(),
             &[],
         )
         .unwrap();
@@ -364,7 +370,7 @@ mod tests {
         let scan_cmd = ScanCommand::new(
             PathBuf::from("/nonexistent/path"),
             PathBuf::from("/tmp"),
-            None,
+            JobProcessorConfig::default(),
             &[],
         )
         .unwrap();
@@ -379,28 +385,13 @@ mod tests {
         let scan_cmd = ScanCommand::new(
             temp_dir.path().to_path_buf(),
             temp_dir.path().to_path_buf(),
-            Some("quality".to_string()),
+            quality(),
             &[],
         )
         .unwrap();
 
         let result = scan_cmd.execute().await;
         assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_scan_with_invalid_preset() {
-        let temp_dir = TempDir::new().unwrap();
-        let scan_cmd = ScanCommand::new(
-            temp_dir.path().to_path_buf(),
-            temp_dir.path().to_path_buf(),
-            Some("invalid_preset".to_string()),
-            &[],
-        )
-        .unwrap();
-
-        let result = scan_cmd.execute().await;
-        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -425,7 +416,7 @@ mod tests {
         let scan_cmd = ScanCommand::new(
             media_root.to_path_buf(),
             temp_dir.path().to_path_buf(),
-            Some("quality".to_string()),
+            quality(),
             &[],
         )
         .unwrap();
@@ -472,7 +463,7 @@ mod tests {
         let scan_cmd = ScanCommand::new(
             media_root.to_path_buf(),
             temp_dir.path().to_path_buf(),
-            Some("quality".to_string()),
+            quality(),
             &[],
         )
         .unwrap();
@@ -519,7 +510,7 @@ mod tests {
         let scan_cmd = ScanCommand::new(
             media_root.to_path_buf(),
             temp_dir.path().to_path_buf(),
-            Some("quality".to_string()),
+            quality(),
             &[],
         )
         .unwrap();
@@ -660,7 +651,7 @@ mod tests {
         ScanCommand::new(
             media_root.to_path_buf(),
             media_root.to_path_buf(),
-            None,
+            JobProcessorConfig::default(),
             &["chromecast-gen2-3".to_string()],
         )
         .unwrap()
@@ -703,11 +694,16 @@ mod tests {
             let media_root = media_root.to_path_buf();
             async move {
                 fs::create_dir_all(&work).unwrap();
-                ScanCommand::new(media_root, work.clone(), None, &targets)
-                    .unwrap()
-                    .execute()
-                    .await
-                    .unwrap();
+                ScanCommand::new(
+                    media_root,
+                    work.clone(),
+                    JobProcessorConfig::default(),
+                    &targets,
+                )
+                .unwrap()
+                .execute()
+                .await
+                .unwrap();
                 queued(&work)
             }
         };
@@ -793,7 +789,7 @@ mod tests {
         ScanCommand::new(
             media_root.to_path_buf(),
             lg_only.clone(),
-            None,
+            JobProcessorConfig::default(),
             &["lg-cx-webos".to_string()],
         )
         .unwrap()
@@ -807,7 +803,7 @@ mod tests {
         ScanCommand::new(
             media_root.to_path_buf(),
             both.clone(),
-            None,
+            JobProcessorConfig::default(),
             &["lg-cx-webos".to_string(), "chromecast-gen2-3".to_string()],
         )
         .unwrap()
@@ -842,7 +838,7 @@ mod tests {
         ScanCommand::new(
             media_root.to_path_buf(),
             media_root.to_path_buf(),
-            None,
+            JobProcessorConfig::default(),
             &[],
         )
         .unwrap()
@@ -885,7 +881,7 @@ mod tests {
         let scan_cmd = ScanCommand::new(
             media_root.to_path_buf(),
             temp_dir.path().to_path_buf(),
-            None,
+            JobProcessorConfig::default(),
             &[],
         )
         .unwrap();
@@ -931,7 +927,7 @@ mod tests {
         let scan_cmd = ScanCommand::new(
             media_root.to_path_buf(),
             temp_dir.path().to_path_buf(),
-            None,
+            JobProcessorConfig::default(),
             &[],
         )
         .unwrap();
@@ -962,7 +958,7 @@ mod tests {
 
         let work = temp_dir.path().join("work");
         fs::create_dir_all(&work).unwrap();
-        ScanCommand::new(show, work.clone(), None, &[])
+        ScanCommand::new(show, work.clone(), JobProcessorConfig::default(), &[])
             .unwrap()
             .execute()
             .await
@@ -983,7 +979,7 @@ mod tests {
         let result = ScanCommand::new(
             media_root.to_path_buf(),
             media_root.to_path_buf(),
-            None,
+            JobProcessorConfig::default(),
             &[],
         )
         .unwrap()

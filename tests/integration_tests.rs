@@ -3,8 +3,6 @@ use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
 
-use serial_test::serial;
-
 use plexify::queue::JobQueue;
 use plexify::JobPriority;
 
@@ -18,7 +16,6 @@ const PLEXIFY_BIN: &str = env!("CARGO_BIN_EXE_plexify");
 
 /// Test the complete scan -> clean workflow
 #[test]
-#[serial]
 fn test_scan_and_clean_workflow() {
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path();
@@ -104,7 +101,6 @@ fn test_scan_and_clean_workflow() {
 
 /// Test help commands work
 #[test]
-#[serial]
 fn test_help_commands() {
     let help_output = Command::new(PLEXIFY_BIN)
         .arg("--help")
@@ -134,7 +130,6 @@ fn test_help_commands() {
 
 /// Test that invalid paths are handled gracefully
 #[test]
-#[serial]
 fn test_invalid_paths() {
     // Test scan with non-existent directory
     let scan_output = Command::new(PLEXIFY_BIN)
@@ -159,9 +154,32 @@ fn test_invalid_paths() {
     );
 }
 
+/// A preset scan does not know is refused, not replaced by a default.
+#[test]
+fn test_scan_refuses_an_unknown_preset() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_str().unwrap();
+
+    let scan_output = Command::new(PLEXIFY_BIN)
+        .args([
+            "scan",
+            temp_path,
+            "--work-dir",
+            temp_path,
+            "--preset",
+            "invalid_preset",
+        ])
+        .output()
+        .expect("Failed to execute scan command");
+
+    assert!(
+        !scan_output.status.success(),
+        "Scan should fail with an unknown preset"
+    );
+}
+
 /// Test that job files contain all work details
 #[test]
-#[serial]
 fn test_job_files_contain_complete_details() {
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path();
@@ -175,18 +193,12 @@ fn test_job_files_contain_complete_details() {
     .unwrap();
     fs::write(temp_path.join("video2.mkv"), "fake mkv content").unwrap();
 
-    // Set custom environment variables to test they're captured
-    // Save current values first
-    let original_preset = std::env::var("FFMPEG_PRESET").ok();
-    let original_crf = std::env::var("FFMPEG_CRF").ok();
-    let original_bitrate = std::env::var("FFMPEG_AUDIO_BITRATE").ok();
-
-    std::env::set_var("FFMPEG_PRESET", "fast");
-    std::env::set_var("FFMPEG_CRF", "20");
-    std::env::set_var("FFMPEG_AUDIO_BITRATE", "192k");
-
-    // Run scan command (use temp_path as both media dir and queue dir)
+    // Run scan command (use temp_path as both media dir and queue dir), with
+    // custom settings in its environment to test they're captured
     let scan_output = Command::new(PLEXIFY_BIN)
+        .env("FFMPEG_PRESET", "fast")
+        .env("FFMPEG_CRF", "20")
+        .env("FFMPEG_AUDIO_BITRATE", "192k")
         .args([
             "scan",
             temp_path.to_str().unwrap(),
@@ -267,25 +279,10 @@ fn test_job_files_contain_complete_details() {
             assert!(job.get("subtitle_path").unwrap().is_null());
         }
     }
-
-    // Restore original environment variables
-    match original_preset {
-        Some(val) => std::env::set_var("FFMPEG_PRESET", val),
-        None => std::env::remove_var("FFMPEG_PRESET"),
-    }
-    match original_crf {
-        Some(val) => std::env::set_var("FFMPEG_CRF", val),
-        None => std::env::remove_var("FFMPEG_CRF"),
-    }
-    match original_bitrate {
-        Some(val) => std::env::set_var("FFMPEG_AUDIO_BITRATE", val),
-        None => std::env::remove_var("FFMPEG_AUDIO_BITRATE"),
-    }
 }
 
 /// Test complete workflow including work folder functionality
 #[test]
-#[serial]
 fn test_work_folder_workflow() {
     let temp_dir = TempDir::new().unwrap();
     let media_path = temp_dir.path().join("media");
@@ -297,11 +294,9 @@ fn test_work_folder_workflow() {
     // Create test media files
     fs::write(media_path.join("test_video.mkv"), "fake mkv content").unwrap();
 
-    // Set environment variable for faster processing
-    std::env::set_var("FFMPEG_PRESET", "ultrafast");
-
-    // First, scan to create jobs
+    // First, scan to create jobs, with the fastest encoder preset
     let scan_output = Command::new(PLEXIFY_BIN)
+        .env("FFMPEG_PRESET", "ultrafast")
         .args([
             "scan",
             media_path.to_str().unwrap(),
@@ -344,14 +339,10 @@ fn test_work_folder_workflow() {
     // 1. Jobs are created with the correct work folder settings
     // 2. Unit tests verify the work folder logic
     // 3. Integration tests verify the complete scan workflow
-
-    // Clean up environment variable
-    std::env::remove_var("FFMPEG_PRESET");
 }
 
 /// Test the add command with individual files
 #[test]
-#[serial]
 fn test_add_command_individual_files() {
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path();
@@ -456,7 +447,6 @@ fn test_add_command_individual_files() {
 
 /// Test hierarchical directory scanning functionality
 #[test]
-#[serial]
 fn test_hierarchical_directory_scanning() {
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path();
@@ -577,13 +567,9 @@ fn test_absolute_paths_in_jobs() {
     )
     .unwrap();
 
-    // Change to a different directory before scanning. PLEXIFY_BIN is absolute,
-    // so it stays valid across the change.
-    let original_dir = std::env::current_dir().unwrap();
-    std::env::set_current_dir(&scan_from_path).unwrap();
-
-    // Run scan command from the different directory
+    // Run scan command from a different directory
     let scan_output = Command::new(PLEXIFY_BIN)
+        .current_dir(&scan_from_path)
         .args([
             "scan",
             media_path.to_str().unwrap(),
@@ -592,9 +578,6 @@ fn test_absolute_paths_in_jobs() {
         ])
         .output()
         .expect("Failed to execute scan command");
-
-    // Restore original directory
-    std::env::set_current_dir(original_dir).unwrap();
 
     assert!(scan_output.status.success(), "Scan command failed");
 
@@ -668,7 +651,6 @@ fn test_absolute_paths_in_jobs() {
 
 /// Test that .plexifyignore files work in integration
 #[test]
-#[serial]
 fn test_plexifyignore_integration() {
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path();
@@ -766,7 +748,6 @@ fn test_plexifyignore_integration() {
 /// building jobs in memory, because that walk is the only thing that produces
 /// the separators and the season directories a worker actually meets.
 #[tokio::test]
-#[serial]
 async fn test_episode_prioritization_integration() {
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path();
@@ -848,7 +829,6 @@ async fn test_episode_prioritization_integration() {
 
 /// Test that work command accepts priority parameter but defaults to none
 #[test]
-#[serial]
 fn test_work_priority_defaults() {
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path();
@@ -1246,7 +1226,6 @@ fn test_status_explains_a_work_root_that_was_never_scanned_into() {
 /// change the one thing that is correct, which is the same failure the
 /// unreachable work root has.
 #[test]
-#[serial]
 fn test_status_tells_an_empty_queue_apart_from_a_misaddressed_one() {
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path();
@@ -1314,7 +1293,6 @@ fn test_status_fails_on_a_work_root_it_cannot_read() {
 /// directory: a report that does not say which queue it read is unusable for the
 /// one mistake it most needs to catch.
 #[test]
-#[serial]
 fn test_status_reports_a_scanned_queue_without_changing_it() {
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path();
@@ -1370,7 +1348,6 @@ fn test_status_reports_a_scanned_queue_without_changing_it() {
 /// stdout. Capturing the two separately is what `2>/dev/null` does, so a report
 /// line found here is a line that survives it.
 #[test]
-#[serial]
 fn test_report_is_on_stdout_and_logs_are_on_stderr() {
     let temp_dir = TempDir::new().unwrap();
     let series = temp_dir.path().join("Series/Breaking Bad/Season 01");
@@ -1414,7 +1391,6 @@ fn test_report_is_on_stdout_and_logs_are_on_stderr() {
 /// read to the operating system's account of why, and the `{}` form of an
 /// `anyhow` error would print the first and discard the second.
 #[test]
-#[serial]
 fn test_failure_reason_is_on_stderr_with_its_context_chain() {
     let temp_dir = TempDir::new().unwrap();
     let missing_plan = temp_dir.path().join("plexify-fix-0.json");
@@ -1451,7 +1427,6 @@ fn test_failure_reason_is_on_stderr_with_its_context_chain() {
 /// The literal shape of the complaint: `plexify ... 2>/dev/null` putting an
 /// error into the stream a caller is capturing as data.
 #[test]
-#[serial]
 fn test_failing_command_writes_nothing_to_stdout_when_stderr_is_discarded() {
     let temp_dir = TempDir::new().unwrap();
     let missing_plan = temp_dir.path().join("plexify-fix-0.json");

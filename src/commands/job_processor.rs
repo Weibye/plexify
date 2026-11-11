@@ -8,7 +8,11 @@ use crate::job::{
 };
 use crate::queue::JobQueue;
 
-/// Shared job processing configuration
+/// Shared job processing configuration.
+///
+/// Built once at the command line, so a command never reads the environment.
+/// `Default` is what a job gets with no preset and no `FFMPEG_*` override.
+#[derive(Default)]
 pub struct JobProcessorConfig {
     pub quality_settings: QualitySettings,
     pub post_processing: PostProcessingSettings,
@@ -273,7 +277,7 @@ mod tests {
         let queue = JobQueue::new(media_root.to_path_buf(), media_root.to_path_buf());
         queue.init().await.unwrap();
 
-        let config = JobProcessorConfig::from_preset(None).unwrap();
+        let config = JobProcessorConfig::default();
         let processor = JobProcessor::new(&queue, &config, media_root);
 
         let relative_path = std::path::Path::new("video.mkv");
@@ -303,7 +307,7 @@ mod tests {
         let queue = JobQueue::new(media_root.to_path_buf(), media_root.to_path_buf());
         queue.init().await.unwrap();
 
-        let config = JobProcessorConfig::from_preset(None).unwrap();
+        let config = JobProcessorConfig::default();
         let processor = JobProcessor::new(&queue, &config, media_root);
 
         let relative_path = std::path::Path::new("video.webm");
@@ -331,7 +335,7 @@ mod tests {
         let queue = JobQueue::new(media_root.to_path_buf(), media_root.to_path_buf());
         queue.init().await.unwrap();
 
-        let config = JobProcessorConfig::from_preset(None).unwrap();
+        let config = JobProcessorConfig::default();
         let processor = JobProcessor::new(&queue, &config, media_root);
 
         let relative_path = std::path::Path::new("video.webm");
