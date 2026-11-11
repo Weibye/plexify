@@ -508,3 +508,23 @@ re-encode cannot add a picture.
 - An audio-only file counts under "Direct Plays as it is", with the gap shown. A separate
   "could not assess" bucket in `audit` would say it more plainly.
 - Guarded by `a_file_with_no_video_stream_is_unassessable_rather_than_refused`.
+
+## 33. A source with no picture is refused, not converted
+
+**Decision.** `work` refuses a job whose source FFprobe finds no video stream in, before
+FFmpeg runs. `scan --target` queues no job for such a file, because `evaluate` judges
+nothing about it, its audio included (see 32).
+
+Recorded 2026-11-11.
+
+**Why.** Every operation maps the picture, so such a job can only fail, with FFmpeg's
+reason. Mapping it as optional (`-map 0:v?`) would deliver a file with no picture and
+disable its source. A picture-less file in a video library is more likely misfiled or
+broken than in need of conversion, and a refused file can be fixed by hand (principle 6).
+
+**Consequences.**
+- A plain `scan` still queues one, because it queues by extension. The job is retried up
+  to `MAX_ATTEMPTS` before it is parked, since the queue cannot park on a first failure.
+- A file FFprobe cannot read at all is refused the same way.
+- Guarded by `a_source_with_no_video_stream_is_refused_for_that` and
+  `a_file_with_no_video_stream_is_not_refused_for_its_audio_either`.
