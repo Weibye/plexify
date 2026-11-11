@@ -237,7 +237,7 @@ impl JobQueue {
                 // job is handed to a caller, so there is no window in which it
                 // is both claimed and reclaimable.
                 let heartbeat_path = heartbeat_path_for(&in_progress_path);
-                async_fs::write(&heartbeat_path, b"").await.map_err(|e| {
+                beat(&heartbeat_path).await.map_err(|e| {
                     anyhow!("Claimed {job_name} but could not write its heartbeat: {e}")
                 })?;
 
@@ -252,7 +252,7 @@ impl JobQueue {
                     job_name: job_name.to_string(),
                     job,
                     in_progress_path,
-                    heartbeat: Some(spawn_heartbeat(heartbeat_path)),
+                    heartbeat: Some(spawn_heartbeat(heartbeat_path, HEARTBEAT_INTERVAL)),
                 }))
             }
             Err(e) if is_absent(&e) => Ok(None),
@@ -680,16 +680,35 @@ impl Reclaimed {
     }
 }
 
-/// Keep refreshing a heartbeat until the task is aborted.
-fn spawn_heartbeat(path: PathBuf) -> tokio::task::JoinHandle<()> {
+/// Keep refreshing a heartbeat every `interval` until the task is aborted.
+fn spawn_heartbeat(path: PathBuf, interval: Duration) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(HEARTBEAT_INTERVAL).await;
-            if let Err(e) = async_fs::write(&path, b"").await {
+            tokio::time::sleep(interval).await;
+            if let Err(e) = beat(&path).await {
                 warn!("Could not refresh job heartbeat: {e}");
             }
         }
     })
+}
+
+/// Mark a heartbeat as fresh, creating it if it is not there.
+///
+/// The mtime is set rather than left to a write: rewriting an empty file with
+/// nothing leaves its mtime alone on Windows, which would let a running job
+/// look as quiet as an abandoned one.
+async fn beat(path: &std::path::Path) -> Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        std::fs::File::options()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?
+            .set_modified(SystemTime::now())
+    })
+    .await??;
+    Ok(())
 }
 
 /// The extension a job carries while it is being moved out of `_in_progress`.
@@ -1768,6 +1787,40 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("stopped without finishing"));
+    }
+
+    /// A long encode outlives `STALE_AFTER`, and only a heartbeat that keeps
+    /// moving stops another worker's sweep from taking the job back mid-encode.
+    #[test]
+    async fn a_running_job_keeps_its_heartbeat_fresh() {
+        let temp_dir = TempDir::new().unwrap();
+        let heartbeat = temp_dir.path().join("job.heartbeat");
+        std::fs::write(&heartbeat, b"").unwrap();
+        let claimed_at = modified_at(&heartbeat).await.unwrap();
+        let interval = Duration::from_millis(20);
+
+        let task = spawn_heartbeat(heartbeat.clone(), interval);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while modified_at(&heartbeat).await.unwrap() <= claimed_at {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the heartbeat was not refreshed while the job ran"
+            );
+            tokio::time::sleep(interval).await;
+        }
+
+        task.abort();
+        let _ = task.await;
+        // A write already dispatched to the blocking pool can still land after
+        // the abort, so let it settle before taking the reading.
+        tokio::time::sleep(interval * 5).await;
+        let stopped_at = modified_at(&heartbeat).await.unwrap();
+        tokio::time::sleep(interval * 10).await;
+        assert_eq!(
+            modified_at(&heartbeat).await.unwrap(),
+            stopped_at,
+            "the heartbeat kept beating after its task was aborted"
+        );
     }
 
     #[test]
