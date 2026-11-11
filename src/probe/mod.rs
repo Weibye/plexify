@@ -20,8 +20,8 @@ pub struct MediaProbe {
     pub duration_seconds: Option<f64>,
     /// Container bitrate in bits per second.
     pub bit_rate: Option<u64>,
-    /// The first video stream. A file may carry cover art as a second one, and
-    /// no client picks that to play.
+    /// The first video stream that is not cover art. A file whose only video
+    /// stream is its cover has none.
     pub video: Option<VideoStream>,
     pub audio: Vec<AudioStream>,
     pub subtitles: Vec<SubtitleStream>,
@@ -109,7 +109,9 @@ pub fn parse(json: &str) -> Result<MediaProbe> {
             .and_then(|f| number(f, "bit_rate"))
             .filter(|b| *b > 0.0)
             .map(|b| b as u64),
-        video: of_type("video").next().map(video_stream),
+        video: of_type("video")
+            .find(|s| !is_cover_art(s))
+            .map(video_stream),
         audio: of_type("audio").map(audio_stream).collect(),
         subtitles: of_type("subtitle")
             .map(|s| SubtitleStream {
@@ -140,6 +142,15 @@ fn video_stream(stream: &Value) -> VideoStream {
         height: positive(stream, "height").map(|h| h as u32),
         pixel_format,
     }
+}
+
+/// A cover is a still picture FFprobe lists as a video stream. No client plays
+/// it as the film, and FFmpeg's `V` stream specifier leaves it out the same way.
+fn is_cover_art(stream: &Value) -> bool {
+    stream
+        .get("disposition")
+        .and_then(|d| number(d, "attached_pic"))
+        == Some(1.0)
 }
 
 fn audio_stream(stream: &Value) -> AudioStream {
@@ -305,6 +316,18 @@ mod tests {
         assert_eq!(video.ref_frames, None);
     }
 
+    /// FFprobe lists cover art as a video stream, and nothing makes it come
+    /// after the film.
+    #[test]
+    fn never_takes_cover_art_as_the_picture() {
+        let json = r#"{"streams": [
+            {"codec_type": "video", "codec_name": "mjpeg", "disposition": {"attached_pic": 1}},
+            {"codec_type": "video", "codec_name": "h264", "disposition": {"attached_pic": 0}}
+        ]}"#;
+
+        assert_eq!(parse(json).unwrap().video.unwrap().codec, "h264");
+    }
+
     #[test]
     fn a_file_with_no_streams_is_a_probe_with_no_streams() {
         let probe = parse(r#"{"format": {"format_name": "matroska"}}"#).unwrap();
@@ -387,6 +410,58 @@ mod tests {
         assert!(video.level.is_some(), "h264 always reports a level");
         assert_eq!(probe.audio.len(), 1);
         assert_eq!(probe.audio[0].codec, "aac");
+    }
+
+    /// An MKV carries a cover as an attachment, which FFprobe reports as a
+    /// video stream. A file whose only "video" is its cover has no picture.
+    #[test]
+    fn a_file_whose_only_video_is_its_cover_has_no_picture() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let cover = dir.path().join("cover.jpg");
+        let path = dir.path().join("cover-only.mkv");
+        let built = Command::new("ffmpeg")
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x64",
+                "-frames:v",
+                "1",
+                "-y",
+            ])
+            .arg(&cover)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(built.success(), "could not build the cover");
+        let built = Command::new("ffmpeg")
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=duration=1",
+                "-c:a",
+                "aac",
+                "-attach",
+            ])
+            .arg(&cover)
+            .args(["-metadata:s:t", "mimetype=image/jpeg", "-y"])
+            .arg(&path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(built.success(), "could not build the test source");
+
+        let probe = probe(&path).unwrap();
+
+        assert_eq!(probe.video, None);
+        assert_eq!(probe.audio.len(), 1);
     }
 
     #[test]
