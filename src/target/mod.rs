@@ -141,6 +141,29 @@ impl Limit {
             },
         )
     }
+
+    /// Refuses a limit whose fields cannot all be true, so a hand-written
+    /// envelope cannot mean something other than what its author read in it.
+    fn check(&self, field: &str) -> Result<()> {
+        let Some(highest) = self.observed_up_to else {
+            return Ok(());
+        };
+
+        if self.source == Provenance::Observed {
+            anyhow::bail!(
+                "{field} sets both source = \"observed\" and observed_up_to: above \
+                 observed_up_to nothing was measured, so make the source \"assumed\""
+            );
+        }
+        if highest > self.value {
+            anyhow::bail!(
+                "{field} has observed_up_to = {highest} above its value = {}: a value \
+                 seen to play cannot be over the cap",
+                self.value
+            );
+        }
+        Ok(())
+    }
 }
 
 /// One client's playback envelope.
@@ -238,7 +261,25 @@ impl PlaybackTarget {
     }
 
     pub fn from_toml(text: &str) -> Result<Self> {
-        toml::from_str(text).context("could not read the target envelope")
+        let target: Self = toml::from_str(text).context("could not read the target envelope")?;
+
+        let video = &target.video;
+        let levels = video
+            .max_level
+            .iter()
+            .map(|(codec, limit)| (format!("video.max_level.{codec}"), limit));
+        let limits = [
+            ("video.max_bit_depth", &video.max_bit_depth),
+            ("video.max_height", &video.max_height),
+            ("video.max_ref_frames", &video.max_ref_frames),
+            ("audio.max_channels", &target.audio.max_channels),
+        ]
+        .map(|(field, limit)| (field.to_string(), limit));
+
+        for (field, limit) in limits.into_iter().chain(levels) {
+            limit.check(&field)?;
+        }
+        Ok(target)
     }
 }
 
@@ -386,15 +427,59 @@ mod tests {
         assert_eq!(level.verdict(50), (false, Provenance::Observed));
     }
 
+    /// The shipped Chromecast envelope with one piece of text replaced, so a
+    /// test fails only for the change it makes.
+    fn chromecast_with(from: &str, to: &str) -> String {
+        let toml = include_str!("../../targets/chromecast-gen2-3.toml");
+        assert!(toml.contains(from), "the built-in no longer has: {from}");
+        toml.replacen(from, to, 1)
+    }
+
+    fn load_error(toml: &str) -> String {
+        format!("{:#}", PlaybackTarget::from_toml(toml).unwrap_err())
+    }
+
     #[test]
     fn a_misspelled_field_is_an_error_rather_than_a_default() {
-        let toml = r#"
-            name = "typo"
-            [video]
-            max_bit_dept = { value = 8, source = "observed" }
-        "#;
+        let error = load_error(&chromecast_with("max_bit_depth =", "max_bit_dept ="));
 
-        assert!(PlaybackTarget::from_toml(toml).is_err());
+        assert!(
+            error.contains("unknown field `max_bit_dept`"),
+            "got: {error}"
+        );
+    }
+
+    /// Above `observed_up_to` the verdict is an assumption whatever `source`
+    /// says, so the two together claim a measurement that is not there.
+    #[test]
+    fn an_observed_limit_with_a_measured_range_is_refused() {
+        let error = load_error(&chromecast_with(
+            r#"max_bit_depth = { value = 8, source = "observed" }"#,
+            r#"max_bit_depth = { value = 8, source = "observed", observed_up_to = 8 }"#,
+        ));
+
+        assert!(error.contains("video.max_bit_depth"), "got: {error}");
+        assert!(error.contains("observed_up_to"), "got: {error}");
+    }
+
+    /// A value seen to play above the cap says the cap is wrong, and the
+    /// verdicts between the two would be refusals marked as measured.
+    #[test]
+    fn a_limit_measured_past_its_own_cap_is_refused() {
+        let error = load_error(&chromecast_with("observed_up_to = 5", "observed_up_to = 9"));
+
+        assert!(error.contains("video.max_ref_frames"), "got: {error}");
+        assert!(error.contains("observed_up_to"), "got: {error}");
+    }
+
+    #[test]
+    fn a_contradictory_level_cap_names_its_codec() {
+        let error = load_error(&chromecast_with(
+            r#"h264 = { value = 41, source = "observed" }"#,
+            r#"h264 = { value = 41, source = "observed", observed_up_to = 40 }"#,
+        ));
+
+        assert!(error.contains("video.max_level.h264"), "got: {error}");
     }
 
     #[test]
