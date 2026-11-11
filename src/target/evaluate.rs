@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::{Limit, PlaybackTarget, Provenance};
-use crate::probe::{AudioStream, MediaProbe};
+use crate::probe::{AudioStream, MediaProbe, VideoStream};
 
 /// What fixing a file costs. The two are not comparable: re-encoding video on
 /// a Pi 4 runs slower than realtime, while a remux copies the video bitstream
@@ -256,10 +256,25 @@ impl Findings {
 
 /// What `target` needs done to the file `probe` describes.
 pub fn evaluate(probe: &MediaProbe, target: &PlaybackTarget) -> Conformance {
+    // No target says what a client does with a file that has no picture, and
+    // no job can give it one, so nothing about it is judged - its audio
+    // included, or a refusal there would queue a job with no picture to copy
+    // (D32). It passes as an assumption, in sight.
+    let Some(video_stream) = &probe.video else {
+        return Conformance::Conforms {
+            unverified: vec![Finding {
+                field: Field::VideoCodec,
+                value: "no video stream".to_string(),
+                claim: None,
+                source: Provenance::Assumed,
+            }],
+        };
+    };
+
     let mut findings = Findings::default();
 
     container(probe, target, &mut findings);
-    video(probe, target, &mut findings);
+    video(video_stream, target, &mut findings);
     audio(probe, target, &mut findings);
     subtitles(probe, target, &mut findings);
 
@@ -303,21 +318,8 @@ fn container(probe: &MediaProbe, target: &PlaybackTarget, findings: &mut Finding
     );
 }
 
-fn video(probe: &MediaProbe, target: &PlaybackTarget, findings: &mut Findings) {
+fn video(video: &VideoStream, target: &PlaybackTarget, findings: &mut Findings) {
     let envelope = &target.video;
-
-    let Some(video) = &probe.video else {
-        // No target says what a client does with a file that has no picture,
-        // and a re-encode cannot add one, so nothing here can be judged. It
-        // passes the way an unread field does: as an assumption, in sight.
-        findings.check(
-            (true, Provenance::Assumed),
-            Field::VideoCodec,
-            "no video stream".to_string(),
-            None,
-        );
-        return;
-    };
 
     let (plays, source) = envelope.codecs.verdict(&video.codec);
     findings.check(
@@ -1165,6 +1167,32 @@ mod tests {
             unverified_claims(&verdict).contains(&"video codec: no video stream".to_string()),
             "{:?}",
             unverified_claims(&verdict)
+        );
+    }
+
+    /// Audio the client refuses is still no reason to queue a file with no
+    /// picture: every job copies or encodes a video stream, so a remux of one
+    /// can only fail, and the file is more likely misfiled than in need of a
+    /// conversion.
+    #[test]
+    fn a_file_with_no_video_stream_is_not_refused_for_its_audio_either() {
+        let probe = MediaProbe {
+            container: Some("matroska,webm".to_string()),
+            video: None,
+            audio: vec![AudioStream {
+                codec: "dts".to_string(),
+                channels: Some(6),
+                language: None,
+            }],
+            ..Default::default()
+        };
+
+        let verdict = evaluate(&probe, &lg());
+
+        assert_eq!(verdict.cost(), None, "{:?}", claims(&verdict));
+        assert_eq!(
+            unverified_claims(&verdict),
+            vec!["video codec: no video stream".to_string()]
         );
     }
 
