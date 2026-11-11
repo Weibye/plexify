@@ -69,11 +69,15 @@ pub enum RefusalReason {
     SourceClaimedTwice { source: String },
     /// The file named by the report is no longer where it was.
     SourceMissing,
+    /// The file could not be read, so nothing can be said about it.
+    Unreadable { error: String },
     /// The file is no longer the one that was moved there.
     ContentChanged {
         expected_bytes: u64,
         actual_bytes: u64,
     },
+    /// The record does not say how big the file was when it was moved.
+    SizeUnrecorded,
 }
 
 impl RefusalReason {
@@ -92,12 +96,16 @@ impl RefusalReason {
             RefusalReason::SourceMissing => {
                 "the file is no longer at the path that was reported".to_string()
             }
+            RefusalReason::Unreadable { error } => format!("the file could not be read: {error}"),
             RefusalReason::ContentChanged {
                 expected_bytes,
                 actual_bytes,
             } => format!(
                 "this is no longer the file that was moved here: {expected_bytes} bytes then, {actual_bytes} now"
             ),
+            RefusalReason::SizeUnrecorded => {
+                "the record does not say how big the moved file was, so there is no telling this is still it".to_string()
+            }
         }
     }
 }
@@ -197,8 +205,8 @@ pub fn plan(report: &ValidationReport) -> FixPlan {
                     source: planned.from.clone(),
                 });
             }
-            if !source.exists() {
-                return Some(RefusalReason::SourceMissing);
+            if let Err(reason) = size_of(&source) {
+                return Some(reason);
             }
             if destination.exists() && !is_same_file(&source, &destination) {
                 return Some(RefusalReason::DestinationExists {
@@ -240,8 +248,15 @@ pub fn apply(plan: &FixPlan, plan_file: &Path) -> Result<FixOutcome> {
         let source = absolute(&plan.media_root, &planned.from);
         let destination = absolute(&plan.media_root, &planned.to);
 
-        match rename(&source, &destination) {
-            Ok(()) => {
+        // The size is read before the move rather than after it: a file whose
+        // size cannot be read stays where it is, while one already moved
+        // without it could never be checked by an undo.
+        let moved = fs::metadata(&source)
+            .with_context(|| format!("could not read the size of {source:?}"))
+            .and_then(|file| rename(&source, &destination).map(|()| file.len()));
+
+        match moved {
+            Ok(size) => {
                 debug!("Renamed {:?} -> {:?}", source, destination);
                 if let Some(parent) = source.parent() {
                     if destination.parent() != Some(parent) {
@@ -249,7 +264,7 @@ pub fn apply(plan: &FixPlan, plan_file: &Path) -> Result<FixOutcome> {
                     }
                 }
                 applied.push(PlannedMove {
-                    size: fs::metadata(&destination).ok().map(|file| file.len()),
+                    size: Some(size),
                     ..planned.clone()
                 });
             }
@@ -424,6 +439,22 @@ pub(crate) fn absolute(media_root: &Path, relative: &str) -> PathBuf {
         path.push(component);
     }
     path
+}
+
+/// The size of a file about to be moved, or why it cannot be.
+///
+/// Only a file that is not there is missing. Any other failure is reported as
+/// itself: a file that cannot be read is still in the library.
+pub(crate) fn size_of(path: &Path) -> Result<u64, RefusalReason> {
+    match fs::metadata(path) {
+        Ok(file) => Ok(file.len()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(RefusalReason::SourceMissing)
+        }
+        Err(error) => Err(RefusalReason::Unreadable {
+            error: error.to_string(),
+        }),
+    }
 }
 
 /// Whether two paths name the same file on disk.
