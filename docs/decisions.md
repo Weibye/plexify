@@ -492,3 +492,19 @@ unnoticed (principle 6) and the one 23's safeguards exist for.
 - A change that gives a library file a new media name belongs in `fix.rs`, with 23's
   rechecks and record.
 - No test guards where library writes happen. Review holds it.
+
+## 32. A file with no picture is not judged
+
+**Decision.** `evaluate` records a missing video stream as an unverified pass, not a
+refusal. The audit lists it under unverified claims as `video codec: no video stream`.
+
+Recorded 2026-11-11.
+
+**Why.** No target says what a client does with a file that has no picture, so a refusal
+claimed a measurement nobody made (see 27). Refusing also queued a `Reencode` job, and a
+re-encode cannot add a picture.
+
+**Consequences.**
+- An audio-only file counts under "Direct Plays as it is", with the gap shown. A separate
+  "could not assess" bucket in `audit` would say it more plainly.
+- Guarded by `a_file_with_no_video_stream_is_unassessable_rather_than_refused`.
