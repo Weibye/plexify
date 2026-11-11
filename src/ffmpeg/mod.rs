@@ -666,8 +666,13 @@ enum SubtitleSource {
 /// nothing here has measured a better rule. Every path maps through here
 /// because FFmpeg only warns about codec options for a track nothing mapped:
 /// the job succeeds, and the output lacks the track it was run to add.
+///
+/// The picture is `0:V`, which leaves out cover art: an MKV carries it as a
+/// video stream marked as an attached picture. Plex shows its own poster, and
+/// mapped as video the cover fails a re-encode's MP4 mux or rides a remux as a
+/// second video track.
 fn mappings(source: usize, adds_a_track: bool, subtitles: &[String]) -> Vec<String> {
-    let mut mappings = vec!["0:v".to_string(), format!("{source}:a")];
+    let mut mappings = vec!["0:V".to_string(), format!("{source}:a")];
     if adds_a_track {
         mappings.push(format!("{source}:a:0"));
     }
@@ -1277,7 +1282,7 @@ impl FFmpegProcessor {
                 .with_overwrite()
                 .with_seek(chunk.start)
                 .with_input(input_path)
-                .with_stream_mapping(&["0:v"])
+                .with_stream_mapping(&["0:V"])
                 .with_video_encoding(&job.quality_settings)
                 .with_transport_stream_output()
                 .with_output(&partial_path);
@@ -1364,7 +1369,9 @@ impl FFmpegProcessor {
     /// back as 2. Only `Some(0)` is ever consulted - "FFprobe found no video
     /// stream here" - and that reading is sound whatever the count means above
     /// zero. Video rather than any stream, because the concat demuxer needs
-    /// every file in its list to declare the same streams.
+    /// every file in its list to declare the same streams. Cover art is not
+    /// counted, because it is not mapped: a file whose only picture is its
+    /// cover has nothing to convert.
     async fn probe_video_stream_count(&self, path: &Path) -> Option<usize> {
         let output = self
             .probe_command()
@@ -1372,7 +1379,7 @@ impl FFmpegProcessor {
                 "-v",
                 "error",
                 "-select_streams",
-                "v",
+                "V",
                 "-show_entries",
                 "stream=index",
                 "-of",
@@ -2380,7 +2387,7 @@ mod tests {
 
         assert_eq!(
             mappings,
-            vec!["0:v", "0:a", "0:s:0", "0:s:1", "/out.mp4"],
+            vec!["0:V", "0:a", "0:s:0", "0:s:1", "/out.mp4"],
             "audio is mapped as a group, and every subtitle stream that can be carried by name"
         );
     }
@@ -3198,6 +3205,105 @@ mod tests {
                 "{operation:?}: {error:#}"
             );
         }
+    }
+
+    /// Build an MKV of `sources` with a JPEG attached the way MKV carries
+    /// cover art. FFmpeg reads the attachment back as a video stream marked
+    /// `attached_pic`.
+    fn build_with_cover_art(dir: &Path, sources: &[&str], output: &Path) {
+        let cover = dir.join("cover.jpg");
+        let built = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "lavfi", "-i", "testsrc=size=64x64"])
+            .args(["-frames:v", "1", "-y"])
+            .arg(&cover)
+            .status()
+            .unwrap();
+        assert!(built.success(), "could not build the cover");
+
+        let mut command = std::process::Command::new("ffmpeg");
+        command.args(["-v", "error"]);
+        for source in sources {
+            command.args(["-f", "lavfi", "-i", source]);
+        }
+        let built = command
+            .args(["-c:v", "libx264", "-c:a", "aac", "-attach"])
+            .arg(&cover)
+            .args(["-metadata:s:t", "mimetype=image/jpeg", "-y"])
+            .arg(output)
+            .status()
+            .unwrap();
+        assert!(built.success(), "could not build the source with cover art");
+    }
+
+    /// Cover art is a picture of the film, not the film. Mapped as video, a
+    /// re-encode turns it into an H.264 track the MP4 muxer refuses, and a
+    /// remux delivers it as a second video track. Plex shows its own poster,
+    /// so it is left out.
+    #[tokio::test]
+    async fn cover_art_is_left_out_of_the_output() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("film.mkv");
+        build_with_cover_art(
+            temp.path(),
+            &["testsrc=duration=6:size=160x120:rate=10", "sine=duration=6"],
+            &input,
+        );
+
+        let remux = Operation::Remux {
+            audio: AudioAction::Copy,
+            subtitles: SubtitleAction::Keep,
+        };
+        let reencode = Operation::Reencode { channels: None };
+        for (operation, chunking) in [
+            (remux, Chunking::default()),
+            (reencode, Chunking::default()),
+            (reencode, TEST_CHUNKING),
+        ] {
+            let work_folder = TempDir::new().unwrap();
+            let job = Job {
+                operation,
+                ..chunking_job(&input)
+            };
+
+            FFmpegProcessor::new(false)
+                .with_chunking(chunking)
+                .process_job(&job, None, Some(work_folder.path()))
+                .await
+                .unwrap_or_else(|error| panic!("{operation:?}, {chunking:?}: {error:#}"));
+
+            let kinds: Vec<String> = streams_of(&job.work_folder_output_path(work_folder.path()))
+                .iter()
+                .map(|stream| stream.split(',').next().unwrap().to_string())
+                .collect();
+            assert_eq!(kinds, ["video", "audio"], "{operation:?}, {chunking:?}");
+        }
+    }
+
+    /// A file whose only picture is its cover art is as audio-only as one with
+    /// none, and is refused for the same reason.
+    #[tokio::test]
+    async fn a_source_whose_only_picture_is_cover_art_is_refused() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("album.mkv");
+        build_with_cover_art(temp.path(), &["sine=duration=2"], &input);
+
+        let error = FFmpegProcessor::new(false)
+            .process_job(&chunking_job(&input), None, Some(temp.path()))
+            .await
+            .expect_err("a source with only cover art was converted");
+
+        assert!(
+            format!("{error:#}").contains("plexify only converts video"),
+            "{error:#}"
+        );
     }
 
     #[test]
