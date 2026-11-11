@@ -20,7 +20,8 @@ use tokio::fs as async_fs;
 use crate::job::Job;
 use crate::paths::to_forward_slashes;
 use crate::queue::{
-    heartbeat_path_for, is_absent, last_activity, JobQueue, MAX_ATTEMPTS, STALE_AFTER,
+    failure_summary, heartbeat_path_for, is_absent, last_activity, JobQueue, MAX_ATTEMPTS,
+    STALE_AFTER,
 };
 
 /// Report the state of a work root's queue.
@@ -375,21 +376,14 @@ fn for_display(path: &Path) -> String {
     to_forward_slashes(path)
 }
 
-/// The most recent line of a recorded error, which is where the reason is.
-///
-/// `ClaimedJob::fail` keeps the *tail* of what FFmpeg said, because that is
-/// where FFmpeg finally names the problem, so the last line is the one worth
-/// putting in a summary. The job file keeps the rest.
+/// The line that sums up a recorded error, and how many earlier lines the job
+/// file holds.
 fn error_summary(message: &str) -> (String, usize) {
-    let lines: Vec<&str> = message
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
+    let lines = message.lines().filter(|l| !l.trim().is_empty()).count();
 
-    match lines.last() {
-        Some(last) => (last.to_string(), lines.len().saturating_sub(1)),
-        None => ("no reason was recorded".to_string(), 0),
+    match failure_summary(message) {
+        "" => ("no reason was recorded".to_string(), 0),
+        summary => (summary.to_string(), lines.saturating_sub(1)),
     }
 }
 
