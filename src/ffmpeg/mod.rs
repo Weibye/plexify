@@ -1621,10 +1621,11 @@ impl FFmpegProcessor {
             return Err(anyhow!("Failed to copy output to {staging_path:?}: {e}"));
         }
 
-        if let Err(e) = tokio::fs::rename(&staging_path, &final_output_path).await {
+        // `fs::rename` replaces whatever is at the destination; this refuses it.
+        if let Err(e) = crate::fix::rename(&staging_path, &final_output_path) {
             let _ = tokio::fs::remove_file(&staging_path).await;
             return Err(anyhow!(
-                "Failed to move output into place at {final_output_path:?}: {e}"
+                "Failed to move output into place at {final_output_path:?}: {e:#}"
             ));
         }
 
@@ -1696,6 +1697,11 @@ impl FFmpegProcessor {
             }
 
             let destination = final_output.with_file_name(format!("{final_stem}.{suffix}"));
+            // `copy` would replace a subtitle somebody already put there.
+            if destination.exists() {
+                warn!("Kept {path:?}: {destination:?} already exists; it will not be overwritten");
+                continue;
+            }
             if let Err(e) = tokio::fs::copy(&path, &destination).await {
                 warn!("Could not put the subtitle {destination:?} beside its file: {e}");
                 continue;
@@ -1720,8 +1726,8 @@ impl FFmpegProcessor {
                 .unwrap_or("")
         ));
 
-        // Rename input file
-        tokio::fs::rename(&input_path, &disabled_input).await?;
+        // `fs::rename` would replace a `.disabled` file already there.
+        crate::fix::rename(&input_path, &disabled_input)?;
         debug!(
             "Renamed input file: {:?} -> {:?}",
             input_path, disabled_input
@@ -1731,7 +1737,7 @@ impl FFmpegProcessor {
         if let Some(vtt_path) = job.full_subtitle_path(media_root) {
             if vtt_path.exists() {
                 let disabled_vtt = vtt_path.with_extension("vtt.disabled");
-                tokio::fs::rename(&vtt_path, &disabled_vtt).await?;
+                crate::fix::rename(&vtt_path, &disabled_vtt)?;
                 debug!(
                     "Renamed subtitle file: {:?} -> {:?}",
                     vtt_path, disabled_vtt
@@ -4613,6 +4619,120 @@ mod tests {
         assert!(!job.work_folder_output_path(&work_folder).exists());
     }
 
+    // The three tests below guard against `fs::rename` and `fs::copy`, which
+    // replace an existing file without a word, on Linux and Windows alike.
+
+    #[tokio::test]
+    async fn delivery_never_writes_over_a_file_already_at_the_output_name() {
+        let temp_dir = TempDir::new().unwrap();
+        let (job, work_folder) = job_ready_to_move(&temp_dir).await;
+        let final_path = job.full_output_path(None);
+        tokio::fs::write(&final_path, "somebody's file")
+            .await
+            .unwrap();
+        let processor = FFmpegProcessor::new(false);
+
+        let error = processor
+            .move_to_destination(&job, None, &work_folder)
+            .await
+            .expect_err("a taken output name is refused");
+
+        assert!(
+            format!("{error:#}").contains(&format!("{final_path:?}")),
+            "the refusal names the file it would have replaced: {error:#}"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(&final_path).await.unwrap(),
+            "somebody's file"
+        );
+        assert!(
+            job.work_folder_output_path(&work_folder).exists(),
+            "the encode is kept for a person to look at"
+        );
+        assert!(!staging_path_for(&final_path, &processor.worker_id).exists());
+    }
+
+    #[tokio::test]
+    async fn delivery_never_writes_over_a_subtitle_already_beside_the_output() {
+        let temp_dir = TempDir::new().unwrap();
+        let (job, work_folder) = job_ready_to_move(&temp_dir).await;
+        let work_output = job.work_folder_output_path(&work_folder);
+        let work_subtitle = work_output.with_extension("eng.srt");
+        tokio::fs::write(&work_subtitle, "extracted").await.unwrap();
+        let existing = job.full_output_path(None).with_extension("eng.srt");
+        tokio::fs::write(&existing, "somebody's subtitle")
+            .await
+            .unwrap();
+
+        FFmpegProcessor::new(false)
+            .move_to_destination(&job, None, &work_folder)
+            .await
+            .expect("a subtitle that cannot land does not hold back its file");
+
+        assert_eq!(
+            tokio::fs::read_to_string(&existing).await.unwrap(),
+            "somebody's subtitle"
+        );
+        assert!(
+            work_subtitle.exists(),
+            "the extracted subtitle is kept for a person to look at"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabling_a_source_never_writes_over_a_disabled_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let media = temp_dir.path();
+        let job = Job::new(
+            PathBuf::from("show.webm"),
+            MediaFileType::WebM,
+            Operation::Reencode { channels: None },
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            media,
+        );
+        let processor = FFmpegProcessor::new(false);
+        let source = media.join("show.webm");
+        let subtitle = media.join("show.vtt");
+        let disabled_source = media.join("show.webm.disabled");
+        let disabled_subtitle = media.join("show.vtt.disabled");
+
+        // The source's own `.disabled` name is taken.
+        std::fs::write(&source, "source").unwrap();
+        std::fs::write(&disabled_source, "an older source").unwrap();
+        let error = processor
+            .disable_source_files(&job, None)
+            .await
+            .expect_err("a taken .disabled name is refused");
+        assert!(
+            format!("{error:#}").contains(&format!("{disabled_source:?}")),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "source");
+        assert_eq!(
+            std::fs::read_to_string(&disabled_source).unwrap(),
+            "an older source"
+        );
+
+        // The source's is free, the subtitle's is taken.
+        std::fs::remove_file(&disabled_source).unwrap();
+        std::fs::write(&subtitle, "subtitle").unwrap();
+        std::fs::write(&disabled_subtitle, "an older subtitle").unwrap();
+        let error = processor
+            .disable_source_files(&job, None)
+            .await
+            .expect_err("a taken .vtt.disabled name is refused");
+        assert!(
+            format!("{error:#}").contains(&format!("{disabled_subtitle:?}")),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&subtitle).unwrap(), "subtitle");
+        assert_eq!(
+            std::fs::read_to_string(&disabled_subtitle).unwrap(),
+            "an older subtitle"
+        );
+    }
+
     #[tokio::test]
     async fn a_part_copied_file_left_by_a_killed_move_is_not_taken_for_the_output() {
         let temp_dir = TempDir::new().unwrap();
@@ -4710,16 +4830,19 @@ mod tests {
             one.move_to_destination(&job, None, one_work),
             other.move_to_destination(&job, None, other_work)
         );
-        first.unwrap();
-        second.unwrap();
-
-        // Whichever rename landed last, the destination holds one worker's
+        // The first to land keeps the destination, and the other refuses to
+        // write over it. Whichever it was, the destination holds one worker's
         // encode from end to end. A shared staging name would leave the two
         // interleaved, and `output_exists` would call that finished.
+        let winner = match (&first, &second) {
+            (Ok(()), Err(_)) => one_content,
+            (Err(_), Ok(())) => other_content,
+            _ => panic!("exactly one move lands: {first:?}, {second:?}"),
+        };
         let landed = tokio::fs::read(&final_path).await.unwrap();
         assert!(
-            &landed == one_content || &landed == other_content,
-            "the destination holds {} bytes that are neither encode",
+            &landed == winner,
+            "the destination holds {} bytes that are not the encode that landed",
             landed.len()
         );
 
