@@ -881,6 +881,18 @@ impl FFmpegProcessor {
             return Err(anyhow!("Input file does not exist: {input_path:?}"));
         }
 
+        // Every operation maps the picture, and a queue built by extension
+        // alone can hold a file without one. Mapping it optionally instead
+        // would deliver a movie with no picture and disable its source, when
+        // the source is more likely misfiled or broken. FFprobe also
+        // finds no stream in a file it cannot read, which is no more a thing
+        // to convert.
+        if self.probe_video_stream_count(&input_path).await == Some(0) {
+            return Err(anyhow!(
+                "FFprobe finds no video stream in {input_path:?}; plexify only converts video"
+            ));
+        }
+
         // Create output directory if it doesn't exist
         if let Some(parent) = output_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -3133,6 +3145,53 @@ mod tests {
             !work_folder.join(format!("{}.chunks", job.id)).exists(),
             "a source below the threshold should never be divided up"
         );
+    }
+
+    /// A queue built by extension holds whatever has a video file's name. A
+    /// source with no picture is refused for that, before FFmpeg is asked to
+    /// map a stream it does not have, so the reason a parked job gives is the
+    /// one somebody can act on.
+    #[tokio::test]
+    async fn a_source_with_no_video_stream_is_refused_for_that() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp = TempDir::new().unwrap();
+        let input = temp.path().join("sound.mkv");
+        let built = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "lavfi", "-i", "sine=duration=2"])
+            .args(["-c:a", "aac"])
+            .arg(&input)
+            .status()
+            .unwrap();
+        assert!(built.success(), "could not build the audio-only source");
+
+        let work_folder = temp.path().join("work");
+        std::fs::create_dir_all(&work_folder).unwrap();
+
+        for operation in [
+            Operation::Reencode { channels: None },
+            Operation::Remux {
+                audio: AudioAction::Transcode { channels: None },
+                subtitles: SubtitleAction::Keep,
+            },
+        ] {
+            let job = Job {
+                operation,
+                ..chunking_job(&input)
+            };
+
+            let error = FFmpegProcessor::new(false)
+                .process_job(&job, None, Some(&work_folder))
+                .await
+                .expect_err("a source with no picture was converted");
+
+            assert!(
+                format!("{error:#}").contains("plexify only converts video"),
+                "{operation:?}: {error:#}"
+            );
+        }
     }
 
     #[test]
