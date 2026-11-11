@@ -24,6 +24,9 @@ use crate::target::{evaluate, Conformance, Cost, Finding, PlaybackTarget, Proven
 pub struct AuditEntry {
     /// The file relative to the scanned directory, with `/` separators.
     pub path: String,
+    /// Out of the file's `stat`. When that stat failed this is 0 and the
+    /// outcome is `ProbeFailed` with the OS's reason, which keeps the entry
+    /// out of every cost bucket and so out of every total.
     pub size_bytes: u64,
     /// How much of `size_bytes` is actually backed by disk. See [`Allocation`].
     pub allocation: Allocation,
@@ -102,12 +105,8 @@ impl Allocation {
     }
 }
 
-/// Whether this platform can read an allocated size at all.
-///
-/// It separates the two things [`Allocation::Unmeasurable`] otherwise conflates:
-/// where this is false nothing was measured and the report says so once, and
-/// where it is true an `Unmeasurable` entry is one file whose own `stat` failed,
-/// which has to be named rather than left looking whole.
+/// Whether this platform can read an allocated size at all. Where it cannot,
+/// nothing was measured and the report says so once.
 pub const ALLOCATION_IS_MEASURABLE: bool = cfg!(unix);
 
 /// Read the allocated size out of a `stat` that has already been performed.
@@ -128,7 +127,8 @@ fn allocation_of(_metadata: &std::fs::Metadata) -> Allocation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Outcome {
     Assessed(Conformance),
-    /// FFprobe could not read the file, so nothing is claimed about it.
+    /// The file could not be stat'd or FFprobe could not read it, so nothing
+    /// is claimed about it.
     ProbeFailed {
         reason: String,
     },
@@ -170,14 +170,6 @@ impl AuditReport {
                 .allocation
                 .shortfall(entry.size_bytes)
                 .map(|missing| (entry, missing))
-        })
-    }
-
-    /// Files this platform could have measured but did not, because their own
-    /// `stat` failed. Always zero where the platform cannot measure at all.
-    pub fn unmeasured(&self) -> impl Iterator<Item = &AuditEntry> {
-        self.entries.iter().filter(|entry| {
-            ALLOCATION_IS_MEASURABLE && matches!(entry.allocation, Allocation::Unmeasurable)
         })
     }
 }
@@ -261,7 +253,25 @@ impl AuditCommand {
     }
 
     fn audit_file(&self, path: &Path) -> AuditEntry {
-        let relative = path.strip_prefix(&self.scan_path).unwrap_or(path);
+        let path_in_report = to_forward_slashes(path.strip_prefix(&self.scan_path).unwrap_or(path));
+
+        // Stat before probing: a file whose size is unknown is not judged, so
+        // no verdict and no bucket total can rest on a size nobody read.
+        let metadata = match std::fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                return AuditEntry {
+                    path: path_in_report,
+                    size_bytes: 0,
+                    allocation: Allocation::Unmeasurable,
+                    modified: None,
+                    outcome: Outcome::ProbeFailed {
+                        reason: format!("could not stat {}: {error}", path.display()),
+                    },
+                }
+            }
+        };
+
         let outcome = match probe(path) {
             Ok(media) => Outcome::Assessed(evaluate(&media, &self.target)),
             Err(error) => Outcome::ProbeFailed {
@@ -269,18 +279,13 @@ impl AuditCommand {
             },
         };
 
-        // One stat, read twice: the length the file claims, and how much of it
-        // the filesystem is actually holding.
-        let metadata = std::fs::metadata(path).ok();
-
         AuditEntry {
-            path: to_forward_slashes(relative),
-            size_bytes: metadata.as_ref().map(|m| m.len()).unwrap_or(0),
-            allocation: metadata
-                .as_ref()
-                .map(allocation_of)
-                .unwrap_or(Allocation::Unmeasurable),
-            modified: metadata.as_ref().and_then(|m| m.modified().ok()),
+            path: path_in_report,
+            // One stat, read twice: the length the file claims, and how much
+            // of it the filesystem is actually holding.
+            size_bytes: metadata.len(),
+            allocation: allocation_of(&metadata),
+            modified: metadata.modified().ok(),
             outcome,
         }
     }
@@ -437,23 +442,6 @@ impl AuditCommand {
                         entry.path,
                         in_flight_caveat(entry.modified),
                     );
-                }
-            }
-
-            // Not folded into the banner above. A file whose own stat failed is
-            // unmeasured on a platform that measures, and letting its measured
-            // neighbours suppress the notice would leave it looking whole -
-            // the same silent clean bill of health the banner exists to
-            // prevent, one file at a time instead of all of them at once.
-            let unmeasured: Vec<_> = report.unmeasured().collect();
-            if !unmeasured.is_empty() {
-                let _ = writeln!(
-                    out,
-                    "\n🕳️  {} file(s) could not be stat'd, so nothing is claimed about how much of them is on disk:",
-                    unmeasured.len()
-                );
-                for entry in unmeasured {
-                    let _ = writeln!(out, "   {}", entry.path);
                 }
             }
         }
@@ -838,6 +826,28 @@ mod tests {
             .contains("Could not be probed"));
     }
 
+    /// A file moved away mid-audit has no size to report. It is listed with
+    /// the OS's reason, never judged, totalled or counted as 0 bytes.
+    #[tokio::test]
+    async fn a_file_that_cannot_be_stat_d_is_reported_with_the_os_reason() {
+        let dir = TempDir::new().unwrap();
+        let vanished = dir.path().join("vanished.mp4");
+        let os_reason = std::fs::metadata(&vanished).unwrap_err().to_string();
+
+        let command = AuditCommand::new(dir.path().to_path_buf(), "chromecast-gen2-3").unwrap();
+        let report = AuditReport {
+            target: "chromecast-gen2-3".into(),
+            scan_path: dir.path().to_path_buf(),
+            audit_time: Duration::from_secs(0),
+            entries: vec![command.audit_file(&vanished)],
+        };
+
+        assert_eq!(report.unreadable().count(), 1);
+        let rendered = command.render_report(&report);
+        assert!(rendered.contains("vanished.mp4"), "{rendered}");
+        assert!(rendered.contains(&os_reason), "{rendered}");
+    }
+
     /// Write `head`, then extend the file to `apparent` bytes.
     ///
     /// Returns whether the extension was actually left as a hole. A filesystem
@@ -953,49 +963,6 @@ mod tests {
             ""
         );
         assert_eq!(in_flight_caveat(None), "");
-    }
-
-    /// A file whose own stat failed must not hide behind its measured
-    /// neighbours - that is the per-file version of the clean bill of health
-    /// the platform banner exists to prevent.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_file_whose_stat_failed_is_named_rather_than_left_looking_whole() {
-        fn entry(path: &str, allocation: Allocation) -> AuditEntry {
-            AuditEntry {
-                path: path.to_string(),
-                size_bytes: 1000,
-                allocation,
-                modified: None,
-                outcome: Outcome::ProbeFailed {
-                    reason: "fixture".into(),
-                },
-            }
-        }
-
-        let dir = TempDir::new().unwrap();
-        let command = AuditCommand::new(dir.path().to_path_buf(), "chromecast-gen2-3").unwrap();
-        let report = AuditReport {
-            target: "chromecast-gen2-3".into(),
-            scan_path: dir.path().to_path_buf(),
-            audit_time: Duration::from_secs(0),
-            entries: vec![
-                entry(
-                    "measured.mp4",
-                    Allocation::Measured {
-                        allocated_bytes: 1000,
-                    },
-                ),
-                entry("unstattable.mp4", Allocation::Unmeasurable),
-            ],
-        };
-
-        let rendered = command.render_report(&report);
-        assert!(
-            rendered.contains("1 file(s) could not be stat'd"),
-            "the measured neighbour must not suppress or absorb it: {rendered}"
-        );
-        assert!(rendered.contains("unstattable.mp4"), "{rendered}");
     }
 
     /// A real hole, and a file of exactly the same apparent size that has none.
