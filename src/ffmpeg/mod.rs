@@ -519,20 +519,12 @@ pub struct SubtitleStream {
 
 /// Which of a source's subtitle streams the output can carry.
 #[derive(Debug, Clone, PartialEq)]
-pub enum SubtitleSelection {
-    /// The source was probed. `kept` holds the positions, among the source's
-    /// subtitle streams, of the ones that can become `mov_text`; `dropped`
-    /// holds the ones that cannot, so the run can say what it left out.
-    Probed {
-        kept: Vec<usize>,
-        dropped: Vec<SubtitleStream>,
-    },
-    /// FFprobe could not read the source, so nothing is known about what its
-    /// subtitle streams hold. Map them all, optionally, and leave FFmpeg to
-    /// judge: a bitmap stream then fails the job, which is no worse than the
-    /// behaviour that existed before the encode could ask, and is a great deal
-    /// better than discarding a track that was never identified.
-    Unprobed,
+pub struct SubtitleSelection {
+    /// The positions, among the source's subtitle streams, of the ones that
+    /// can become `mov_text`.
+    kept: Vec<usize>,
+    /// The ones that cannot, so the run can say what it left out.
+    dropped: Vec<SubtitleStream>,
 }
 
 impl SubtitleSelection {
@@ -542,21 +534,15 @@ impl SubtitleSelection {
     /// The source is input 0 for a one-pass encode and input 1 for the join
     /// that follows a chunked one, where input 0 is the list of chunks.
     pub fn mappings(&self, input_index: usize) -> Vec<String> {
-        match self {
-            Self::Probed { kept, .. } => kept
-                .iter()
-                .map(|position| format!("{input_index}:s:{position}"))
-                .collect(),
-            Self::Unprobed => vec![format!("{input_index}:s?")],
-        }
+        self.kept
+            .iter()
+            .map(|position| format!("{input_index}:s:{position}"))
+            .collect()
     }
 
     /// The subtitle streams that cannot go into the output.
     pub fn dropped(&self) -> &[SubtitleStream] {
-        match self {
-            Self::Probed { dropped, .. } => dropped,
-            Self::Unprobed => &[],
-        }
+        &self.dropped
     }
 }
 
@@ -574,7 +560,7 @@ pub fn select_subtitle_streams(streams: &[SubtitleStream]) -> SubtitleSelection 
         }
     }
 
-    SubtitleSelection::Probed { kept, dropped }
+    SubtitleSelection { kept, dropped }
 }
 
 /// One line of the subtitle probe's CSV output.
@@ -792,6 +778,9 @@ pub struct FFmpegProcessor {
     /// Tells this worker's staging files apart from every other worker's. See
     /// [`staging_path_for`].
     worker_id: Uuid,
+    /// The FFprobe program to run. Only a test names another, to make the
+    /// probe fail while FFmpeg still works.
+    ffprobe: &'static str,
 }
 
 impl FFmpegProcessor {
@@ -800,7 +789,14 @@ impl FFmpegProcessor {
             background_mode,
             chunking: Chunking::default(),
             worker_id: Uuid::new_v4(),
+            ffprobe: "ffprobe",
         }
+    }
+
+    #[cfg(test)]
+    fn with_ffprobe(mut self, ffprobe: &'static str) -> Self {
+        self.ffprobe = ffprobe;
+        self
     }
 
     /// Divide sources differently from the default.
@@ -834,7 +830,7 @@ impl FFmpegProcessor {
     /// there is one place where a background worker's priority is decided, and
     /// no FFmpeg-family process that quietly bypasses it.
     fn probe_command(&self) -> Command {
-        self.program("ffprobe")
+        self.program(self.ffprobe)
     }
 
     /// The command that runs an FFmpeg-family program, before any arguments.
@@ -912,7 +908,7 @@ impl FFmpegProcessor {
                 Some(SubtitleSource::External(vtt_path))
             }
             (true, MediaFileType::Mkv | MediaFileType::Avi) => Some(SubtitleSource::Embedded(
-                self.select_subtitles(&input_path).await,
+                self.select_subtitles(&input_path).await?,
             )),
         };
 
@@ -985,11 +981,7 @@ impl FFmpegProcessor {
     /// video does: a media server that indexes a half-written subtitle shows a
     /// broken track.
     async fn extract_sidecars(&self, input_path: &Path, output_path: &Path) -> Result<()> {
-        let Some(streams) = self.probe_subtitle_streams(input_path).await else {
-            warn!("FFprobe could not read the subtitle streams of {input_path:?}; no sidecar was written, and the tracks are still in the source.");
-            return Ok(());
-        };
-
+        let streams = self.probe_subtitle_streams(input_path).await?;
         let plan = subtitles::plan(&streams, output_path);
 
         for stream in &plan.unconvertible {
@@ -1048,19 +1040,14 @@ impl FFmpegProcessor {
 
     /// Work out which of a source's subtitle streams can go into the output,
     /// and say what is being left behind.
-    async fn select_subtitles(&self, input_path: &Path) -> SubtitleSelection {
-        let Some(streams) = self.probe_subtitle_streams(input_path).await else {
-            warn!("⚠️ FFprobe could not read the subtitle streams of {input_path:?}; every subtitle stream will be offered to FFmpeg as it was before.");
-            return SubtitleSelection::Unprobed;
-        };
-
-        let selection = select_subtitle_streams(&streams);
+    async fn select_subtitles(&self, input_path: &Path) -> Result<SubtitleSelection> {
+        let selection = select_subtitle_streams(&self.probe_subtitle_streams(input_path).await?);
 
         for stream in selection.dropped() {
             warn!("{}", dropped_stream_warning(stream, input_path));
         }
 
-        selection
+        Ok(selection)
     }
 
     /// Convert the whole source in a single FFmpeg run.
@@ -1478,8 +1465,10 @@ impl FFmpegProcessor {
     /// That order is what makes the result usable as a mapping: the nth line
     /// here is the stream FFmpeg calls `0:s:n`. A source with no subtitles
     /// probes successfully and comes back empty, which is a different answer
-    /// from `None` - that means FFprobe could not read the file at all.
-    async fn probe_subtitle_streams(&self, input_path: &Path) -> Option<Vec<SubtitleStream>> {
+    /// from an error - that means FFprobe could not read the file at all, and
+    /// a job that goes on without knowing what its tracks are can deliver an
+    /// output without them while `work` disables the source that had them.
+    async fn probe_subtitle_streams(&self, input_path: &Path) -> Result<Vec<SubtitleStream>> {
         let output = self
             .probe_command()
             .args([
@@ -1497,20 +1486,25 @@ impl FFmpegProcessor {
             .stderr(Stdio::piped())
             .output()
             .await
-            .ok()?;
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to start FFprobe to read the subtitle streams of {input_path:?}: {e}"
+                )
+            })?;
 
         if !output.status.success() {
-            return None;
+            return Err(anyhow!(
+                "FFprobe could not read the subtitle streams of {input_path:?}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
         }
 
-        Some(
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(parse_probed_subtitle_line)
-                .collect(),
-        )
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(parse_probed_subtitle_line)
+            .collect())
     }
 
     /// Run one FFmpeg invocation, turning a non-zero exit into an error that
@@ -2349,7 +2343,7 @@ mod tests {
 
     #[test]
     fn maps_every_stream_rather_than_the_first_of_each() {
-        let selection = SubtitleSelection::Probed {
+        let selection = SubtitleSelection {
             kept: vec![0, 1],
             dropped: Vec::new(),
         };
@@ -4242,16 +4236,6 @@ mod tests {
         assert!(select_subtitle_streams(&[]).mappings(0).is_empty());
     }
 
-    #[test]
-    fn a_source_that_could_not_be_probed_falls_back_to_the_optional_group() {
-        // Nothing is known about what the streams hold, so FFmpeg is left to
-        // judge. That can still fail on a bitmap stream - but silently
-        // discarding a stream nobody identified would be worse.
-        assert_eq!(SubtitleSelection::Unprobed.mappings(0), vec!["0:s?"]);
-        assert_eq!(SubtitleSelection::Unprobed.mappings(1), vec!["1:s?"]);
-        assert!(SubtitleSelection::Unprobed.dropped().is_empty());
-    }
-
     /// Subtitle events as whole milliseconds, so the comparison is not about
     /// float noise.
     ///
@@ -5069,6 +5053,57 @@ mod tests {
             !names.iter().any(|name| name == "show.eng.ass"),
             "an unstyled original is not worth keeping: {names:?}"
         );
+    }
+
+    /// A job that cannot read its source's subtitle streams fails, whether it
+    /// carries them or extracts them. On success `work` disables the source,
+    /// so a job that went on without knowing what the tracks were could leave
+    /// the library holding a file without them.
+    #[test]
+    fn a_job_that_cannot_probe_its_subtitles_fails() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let source = temp_dir.path().join("sources");
+        std::fs::create_dir_all(&source).unwrap();
+        let input = build_subtitled_source(&source.join("show.mkv"), &source);
+
+        for subtitles in [SubtitleAction::Keep, SubtitleAction::Extract] {
+            let job = Job::new(
+                input.clone(),
+                MediaFileType::Mkv,
+                Operation::Remux {
+                    audio: AudioAction::Copy,
+                    subtitles,
+                },
+                QualitySettings::default(),
+                PostProcessingSettings::default(),
+                temp_dir.path(),
+            );
+            let work_folder = temp_dir.path().join(format!("work-{subtitles:?}"));
+            std::fs::create_dir_all(&work_folder).unwrap();
+
+            let result = tokio::runtime::Runtime::new().unwrap().block_on(
+                FFmpegProcessor::new(false)
+                    .with_ffprobe("plexify-test-no-such-ffprobe")
+                    .process_job(&job, None, Some(&work_folder)),
+            );
+
+            let error = result.expect_err(&format!(
+                "{subtitles:?}: the job succeeded without reading the subtitle streams; \
+                 the work folder holds {:?}",
+                std::fs::read_dir(&work_folder)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect::<Vec<_>>()
+            ));
+            assert!(
+                format!("{error:#}").contains("subtitle streams"),
+                "{subtitles:?}: the failure should say what could not be read: {error:#}"
+            );
+        }
     }
 
     /// A sidecar written into the work folder has to arrive beside the finished
