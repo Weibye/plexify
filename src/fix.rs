@@ -64,6 +64,9 @@ pub enum RefusalReason {
     DestinationExists { destination: String },
     /// Another source in this same run canonicalises to the destination.
     DestinationClaimedTwice { destination: String },
+    /// Another rename in this same run would move the same file - a sidecar
+    /// whose name fits more than one media file.
+    SourceClaimedTwice { source: String },
     /// The file named by the report is no longer where it was.
     SourceMissing,
     /// The file is no longer the one that was moved there.
@@ -82,6 +85,9 @@ impl RefusalReason {
             }
             RefusalReason::DestinationClaimedTwice { destination } => {
                 format!("more than one file canonicalises to '{destination}'")
+            }
+            RefusalReason::SourceClaimedTwice { source } => {
+                format!("'{source}' belongs to more than one file being renamed")
             }
             RefusalReason::SourceMissing => {
                 "the file is no longer at the path that was reported".to_string()
@@ -160,9 +166,13 @@ pub fn plan(report: &ValidationReport) -> FixPlan {
 
     // A destination that more than one file resolves to cannot be handed to
     // either of them: whichever moved first would be overwritten by the second.
+    // Nor can a source two groups both pick up - a sidecar whose name fits two
+    // media files - since whichever moved second would go without it.
     let mut claims: HashMap<&str, usize> = HashMap::new();
+    let mut sources: HashMap<&str, usize> = HashMap::new();
     for planned in groups.iter().flatten() {
         *claims.entry(planned.to.as_str()).or_default() += 1;
+        *sources.entry(planned.from.as_str()).or_default() += 1;
     }
 
     let mut moves = Vec::new();
@@ -180,6 +190,11 @@ pub fn plan(report: &ValidationReport) -> FixPlan {
             if claims.get(planned.to.as_str()).copied().unwrap_or(0) > 1 {
                 return Some(RefusalReason::DestinationClaimedTwice {
                     destination: planned.to.clone(),
+                });
+            }
+            if sources.get(planned.from.as_str()).copied().unwrap_or(0) > 1 {
+                return Some(RefusalReason::SourceClaimedTwice {
+                    source: planned.from.clone(),
                 });
             }
             if !source.exists() {
@@ -898,6 +913,43 @@ mod tests {
         );
         assert_eq!(outcome.refusals.len(), 1);
         assert!(absolute(root, "Series/Show/Season 1/Show - S01E01 Pilot.mkv").exists());
+    }
+
+    /// `Pilot.Part2.en.srt` is a sidecar of `Pilot.mkv` by prefix and of
+    /// `Pilot.Part2.mkv` by stem. Either group taking it is a guess, and the one
+    /// that moved second would go without its subtitle.
+    #[test]
+    fn a_sidecar_two_files_both_claim_holds_both_back() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        let season = "Series/Show/Season 1";
+        touch(root, &format!("{season}/Show - S01E01 Pilot.mkv"));
+        touch(root, &format!("{season}/Show - S01E01 Pilot.Part2.mkv"));
+        touch(root, &format!("{season}/Show - S01E01 Pilot.Part2.en.srt"));
+
+        let report = report(
+            root,
+            vec![
+                rename_issue(
+                    &format!("{season}/Show - S01E01 Pilot.mkv"),
+                    "Series/Show/Season 01/Show - S01E01 - Pilot.mkv",
+                ),
+                rename_issue(
+                    &format!("{season}/Show - S01E01 Pilot.Part2.mkv"),
+                    "Series/Show/Season 01/Show - S01E02 - Pilot Part 2.mkv",
+                ),
+            ],
+        );
+
+        let outcome = apply(&plan(&report), &temp.path().join("plan.json")).unwrap();
+
+        assert!(outcome.applied.is_empty(), "{:?}", outcome.applied);
+        assert_eq!(outcome.refusals.len(), 2);
+        assert!(outcome
+            .refusals
+            .iter()
+            .all(|refusal| matches!(refusal.reason, RefusalReason::SourceClaimedTwice { .. })));
+        assert!(absolute(root, &format!("{season}/Show - S01E01 Pilot.Part2.en.srt")).exists());
     }
 
     #[test]

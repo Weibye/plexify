@@ -76,66 +76,78 @@ pub fn plan(record: &FixOutcome, reversing: &Path) -> UndoPlan {
     // a fix plan chains - a destination is canonical and a source never is, so
     // one file's destination is never another's source - but unwinding
     // backwards is the assumption-free way to do it.
-    let reversals: Vec<PlannedMove> = record
-        .applied
-        .iter()
-        .rev()
-        .map(|applied| PlannedMove {
+    //
+    // A media file and its sidecars went out together and come back together
+    // or not at all. The record lists each media file ahead of its sidecars,
+    // which is what lets the groups be read back out of it.
+    let mut groups: Vec<Vec<PlannedMove>> = Vec::new();
+    for applied in &record.applied {
+        let reversal = PlannedMove {
             from: applied.to.clone(),
             to: applied.from.clone(),
-            sidecar: applied.sidecar,
-            size: applied.size,
-        })
-        .collect();
+            ..applied.clone()
+        };
+        match groups.last_mut() {
+            Some(group) if applied.sidecar => group.push(reversal),
+            _ => groups.push(vec![reversal]),
+        }
+    }
+    groups.reverse();
 
     // A path this undo is about to vacate is not "occupied" for the purposes of
     // the check below: two files swapping back into place is the normal case
     // when a whole season was renamed.
-    let vacating: HashSet<&str> = reversals.iter().map(|move_| move_.from.as_str()).collect();
+    let vacating: HashSet<&str> = groups
+        .iter()
+        .flatten()
+        .map(|move_| move_.from.as_str())
+        .collect();
 
     let mut moves = Vec::new();
     let mut refusals = Vec::new();
 
-    for reversal in reversals.iter() {
-        let source = absolute(media_root, &reversal.from);
-        let destination = absolute(media_root, &reversal.to);
+    'group: for group in &groups {
+        for reversal in group {
+            let source = absolute(media_root, &reversal.from);
+            let destination = absolute(media_root, &reversal.to);
 
-        if !source.exists() {
-            refusals.push(Refusal {
-                path: reversal.from.clone(),
-                reason: RefusalReason::SourceMissing,
-            });
-            continue;
-        }
-
-        if destination.exists()
-            && !is_same_file(&source, &destination)
-            && !vacating.contains(reversal.to.as_str())
-        {
-            refusals.push(Refusal {
-                path: reversal.from.clone(),
-                reason: RefusalReason::DestinationExists {
-                    destination: reversal.to.clone(),
-                },
-            });
-            continue;
-        }
-
-        if let Some(expected) = reversal.size {
-            let actual = fs::metadata(&source).map(|file| file.len()).unwrap_or(0);
-            if actual != expected {
+            if !source.exists() {
                 refusals.push(Refusal {
                     path: reversal.from.clone(),
-                    reason: RefusalReason::ContentChanged {
-                        expected_bytes: expected,
-                        actual_bytes: actual,
+                    reason: RefusalReason::SourceMissing,
+                });
+                continue 'group;
+            }
+
+            if destination.exists()
+                && !is_same_file(&source, &destination)
+                && !vacating.contains(reversal.to.as_str())
+            {
+                refusals.push(Refusal {
+                    path: reversal.from.clone(),
+                    reason: RefusalReason::DestinationExists {
+                        destination: reversal.to.clone(),
                     },
                 });
-                continue;
+                continue 'group;
+            }
+
+            if let Some(expected) = reversal.size {
+                let actual = fs::metadata(&source).map(|file| file.len()).unwrap_or(0);
+                if actual != expected {
+                    refusals.push(Refusal {
+                        path: reversal.from.clone(),
+                        reason: RefusalReason::ContentChanged {
+                            expected_bytes: expected,
+                            actual_bytes: actual,
+                        },
+                    });
+                    continue 'group;
+                }
             }
         }
 
-        moves.push(reversal.clone());
+        moves.extend(group.iter().cloned());
     }
 
     UndoPlan {
@@ -386,6 +398,83 @@ mod tests {
 
         assert!(absolute(root, "Series/Show/Season 1/Show - S01E01 Pilot.mkv").exists());
         assert!(absolute(root, "Series/Show/Season 1/Show - S01E01 Pilot.en.srt").exists());
+    }
+
+    #[test]
+    fn a_blocked_subtitle_holds_back_its_video() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        touch(
+            root,
+            "Series/Show/Season 1/Show - S01E01 Pilot.mkv",
+            "video",
+        );
+        touch(
+            root,
+            "Series/Show/Season 1/Show - S01E01 Pilot.en.srt",
+            "subs",
+        );
+
+        let (record, plan_file) = fix(
+            root,
+            &[(
+                "Series/Show/Season 1/Show - S01E01 Pilot.mkv",
+                "Series/Show/Season 01/Show - S01E01 - Pilot.mkv",
+            )],
+        );
+
+        // A different subtitle has since taken the one the fix moved away.
+        touch(
+            root,
+            "Series/Show/Season 1/Show - S01E01 Pilot.en.srt",
+            "other",
+        );
+
+        let outcome = apply(&plan(&record, &plan_file), &root.join("undo.json")).unwrap();
+
+        assert!(
+            outcome.applied.is_empty(),
+            "putting the video back without its subtitle would split the pair: {:?}",
+            outcome.applied
+        );
+        assert!(absolute(root, "Series/Show/Season 01/Show - S01E01 - Pilot.mkv").exists());
+        assert!(absolute(root, "Series/Show/Season 01/Show - S01E01 - Pilot.en.srt").exists());
+    }
+
+    #[test]
+    fn a_blocked_video_holds_back_its_subtitle() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        touch(
+            root,
+            "Series/Show/Season 1/Show - S01E01 Pilot.mkv",
+            "video",
+        );
+        touch(
+            root,
+            "Series/Show/Season 1/Show - S01E01 Pilot.en.srt",
+            "subs",
+        );
+
+        let (record, plan_file) = fix(
+            root,
+            &[(
+                "Series/Show/Season 1/Show - S01E01 Pilot.mkv",
+                "Series/Show/Season 01/Show - S01E01 - Pilot.mkv",
+            )],
+        );
+
+        // Re-encoded in place since the fix.
+        touch(
+            root,
+            "Series/Show/Season 01/Show - S01E01 - Pilot.mkv",
+            "a longer re-encode",
+        );
+
+        let outcome = apply(&plan(&record, &plan_file), &root.join("undo.json")).unwrap();
+
+        assert!(outcome.applied.is_empty(), "{:?}", outcome.applied);
+        assert!(absolute(root, "Series/Show/Season 01/Show - S01E01 - Pilot.en.srt").exists());
     }
 
     #[test]
