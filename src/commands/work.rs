@@ -45,7 +45,7 @@ impl WorkCommand {
             return Err(anyhow!("Path is not a directory: {:?}", self.media_root));
         }
 
-        let config = Config::from_env();
+        let config = Config::from_env()?;
         let mode = if self.background_mode {
             "Low Priority Worker"
         } else {
