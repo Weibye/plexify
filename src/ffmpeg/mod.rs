@@ -1738,23 +1738,26 @@ impl FFmpegProcessor {
                 .unwrap_or("")
         ));
 
-        // `fs::rename` would replace a `.disabled` file already there.
-        crate::fix::rename(&input_path, &disabled_input)?;
-        debug!(
-            "Renamed input file: {:?} -> {:?}",
-            input_path, disabled_input
-        );
-
-        // Rename subtitle file if it exists (WebM)
+        let mut moves = vec![(input_path, disabled_input)];
+        // A WebM's subtitle lives beside it as a `.vtt`.
         if let Some(vtt_path) = job.full_subtitle_path(media_root) {
             if vtt_path.exists() {
                 let disabled_vtt = vtt_path.with_extension("vtt.disabled");
-                crate::fix::rename(&vtt_path, &disabled_vtt)?;
-                debug!(
-                    "Renamed subtitle file: {:?} -> {:?}",
-                    vtt_path, disabled_vtt
-                );
+                moves.push((vtt_path, disabled_vtt));
             }
+        }
+
+        // Every name is checked before anything moves: a source disabled without
+        // its subtitle leaves Plex a subtitle beside nothing. `fix::rename` checks
+        // again, since `fs::rename` would replace a `.disabled` file already there.
+        if let Some((_, taken)) = moves.iter().find(|(_, disabled)| disabled.exists()) {
+            return Err(anyhow!(
+                "{taken:?} already exists; it will not be overwritten"
+            ));
+        }
+        for (path, disabled) in &moves {
+            crate::fix::rename(path, disabled)?;
+            debug!("Disabled {path:?} -> {disabled:?}");
         }
 
         Ok(())
@@ -4773,7 +4776,8 @@ mod tests {
             "an older source"
         );
 
-        // The source's is free, the subtitle's is taken.
+        // The source's is free, the subtitle's is taken. Neither moves: a source
+        // disabled without its subtitle leaves Plex a subtitle beside nothing.
         std::fs::remove_file(&disabled_source).unwrap();
         std::fs::write(&subtitle, "subtitle").unwrap();
         std::fs::write(&disabled_subtitle, "an older subtitle").unwrap();
@@ -4785,6 +4789,8 @@ mod tests {
             format!("{error:#}").contains(&format!("{disabled_subtitle:?}")),
             "{error:#}"
         );
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "source");
+        assert!(!disabled_source.exists());
         assert_eq!(std::fs::read_to_string(&subtitle).unwrap(), "subtitle");
         assert_eq!(
             std::fs::read_to_string(&disabled_subtitle).unwrap(),

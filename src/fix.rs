@@ -779,8 +779,9 @@ mod tests {
         assert!(absolute(root, "Series/Show/Season 1/Show - S01E01 Pilot.mkv").exists());
     }
 
-    /// The last line of defence against overwriting, for fix and undo alike. A
-    /// plan checks destinations before the run starts; this holds while it runs.
+    /// The last line of defence against overwriting, for every caller: fix, undo
+    /// and `work` disabling a source. They check destinations before moving
+    /// anything; this holds while the moves run.
     #[test]
     fn a_rename_onto_a_different_file_is_refused() {
         let temp = TempDir::new().unwrap();
