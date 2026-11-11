@@ -13,6 +13,8 @@
 //! - Something already occupies the path it came from - possibly a *different*
 //!   file that has since been canonicalised into that name.
 //! - The file is no longer the one that was moved, as far as its size can say.
+//! - The file cannot be read, or the record has no size for it, so none of the
+//!   above can be checked.
 //!
 //! Size is weak evidence and is treated as such: it catches a file having been
 //! replaced, not a re-encode that happens to be the same length. Hashing a media
@@ -22,7 +24,6 @@
 //! An undo is itself a fix run in the other direction, so it writes its own
 //! record. That is what makes it reversible in turn.
 
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -32,8 +33,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::fix::{
-    absolute, emptied, is_same_file, rename, write_new, FailedMove, FixOutcome, PlannedMove,
-    Refusal, RefusalReason,
+    absolute, emptied, is_same_file, rename, size_of, write_new, FailedMove, FixOutcome,
+    PlannedMove, Refusal, RefusalReason,
 };
 use crate::paths::to_forward_slashes;
 
@@ -94,60 +95,44 @@ pub fn plan(record: &FixOutcome, reversing: &Path) -> UndoPlan {
     }
     groups.reverse();
 
-    // A path this undo is about to vacate is not "occupied" for the purposes of
-    // the check below: two files swapping back into place is the normal case
-    // when a whole season was renamed.
-    let vacating: HashSet<&str> = groups
-        .iter()
-        .flatten()
-        .map(|move_| move_.from.as_str())
-        .collect();
-
     let mut moves = Vec::new();
     let mut refusals = Vec::new();
 
-    'group: for group in &groups {
-        for reversal in group {
+    for group in &groups {
+        // Any member that cannot go back holds back the whole group. An
+        // occupied path is refused even if another group would vacate it: no
+        // fix moves a file onto a path another file leaves, and a group can be
+        // refused after this one was planned, leaving the path taken.
+        let blocked = group.iter().find_map(|reversal| {
             let source = absolute(media_root, &reversal.from);
             let destination = absolute(media_root, &reversal.to);
 
-            if !source.exists() {
-                refusals.push(Refusal {
-                    path: reversal.from.clone(),
-                    reason: RefusalReason::SourceMissing,
-                });
-                continue 'group;
-            }
-
-            if destination.exists()
-                && !is_same_file(&source, &destination)
-                && !vacating.contains(reversal.to.as_str())
-            {
-                refusals.push(Refusal {
-                    path: reversal.from.clone(),
-                    reason: RefusalReason::DestinationExists {
+            let reason = match size_of(&source) {
+                Err(reason) => reason,
+                Ok(_) if destination.exists() && !is_same_file(&source, &destination) => {
+                    RefusalReason::DestinationExists {
                         destination: reversal.to.clone(),
-                    },
-                });
-                continue 'group;
-            }
-
-            if let Some(expected) = reversal.size {
-                let actual = fs::metadata(&source).map(|file| file.len()).unwrap_or(0);
-                if actual != expected {
-                    refusals.push(Refusal {
-                        path: reversal.from.clone(),
-                        reason: RefusalReason::ContentChanged {
-                            expected_bytes: expected,
-                            actual_bytes: actual,
-                        },
-                    });
-                    continue 'group;
+                    }
                 }
-            }
-        }
+                Ok(actual) => match reversal.size {
+                    Some(expected) if expected == actual => return None,
+                    Some(expected) => RefusalReason::ContentChanged {
+                        expected_bytes: expected,
+                        actual_bytes: actual,
+                    },
+                    None => RefusalReason::SizeUnrecorded,
+                },
+            };
+            Some(Refusal {
+                path: reversal.from.clone(),
+                reason,
+            })
+        });
 
-        moves.extend(group.iter().cloned());
+        match blocked {
+            Some(refusal) => refusals.push(refusal),
+            None => moves.extend(group.iter().cloned()),
+        }
     }
 
     UndoPlan {
@@ -605,6 +590,143 @@ mod tests {
             "got {:?}",
             undo.refusals[0].reason
         );
+    }
+
+    #[test]
+    fn refuses_a_file_the_record_has_no_size_for() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        touch(
+            root,
+            "Series/Show/Season 1/Show - S01E01 Pilot.mkv",
+            "video",
+        );
+
+        let (mut record, plan_file) = fix(
+            root,
+            &[(
+                "Series/Show/Season 1/Show - S01E01 Pilot.mkv",
+                "Series/Show/Season 01/Show - S01E01 - Pilot.mkv",
+            )],
+        );
+        record.applied[0].size = None;
+        touch(
+            root,
+            "Series/Show/Season 01/Show - S01E01 - Pilot.mkv",
+            "a much longer re-encode of the same episode",
+        );
+
+        let undo = plan(&record, &plan_file);
+
+        assert!(
+            undo.moves.is_empty(),
+            "without a size there is no telling this is the file that was moved"
+        );
+        assert_eq!(undo.refusals[0].reason, RefusalReason::SizeUnrecorded);
+    }
+
+    /// Make a file impossible to stat while it stays where it is, as a
+    /// permissions problem on a real library would.
+    #[cfg(unix)]
+    fn set_readable(file: &Path, readable: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if readable { 0o755 } else { 0o600 };
+        fs::set_permissions(file.parent().unwrap(), fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(
+            fs::metadata(file).is_ok(),
+            readable,
+            "the permissions must bind this user, which they do not for root"
+        );
+    }
+
+    #[cfg(windows)]
+    fn set_readable(file: &Path, readable: bool) {
+        // Neither denial stops a stat alone: a directory that can be listed
+        // answers for its files' attributes.
+        for (path, right) in [(file.parent().unwrap(), "(RD)"), (file, "(RA)")] {
+            let mut icacls = std::process::Command::new("icacls");
+            icacls.arg(path);
+            if readable {
+                icacls.args(["/remove:d", "*S-1-1-0"]);
+            } else {
+                icacls.args(["/deny", &format!("*S-1-1-0:{right}")]);
+            }
+            assert!(icacls.output().unwrap().status.success());
+        }
+        assert_eq!(fs::metadata(file).is_ok(), readable);
+    }
+
+    #[test]
+    fn refuses_with_the_reason_when_the_file_cannot_be_read() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        touch(
+            root,
+            "Series/Show/Season 1/Show - S01E01 Pilot.mkv",
+            "video",
+        );
+
+        let (record, plan_file) = fix(
+            root,
+            &[(
+                "Series/Show/Season 1/Show - S01E01 Pilot.mkv",
+                "Series/Show/Season 01/Show - S01E01 - Pilot.mkv",
+            )],
+        );
+
+        let moved = absolute(root, "Series/Show/Season 01/Show - S01E01 - Pilot.mkv");
+        set_readable(&moved, false);
+        let undo = plan(&record, &plan_file);
+        set_readable(&moved, true);
+
+        assert!(undo.moves.is_empty());
+        assert!(
+            matches!(undo.refusals[0].reason, RefusalReason::Unreadable { .. }),
+            "the file is still there, so neither 'gone' nor '0 bytes' is true: {:?}",
+            undo.refusals[0].reason
+        );
+    }
+
+    #[test]
+    fn a_path_a_refused_group_still_holds_is_refused_before_anything_moves() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+        touch(root, "Season 01/a.mkv", "video");
+        touch(root, "Season 01/a.en.srt", "subs");
+        touch(root, "Season 1/a.en.srt", "replaced since");
+
+        // A record in which one move left a path that another then took. No fix
+        // writes this - its plan refuses any destination that exists - so this
+        // one is written by hand. The second file has changed since, so it stays
+        // put, and the subtitle's original path stays taken.
+        let moved = |from: &str, to: &str, sidecar: bool, size: u64| PlannedMove {
+            from: from.to_string(),
+            to: to.to_string(),
+            sidecar,
+            size: Some(size),
+        };
+        let record = FixOutcome {
+            media_root: root.to_path_buf(),
+            applied: vec![
+                moved("Season 1/a.mkv", "Season 01/a.mkv", false, 5),
+                moved("Season 1/a.en.srt", "Season 01/a.en.srt", true, 4),
+                moved("Season 01/b.mkv", "Season 1/a.en.srt", false, 1),
+            ],
+            failed: Vec::new(),
+            refusals: Vec::new(),
+            emptied_directories: Vec::new(),
+            plan_file: root.join("fix-plan.json"),
+        };
+
+        let undo = plan(&record, &record.plan_file);
+        let outcome = apply(&undo, &root.join("undo.json")).unwrap();
+
+        assert!(
+            outcome.applied.is_empty() && outcome.failed.is_empty(),
+            "the video must not go back without its subtitle: {outcome:?}"
+        );
+        assert!(absolute(root, "Season 01/a.mkv").exists());
+        assert!(absolute(root, "Season 01/a.en.srt").exists());
     }
 
     #[test]
