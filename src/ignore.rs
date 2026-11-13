@@ -3,7 +3,10 @@ use glob::Pattern;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
+use walkdir::WalkDir;
+
+use crate::queue::QueueDirectory;
 
 /// Handles .plexifyignore files with gitignore-style pattern matching
 #[derive(Debug, Clone)]
@@ -91,8 +94,6 @@ impl IgnoreFilter {
     /// A directory's own rules are loaded as it is entered, so they decide which
     /// of its children are pruned.
     fn load_ignore_files_under(&mut self, scan_path: &Path) -> Result<()> {
-        use walkdir::WalkDir;
-
         let mut walk = WalkDir::new(scan_path).follow_links(false).into_iter();
         while let Some(entry) = walk.next() {
             let entry = entry.with_context(|| {
@@ -159,9 +160,41 @@ impl IgnoreFilter {
         Ok(())
     }
 
-    /// Check if a path should be ignored
-    /// Returns true if the path should be ignored, false otherwise
-    pub fn should_ignore(&self, path: &Path) -> bool {
+    /// Whether a rule excludes `path`, or a directory it is inside.
+    pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+        path.ancestors()
+            .skip(1)
+            .take_while(|ancestor| *ancestor != self.root && ancestor.starts_with(&self.root))
+            .any(|ancestor| self.rules_exclude(ancestor, true))
+            || self.rules_exclude(path, is_dir)
+    }
+
+    /// Whether a walk should prune this directory and everything beneath it.
+    ///
+    /// Only the directory itself is judged, not its ancestors: a walk that
+    /// prunes reaches a directory only through ancestors it has already let in.
+    pub fn should_skip_dir(&self, path: &Path) -> bool {
+        path.is_dir() && self.rules_exclude(path, true)
+    }
+
+    /// Walk `scan_path` for the media files no rule excludes.
+    ///
+    /// Ignored directories and a work root's queue directories are pruned
+    /// rather than walked and discarded. A part of the tree that cannot be read
+    /// is a warning naming it, and the walk goes on without it.
+    pub fn media_files(&self, scan_path: &Path) -> MediaFiles<'_> {
+        MediaFiles {
+            filter: self,
+            walk: WalkDir::new(scan_path).follow_links(false).into_iter(),
+            directories: 0,
+            files: 0,
+            ignored: 0,
+        }
+    }
+
+    /// Whether the rules alone exclude `path`. The last rule to match decides,
+    /// read from the root's rules down to those of the directory nearest it.
+    fn rules_exclude(&self, path: &Path, is_dir: bool) -> bool {
         let relative_path = match path.strip_prefix(&self.root) {
             Ok(rel) => rel,
             Err(_) => {
@@ -172,28 +205,6 @@ impl IgnoreFilter {
 
         // Convert to forward slashes for consistent matching
         let path_str = relative_path.to_string_lossy().replace("\\", "/");
-        let is_dir = path.is_dir();
-
-        trace!(
-            "Checking if path should be ignored: {} (is_dir: {})",
-            path_str,
-            is_dir
-        );
-
-        // First check if any parent directory is ignored
-        if !is_dir {
-            let mut current_parent = path.parent();
-            while let Some(parent) = current_parent {
-                if parent != self.root && self.should_ignore(parent) {
-                    trace!(
-                        "Path '{}' ignored because parent directory is ignored",
-                        path_str
-                    );
-                    return true;
-                }
-                current_parent = parent.parent();
-            }
-        }
 
         // Check patterns from all applicable directories, starting from root to specific
         let mut ignored = false;
@@ -247,80 +258,93 @@ impl IgnoreFilter {
         );
         ignored
     }
+}
 
-    /// Check if a directory should be skipped during traversal
-    /// This is an optimized version for directory-level checking that doesn't
-    /// perform parent directory lookups to avoid infinite recursion during walkdir
-    pub fn should_skip_dir(&self, path: &Path) -> bool {
-        if !path.is_dir() {
-            return false;
-        }
+/// The media files of one walk, and a count of what else it passed.
+///
+/// The counts are complete once the iterator is exhausted.
+pub struct MediaFiles<'a> {
+    filter: &'a IgnoreFilter,
+    walk: walkdir::IntoIter,
+    /// Directories walked beneath the starting one.
+    pub directories: usize,
+    /// Files no rule excludes, media or not.
+    pub files: usize,
+    /// Files a rule excludes inside a directory that was walked.
+    pub ignored: usize,
+}
 
-        let relative_path = match path.strip_prefix(&self.root) {
-            Ok(rel) => rel,
-            Err(_) => {
-                // Path is not under root, don't skip
-                return false;
-            }
-        };
+impl Iterator for MediaFiles<'_> {
+    type Item = PathBuf;
 
-        // Convert to forward slashes for consistent matching
-        let path_str = relative_path.to_string_lossy().replace("\\", "/");
-
-        trace!("Checking if directory should be skipped: {}", path_str);
-
-        // Check patterns from all applicable directories, starting from root to specific
-        let mut ignored = false;
-
-        // Get all directories that could have patterns affecting this path
-        let mut applicable_dirs: Vec<_> = self
-            .patterns_by_dir
-            .keys()
-            .filter(|dir| {
-                // Include if the pattern directory is an ancestor of the path
-                path.starts_with(dir) || dir == &&self.root
-            })
-            .collect();
-
-        // Sort by depth (root first, then deeper directories)
-        applicable_dirs.sort_by_key(|dir| dir.components().count());
-
-        for dir in applicable_dirs {
-            if let Some(patterns) = self.patterns_by_dir.get(dir) {
-                // Calculate relative path from this pattern directory
-                let pattern_relative_path = if dir == &self.root {
-                    path_str.clone()
-                } else {
-                    match path.strip_prefix(dir) {
-                        Ok(rel) => rel.to_string_lossy().replace("\\", "/"),
-                        Err(_) => path_str.clone(), // Fallback to full relative path
-                    }
-                };
-
-                for pattern in patterns {
-                    if pattern.matches(&pattern_relative_path, true)
-                        || pattern.matches(&path_str, true)
-                    {
-                        ignored = !pattern.negation;
-                        trace!(
-                            "Pattern '{}' from {} {} directory '{}'",
-                            pattern.original,
-                            dir.display(),
-                            if ignored { "ignores" } else { "includes" },
-                            path_str
-                        );
-                    }
+    fn next(&mut self) -> Option<PathBuf> {
+        loop {
+            let entry = match self.walk.next()? {
+                Ok(entry) => entry,
+                Err(error) => {
+                    warn!("⚠️ Skipped, because it could not be read: {error}");
+                    continue;
                 }
+            };
+            let path = entry.path();
+
+            // A link is followed only far enough to tell a directory from a
+            // file; the walk never descends through one.
+            let is_dir = entry.file_type().is_dir() || (entry.path_is_symlink() && path.is_dir());
+            if is_dir {
+                if entry.depth() == 0 {
+                    continue;
+                }
+                // A work root inside the media root is the mistake people make
+                // constantly, and its jobs and half-written encodes are not
+                // library files.
+                if is_queue_directory(path) || self.filter.should_skip_dir(path) {
+                    debug!("🚫 Skipping entire directory: {:?}", path);
+                    self.walk.skip_current_dir();
+                } else {
+                    self.directories += 1;
+                }
+                continue;
+            }
+
+            if self.filter.is_ignored(path, false) {
+                debug!("🚫 Ignoring path: {:?}", path);
+                self.ignored += 1;
+                continue;
+            }
+
+            self.files += 1;
+            if is_media_file(path) {
+                return Some(entry.into_path());
             }
         }
-
-        trace!(
-            "Directory skip decision for '{}': {}",
-            path_str,
-            if ignored { "SKIP" } else { "CONTINUE" }
-        );
-        ignored
     }
+}
+
+/// One of the four directories a work root is made of.
+fn is_queue_directory(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| {
+        QueueDirectory::ALL
+            .iter()
+            .any(|directory| name == directory.on_disk_name())
+    })
+}
+
+/// The containers a library's media comes in: what validate names, audit
+/// probes and fix moves with its sidecars. Scan converts only some of them,
+/// and `JobProcessor::determine_file_type` says which.
+const MEDIA_EXTENSIONS: &[&str] = &["mkv", "mp4", "avi", "webm", "mov", "m4v"];
+
+/// Whether `extension`, without its dot and in any case, is a media container.
+pub fn is_media_extension(extension: &str) -> bool {
+    MEDIA_EXTENSIONS
+        .iter()
+        .any(|known| extension.eq_ignore_ascii_case(known))
+}
+
+fn is_media_file(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| is_media_extension(&extension.to_string_lossy()))
 }
 
 impl IgnorePattern {
@@ -419,13 +443,13 @@ mod tests {
         let filter = IgnoreFilter::new(root.to_path_buf()).unwrap();
 
         // Should ignore
-        assert!(filter.should_ignore(&root.join("test.tmp")));
-        assert!(filter.should_ignore(&root.join("Downloads")));
-        assert!(filter.should_ignore(&root.join("tools")));
+        assert!(filter.is_ignored(&root.join("test.tmp"), false));
+        assert!(filter.is_ignored(&root.join("Downloads"), true));
+        assert!(filter.is_ignored(&root.join("tools"), true));
 
         // Should not ignore
-        assert!(!filter.should_ignore(&root.join("video.mkv")));
-        assert!(!filter.should_ignore(&root.join("Anime")));
+        assert!(!filter.is_ignored(&root.join("video.mkv"), false));
+        assert!(!filter.is_ignored(&root.join("Anime"), true));
     }
 
     #[test]
@@ -450,15 +474,15 @@ mod tests {
         let filter = IgnoreFilter::new(root.to_path_buf()).unwrap();
 
         // Root patterns should apply
-        assert!(filter.should_ignore(&root.join("test.tmp")));
+        assert!(filter.is_ignored(&root.join("test.tmp"), false));
 
         // Nested patterns should apply
-        assert!(filter.should_ignore(&root.join("Series/old")));
-        assert!(filter.should_ignore(&root.join("Series/old/episode.mkv")));
+        assert!(filter.is_ignored(&root.join("Series/old"), true));
+        assert!(filter.is_ignored(&root.join("Series/old/episode.mkv"), false));
 
         // Should not ignore
-        assert!(!filter.should_ignore(&root.join("Series/show.mkv")));
-        assert!(!filter.should_ignore(&root.join("Series/important.mkv")));
+        assert!(!filter.is_ignored(&root.join("Series/show.mkv"), false));
+        assert!(!filter.is_ignored(&root.join("Series/important.mkv"), false));
     }
 
     #[test]
@@ -475,10 +499,10 @@ mod tests {
         let filter = IgnoreFilter::new(root.to_path_buf()).unwrap();
 
         // Should ignore directory
-        assert!(filter.should_ignore(&root.join("temp")));
+        assert!(filter.is_ignored(&root.join("temp"), true));
 
         // Should not ignore file with similar name
-        assert!(!filter.should_ignore(&root.join("temp_file")));
+        assert!(!filter.is_ignored(&root.join("temp_file"), false));
     }
 
     #[test]
@@ -495,13 +519,13 @@ mod tests {
         let filter = IgnoreFilter::new(root.to_path_buf()).unwrap();
 
         // Should ignore .mkv files
-        assert!(filter.should_ignore(&root.join("video.mkv")));
+        assert!(filter.is_ignored(&root.join("video.mkv"), false));
 
         // Should not ignore important.mkv due to negation
-        assert!(!filter.should_ignore(&root.join("important.mkv")));
+        assert!(!filter.is_ignored(&root.join("important.mkv"), false));
 
         // Should not ignore other files
-        assert!(!filter.should_ignore(&root.join("test.mp4")));
+        assert!(!filter.is_ignored(&root.join("test.mp4"), false));
     }
 
     #[test]
@@ -572,15 +596,15 @@ mod tests {
         let filter = IgnoreFilter::for_scope(root.to_path_buf(), &series).unwrap();
 
         assert!(
-            filter.should_ignore(&series.join("Season 06/artwork.tmp")),
+            filter.is_ignored(&series.join("Season 06/artwork.tmp"), false),
             "a rule at the library root still governs a scoped run"
         );
         assert!(
-            filter.should_ignore(&series.join("Season 06/episode.nfo")),
+            filter.is_ignored(&series.join("Season 06/episode.nfo"), false),
             "a rule inside the scope applies"
         );
         assert!(
-            !filter.should_ignore(&series.join("Season 06/episode.mkv")),
+            !filter.is_ignored(&series.join("Season 06/episode.mkv"), false),
             "a sibling's rules were never in scope, and are not loaded"
         );
     }
@@ -601,7 +625,7 @@ mod tests {
 
         let filter = IgnoreFilter::new(root.to_path_buf()).unwrap();
 
-        assert!(filter.should_ignore(&deep.join("episode.mkv")));
+        assert!(filter.is_ignored(&deep.join("episode.mkv"), false));
     }
 
     #[test]
@@ -653,6 +677,142 @@ mod tests {
     fn unlock(dir: &Path) {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Deny this user the right to list `dir`.
+    #[cfg(windows)]
+    fn lock(dir: &Path) -> bool {
+        icacls(
+            dir,
+            &[
+                "/deny",
+                &format!("{}:(RD)", std::env::var("USERNAME").unwrap()),
+            ],
+        );
+        let locked = fs::read_dir(dir).is_err();
+        if !locked {
+            eprintln!("skipping: this process can list a directory it was denied");
+        }
+        locked
+    }
+
+    #[cfg(windows)]
+    fn unlock(dir: &Path) {
+        icacls(dir, &["/remove:d", &std::env::var("USERNAME").unwrap()]);
+    }
+
+    #[cfg(windows)]
+    fn icacls(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("icacls")
+            .arg(dir)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "icacls {args:?} failed on {dir:?}");
+    }
+
+    /// Run `f` and return what it logged, as `main`'s subscriber would print it.
+    fn logs_of<T>(f: impl FnOnce() -> T) -> (T, String) {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, f);
+        let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        (result, logs)
+    }
+
+    #[test]
+    fn a_walk_yields_the_media_files_no_rule_or_queue_directory_excludes() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        fs::write(root.join(".plexifyignore"), "Downloads/\n*.tmp.mkv\n").unwrap();
+        let season = root.join("Series").join("Show").join("Season 01");
+        fs::create_dir_all(&season).unwrap();
+        for name in ["a.mkv", "b.MP4", "c.mov", "d.m4v", "e.webm", "f.avi"] {
+            fs::write(season.join(name), "").unwrap();
+        }
+        for name in ["a.en.srt", "e.vtt", "show.nfo", "x.tmp.mkv", "no-extension"] {
+            fs::write(season.join(name), "").unwrap();
+        }
+        for excluded in [
+            "Downloads",
+            "_queue",
+            "_in_progress",
+            "Series/_completed",
+            "_failed",
+        ] {
+            fs::create_dir_all(root.join(excluded)).unwrap();
+            fs::write(root.join(excluded).join("film.mkv"), "").unwrap();
+        }
+
+        let filter = IgnoreFilter::new(root.to_path_buf()).unwrap();
+        let mut walk = filter.media_files(root);
+        let mut found: Vec<_> = walk.by_ref().collect();
+        found.sort();
+
+        let mut expected: Vec<_> = ["a.mkv", "b.MP4", "c.mov", "d.m4v", "e.webm", "f.avi"]
+            .iter()
+            .map(|name| season.join(name))
+            .collect();
+        expected.sort();
+        assert_eq!(found, expected);
+        assert_eq!(walk.directories, 3, "Series, Show and Season 01");
+        assert_eq!(
+            walk.files, 11,
+            "every file but the ignored one, media or not, .plexifyignore too"
+        );
+        assert_eq!(walk.ignored, 1, "x.tmp.mkv");
+    }
+
+    /// Loading the rules refuses a directory it cannot read, so the walk meets
+    /// one only when the tree changes after the rules were loaded.
+    #[test]
+    fn a_directory_the_walk_cannot_read_is_a_warning_naming_it() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let locked = root.join("Series").join("Locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("hidden.mkv"), "").unwrap();
+        fs::write(root.join("Series").join("episode.mkv"), "").unwrap();
+        let filter = IgnoreFilter::new(root.to_path_buf()).unwrap();
+        if !lock(&locked) {
+            return;
+        }
+
+        let (found, logs) = logs_of(|| filter.media_files(root).collect::<Vec<_>>());
+        unlock(&locked);
+
+        assert_eq!(
+            found,
+            vec![root.join("Series").join("episode.mkv")],
+            "the rest of the library is still walked"
+        );
+        let warning = logs
+            .lines()
+            .find(|line| line.contains("WARN"))
+            .unwrap_or_else(|| panic!("no warning in: {logs}"));
+        assert!(
+            warning.contains(&locked.display().to_string()),
+            "names the directory: {warning}"
+        );
     }
 
     #[cfg(unix)]

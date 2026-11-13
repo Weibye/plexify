@@ -8,15 +8,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
-use tracing::{debug, info};
-use walkdir::WalkDir;
+use tracing::info;
 
-use crate::commands::validate::MEDIA_EXTENSIONS;
 use crate::ignore::IgnoreFilter;
 use crate::naming::scope_for;
 use crate::paths::to_forward_slashes;
 use crate::probe::probe;
-use crate::queue::QueueDirectory;
 use crate::target::{evaluate, Conformance, Cost, Finding, PlaybackTarget, Provenance};
 
 /// One file's verdict.
@@ -330,45 +327,7 @@ impl AuditCommand {
         let scope = scope_for(&self.scan_path);
         let filter = IgnoreFilter::for_scope(scope.library_root, &scope.scan_path)?;
 
-        Ok(WalkDir::new(&self.scan_path)
-            .follow_links(false)
-            .into_iter()
-            // Prune ignored subtrees rather than walking and discarding them.
-            .filter_entry(|entry| {
-                let path = entry.path();
-                if path == self.scan_path || !path.is_dir() {
-                    return true;
-                }
-
-                // A work root inside the media root is the mistake people make
-                // constantly, and its half-written outputs are not library
-                // files. Auditing them reports the queue's own scratch space.
-                if is_queue_directory(path) {
-                    debug!("🚫 Skipping queue directory: {:?}", path);
-                    return false;
-                }
-
-                if filter.should_skip_dir(path) {
-                    debug!("🚫 Skipping entire directory: {:?}", path);
-                    return false;
-                }
-
-                true
-            })
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.into_path())
-            .filter(|path| {
-                !path.is_dir()
-                    && !filter.should_ignore(path)
-                    && path
-                        .extension()
-                        .map(|ext| {
-                            MEDIA_EXTENSIONS
-                                .contains(&ext.to_string_lossy().to_lowercase().as_str())
-                        })
-                        .unwrap_or(false)
-            })
-            .collect())
+        Ok(filter.media_files(&self.scan_path).collect())
     }
 
     pub fn print_report(&self, report: &AuditReport) {
@@ -578,17 +537,6 @@ impl AuditCommand {
 
         out
     }
-}
-
-/// One of the four directories a work root is made of.
-fn is_queue_directory(path: &Path) -> bool {
-    path.file_name()
-        .map(|name| {
-            QueueDirectory::ALL
-                .iter()
-                .any(|directory| name == directory.on_disk_name())
-        })
-        .unwrap_or(false)
 }
 
 /// How long after a write a file is still plausibly being written.

@@ -62,7 +62,7 @@ fn bench_directory_skip_old_approach(c: &mut Criterion) {
                 let path = entry.path();
                 if !path.is_dir() {
                     // Only check files, not directories
-                    if !filter.should_ignore(path) {
+                    if !filter.is_ignored(path, false) {
                         count += 1;
                     }
                 }
@@ -99,7 +99,7 @@ fn bench_directory_skip_new_approach(c: &mut Criterion) {
                 let path = entry.path();
                 if !path.is_dir() {
                     // Only count files
-                    if !filter.should_ignore(path) {
+                    if !filter.is_ignored(path, false) {
                         count += 1;
                     }
                 }

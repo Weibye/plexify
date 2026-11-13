@@ -5,8 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, info};
-use walkdir::WalkDir;
+use tracing::info;
 
 use crate::fix::FixOutcome;
 use crate::ignore::IgnoreFilter;
@@ -14,9 +13,6 @@ use crate::naming::{
     assess, scope_for, series_directory_disagreement, Assessment, LibraryRoot, Scope,
 };
 use crate::paths::to_forward_slashes;
-
-/// Media file extensions that should be validated
-pub const MEDIA_EXTENSIONS: &[&str] = &["mkv", "mp4", "avi", "webm", "mov", "m4v"];
 
 /// Something the library holds that is not in canonical form.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,19 +218,11 @@ impl ValidateCommand {
         // Rules belong to the library root even when the run is narrower, but only
         // the files above and inside the scanned subtree can affect it - see
         // `IgnoreFilter::for_scope`.
-        let ignore_filter = Some(IgnoreFilter::for_scope(
-            self.scope.library_root.clone(),
-            &self.scope.scan_path,
-        )?);
-
-        // Create a lookup set for media extensions for faster checks
-        let media_extensions: std::collections::HashSet<&str> =
-            MEDIA_EXTENSIONS.iter().copied().collect();
+        let ignore_filter =
+            IgnoreFilter::for_scope(self.scope.library_root.clone(), &self.scope.scan_path)?;
 
         // First, collect all media files with progress indicator
         let mut media_files = Vec::new();
-        let mut ignored_count = 0;
-        let mut files_processed = 0;
 
         let scan_pb = ProgressBar::new_spinner();
         scan_pb.set_style(
@@ -245,61 +233,10 @@ impl ValidateCommand {
         scan_pb.set_message("Collecting media files...");
         scan_pb.enable_steady_tick(std::time::Duration::from_millis(120));
 
-        for entry in WalkDir::new(&self.scope.scan_path)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|e| {
-                let path = e.path();
-
-                // Always allow the root directory
-                if path == self.scope.scan_path {
-                    return true;
-                }
-
-                // Check if we should skip this directory and all its contents
-                if path.is_dir() {
-                    if let Some(ref filter) = ignore_filter {
-                        if filter.should_skip_dir(path) {
-                            debug!("🚫 Skipping entire directory: {:?}", path);
-                            return false; // This will cause WalkDir to skip the directory
-                        }
-                    }
-                }
-
-                true // Allow files and non-ignored directories
-            })
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-
-            // Skip directories and non-media files
-            if path.is_dir() {
-                continue;
-            }
-
-            // Check if this individual file should be ignored
-            if let Some(ref filter) = ignore_filter {
-                if filter.should_ignore(path) {
-                    debug!("🚫 Ignoring path: {:?}", path);
-                    ignored_count += 1;
-                    continue;
-                }
-            }
-
-            files_processed += 1;
-
-            // Update progress message periodically
-            if files_processed % 500 == 0 {
-                scan_pb.set_message(format!("Scanned {} files...", files_processed));
-            }
-
-            // Check if it's a media file
-            if let Some(extension) = path.extension() {
-                let ext = extension.to_string_lossy().to_lowercase();
-                if media_extensions.contains(ext.as_str()) {
-                    media_files.push(path.to_path_buf());
-                }
-            }
+        let mut walk = ignore_filter.media_files(&self.scope.scan_path);
+        while let Some(path) = walk.next() {
+            media_files.push(path);
+            scan_pb.set_message(format!("Scanned {} files...", walk.files));
         }
 
         scan_pb.finish_and_clear();
@@ -309,10 +246,10 @@ impl ValidateCommand {
             media_files.len()
         );
 
-        if ignored_count > 0 {
+        if walk.ignored > 0 {
             info!(
                 "📋 Ignored {} paths due to .plexifyignore patterns",
-                ignored_count
+                walk.ignored
             );
         }
         // Create validation progress bar
