@@ -1,20 +1,16 @@
-//! What a media file actually contains, read from FFprobe.
-//!
-//! Everything else in plexify infers a file's type from its extension. An
-//! extension cannot say what codec, profile, level or pixel format is inside,
-//! and those are the properties a client bases a Direct Play decision on.
-//!
-//! This module reports what is there and decides nothing. What a given client
-//! will accept lives in [`crate::target`].
+//! What a media file contains, read from FFprobe: the codec, profile, level
+//! and pixel format an extension cannot say. It decides nothing; what a client
+//! accepts is [`crate::target`]'s. See D27.
 
 use anyhow::{anyhow, Context, Result};
-use serde::{Deserialize, Serialize};
+use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The streams and container properties of one media file.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct MediaProbe {
     pub container: Option<String>,
     pub duration_seconds: Option<f64>,
@@ -30,9 +26,12 @@ pub struct MediaProbe {
 /// Codec names, profiles and pixel formats are lowercased on the way in.
 /// FFprobe's casing varies by codec - `High` for H.264, `Main 10` for HEVC -
 /// and a target envelope should not have to spell each variant.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+///
+/// A codec is `None` where FFprobe named none, as it does for a stream it has
+/// no decoder for.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct VideoStream {
-    pub codec: String,
+    pub codec: Option<String>,
     pub profile: Option<String>,
     /// FFprobe's integer encoding of the codec level: 41 is H.264 level 4.1.
     pub level: Option<i64>,
@@ -45,17 +44,51 @@ pub struct VideoStream {
     pub height: Option<u32>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AudioStream {
-    pub codec: String,
+    pub codec: Option<String>,
     pub channels: Option<u32>,
     pub language: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SubtitleStream {
-    pub codec: String,
+    pub codec: Option<String>,
     pub language: Option<String>,
+}
+
+/// Probe every one of `paths` and hand each result to `judge`, in `paths`
+/// order, behind one progress bar.
+///
+/// FFprobe is a blocking subprocess per file, so the files are probed in
+/// parallel on the blocking pool rather than parking a runtime worker for the
+/// length of a library.
+pub async fn probe_all<T, F>(paths: Vec<PathBuf>, judge: F) -> Result<Vec<T>>
+where
+    T: Send + 'static,
+    F: Fn(&Path, Result<MediaProbe>) -> T + Send + Sync + 'static,
+{
+    let progress = ProgressBar::new(paths.len() as u64);
+    progress.set_style(
+        ProgressStyle::with_template("Probing {bar:30.cyan/blue} {pos}/{len}")
+            .unwrap()
+            .progress_chars("█▉▊▋▌▍▎▏ "),
+    );
+
+    tokio::task::spawn_blocking(move || {
+        let judged = paths
+            .par_iter()
+            .map(|path| {
+                let judged = judge(path, probe(path));
+                progress.inc(1);
+                judged
+            })
+            .collect();
+        progress.finish_and_clear();
+        judged
+    })
+    .await
+    .context("probing stopped part way through")
 }
 
 /// Read one file with FFprobe.
@@ -194,10 +227,8 @@ fn depth_from_pixel_format(pixel_format: Option<&str>) -> Option<u32> {
     }
 }
 
-fn codec_name(stream: &Value) -> String {
-    text(stream, "codec_name")
-        .map(|c| c.to_lowercase())
-        .unwrap_or_default()
+fn codec_name(stream: &Value) -> Option<String> {
+    text(stream, "codec_name").map(|c| c.to_lowercase())
 }
 
 fn language(stream: &Value) -> Option<String> {
@@ -248,17 +279,17 @@ mod tests {
         let probe = parse(H264_AAC).unwrap();
         let video = probe.video.unwrap();
 
-        assert_eq!(video.codec, "h264");
+        assert_eq!(video.codec.as_deref(), Some("h264"));
         assert_eq!(video.profile.as_deref(), Some("high"));
         assert_eq!(video.level, Some(41));
         assert_eq!(video.pixel_format.as_deref(), Some("yuv420p"));
         assert_eq!(video.bit_depth, Some(8));
         assert_eq!(video.ref_frames, Some(4));
         assert_eq!(video.height, Some(1080));
-        assert_eq!(probe.audio[0].codec, "aac");
+        assert_eq!(probe.audio[0].codec.as_deref(), Some("aac"));
         assert_eq!(probe.audio[0].channels, Some(2));
         assert_eq!(probe.audio[0].language.as_deref(), Some("eng"));
-        assert_eq!(probe.subtitles[0].codec, "mov_text");
+        assert_eq!(probe.subtitles[0].codec.as_deref(), Some("mov_text"));
         assert_eq!(probe.container.as_deref(), Some("mov,mp4,m4a"));
         assert_eq!(probe.bit_rate, Some(1_200_000));
     }
@@ -325,7 +356,26 @@ mod tests {
             {"codec_type": "video", "codec_name": "h264", "disposition": {"attached_pic": 0}}
         ]}"#;
 
-        assert_eq!(parse(json).unwrap().video.unwrap().codec, "h264");
+        assert_eq!(
+            parse(json).unwrap().video.unwrap().codec.as_deref(),
+            Some("h264")
+        );
+    }
+
+    /// FFprobe names no codec for a stream it has no decoder for, and an
+    /// empty name would read as a codec called "".
+    #[test]
+    fn a_stream_ffprobe_names_no_codec_for_has_none() {
+        let json = r#"{"streams": [
+            {"codec_type": "video", "codec_tag_string": "XVID"},
+            {"codec_type": "audio", "codec_name": ""},
+            {"codec_type": "subtitle"}
+        ]}"#;
+        let probe = parse(json).unwrap();
+
+        assert_eq!(probe.video.unwrap().codec, None, "the video stream");
+        assert_eq!(probe.audio[0].codec, None, "the audio stream");
+        assert_eq!(probe.subtitles[0].codec, None, "the subtitle stream");
     }
 
     #[test]
@@ -402,14 +452,14 @@ mod tests {
         let probe = probe(&path).unwrap();
         let video = probe.video.expect("the file has a video stream");
 
-        assert_eq!(video.codec, "h264");
+        assert_eq!(video.codec.as_deref(), Some("h264"));
         assert_eq!(video.profile.as_deref(), Some("high"));
         assert_eq!(video.pixel_format.as_deref(), Some("yuv420p"));
         assert_eq!(video.bit_depth, Some(8));
         assert_eq!(video.width, Some(320));
         assert!(video.level.is_some(), "h264 always reports a level");
         assert_eq!(probe.audio.len(), 1);
-        assert_eq!(probe.audio[0].codec, "aac");
+        assert_eq!(probe.audio[0].codec.as_deref(), Some("aac"));
     }
 
     /// An MKV carries a cover as an attachment, which FFprobe reports as a

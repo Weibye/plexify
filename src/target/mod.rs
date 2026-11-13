@@ -1,23 +1,12 @@
-//! What a client will play, and how much of that was actually measured.
-//!
-//! A target is data, not code: the envelope of one device, loaded from TOML.
-//! Probing a library is slow and its answers do not change; an envelope changes
-//! every time something is learned about a client. Keeping them apart means
-//! recalibrating costs a re-read rather than a re-probe.
-//!
-//! Every claim carries its [`Provenance`]. Three spec-derived assumptions in
-//! this project have already been measured wrong on the hardware, so a belief
-//! that has never been tested must not be able to look like a fact. That is
-//! also why a measured *rejection* is written down (`rejects`) rather than left
-//! as an absence: silence cannot tell "we measured this and it failed" apart
-//! from "we never tried it".
+//! What a client will play: one device's envelope, loaded from TOML, with
+//! every claim marked by how it was arrived at. See D27.
 
 pub mod evaluate;
 
 pub use evaluate::{evaluate, Conformance, Cost, Field, Finding};
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -34,7 +23,7 @@ pub const BUILTIN_TARGETS: &[(&str, &str)] = &[
 ];
 
 /// How a claim was arrived at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Provenance {
     /// Confirmed against a live playback decision on the device.
@@ -56,7 +45,7 @@ impl Provenance {
 }
 
 /// Values a client is believed to handle, each carrying its own provenance.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClaimSet {
     #[serde(default)]
@@ -80,13 +69,13 @@ impl ClaimSet {
 }
 
 /// What a client does with a set of values.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Support {
     #[serde(default)]
     pub accepts: ClaimSet,
-    /// Values measured or believed to fail. Recorded separately so a rejection
-    /// that was actually observed keeps saying so.
+    /// Values measured or believed to fail. Written down rather than left out,
+    /// because an absence cannot tell "measured failing" from "never tried".
     #[serde(default)]
     pub rejects: ClaimSet,
 }
@@ -109,7 +98,7 @@ impl Support {
 }
 
 /// A ceiling the client is believed to accept up to.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limit {
     pub value: u32,
@@ -167,7 +156,7 @@ impl Limit {
 }
 
 /// One client's playback envelope.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlaybackTarget {
     pub name: String,
@@ -186,7 +175,7 @@ pub struct PlaybackTarget {
     pub subtitles: SubtitleEnvelope,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VideoEnvelope {
     pub codecs: Support,
@@ -205,14 +194,14 @@ pub struct VideoEnvelope {
     pub pixel_formats: Support,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AudioEnvelope {
     pub codecs: Support,
     pub max_channels: Limit,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubtitleEnvelope {
     /// Formats the client renders by burning them into the picture. The client
@@ -306,11 +295,6 @@ mod tests {
             (false, Provenance::Observed)
         );
 
-        // Both LG rejections were rechecked against the client cap that
-        // manufactured the subtitle burns below, and both survive it: the Opus
-        // session transcoded the audio with the **video copied**, and the AVI
-        // stall had no transcode session in flight at all. A capped playback is
-        // a video re-encode, and neither of those is one.
         let lg = PlaybackTarget::builtin("lg-cx-webos").unwrap().unwrap();
         assert_eq!(
             lg.audio.codecs.verdict("opus"),
@@ -319,16 +303,9 @@ mod tests {
         assert_eq!(lg.containers.verdict("avi"), (false, Provenance::Observed));
     }
 
-    /// The LG burns nothing in, and every format once listed there is named
-    /// here so that re-adding one has to argue with a test.
-    ///
-    /// `mov_text` and `webvtt` were `observed`, read off sessions taken with
-    /// the app's own quality set to 3 Mbps 720p - which re-encodes every
-    /// picture, and a re-encode burns a text track into it for free. Measured
-    /// 2026-09-01 with that set to Original: a selected `mov_text` track was
-    /// converted into an `srt` sidecar and a selected `hdmv_pgs_subtitle`
-    /// track was copied for the app to render, both while the part decision
-    /// stayed `directplay` and the video was untouched.
+    /// The LG burns nothing in. Each format named here has been claimed to
+    /// burn and was taken out on the evidence in `targets/lg-cx-webos.toml`,
+    /// so re-adding one has to argue with this test.
     #[test]
     fn the_lg_is_not_claimed_to_burn_any_subtitle_in() {
         let lg = PlaybackTarget::builtin("lg-cx-webos").unwrap().unwrap();
@@ -345,13 +322,8 @@ mod tests {
         }
     }
 
-    /// One codec, opposite verdicts, both measured. An envelope is per-client
-    /// for exactly this reason: meeting the two, a reader should not have to
-    /// wonder which is stale.
-    ///
-    /// The Chromecast's receiver app transcodes AC3 in every layout. The LG
-    /// panel decodes it - measured 2026-09-01 with the app's quality set to
-    /// Original, `part decision = directplay` and no audio decision at all.
+    /// One codec, opposite verdicts, both measured. An envelope is per client
+    /// so that two devices can differ without either looking stale.
     #[test]
     fn ac3_is_refused_on_the_chromecast_and_played_on_the_lg() {
         let chromecast = PlaybackTarget::builtin("chromecast-gen2-3")

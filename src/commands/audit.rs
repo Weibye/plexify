@@ -2,9 +2,6 @@
 //! it. Read-only: it proposes nothing and changes nothing.
 
 use anyhow::{anyhow, Result};
-use indicatif::{ProgressBar, ProgressStyle};
-use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -13,11 +10,11 @@ use tracing::info;
 use crate::ignore::IgnoreFilter;
 use crate::naming::scope_for;
 use crate::paths::to_forward_slashes;
-use crate::probe::probe;
+use crate::probe::{probe_all, MediaProbe};
 use crate::target::{evaluate, Conformance, Cost, Finding, PlaybackTarget, Provenance};
 
 /// One file's verdict.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct AuditEntry {
     /// The file relative to the scanned directory, with `/` separators.
     pub path: String,
@@ -35,7 +32,7 @@ impl AuditEntry {
 }
 
 /// What one `stat` of a file said.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Stat {
     pub size_bytes: u64,
     /// How much of `size_bytes` is actually backed by disk. See [`Allocation`].
@@ -60,7 +57,7 @@ pub struct Stat {
 /// Nothing acts on it. A file preallocated by a copy that is still running is
 /// indistinguishable from one whose content was lost, so this reports a
 /// measurement - how much is not on disk - and never a verdict.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Allocation {
     /// `st_blocks * 512`. The unit is 512 bytes by definition of the field,
     /// whatever block size the filesystem underneath actually uses.
@@ -133,7 +130,7 @@ fn allocation_of(_metadata: &std::fs::Metadata) -> Allocation {
     Allocation::Unmeasurable
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub enum Outcome {
     Assessed {
         stat: Stat,
@@ -145,7 +142,7 @@ pub enum Outcome {
     Unreadable { stat: Option<Stat>, reason: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct AuditReport {
     pub target: String,
     pub scan_path: PathBuf,
@@ -154,18 +151,19 @@ pub struct AuditReport {
 }
 
 impl AuditReport {
-    /// The files in one cost bucket. `None` is the bucket that needs nothing,
-    /// which a file with no picture is not in: see [`AuditReport::no_picture`].
-    pub fn bucket(
-        &self,
-        cost: Option<Cost>,
-    ) -> impl Iterator<Item = (&AuditEntry, &Stat, &Conformance)> {
-        self.assessed().filter(move |(_, _, conformance)| {
-            **conformance != Conformance::NoPicture && conformance.cost() == cost
-        })
+    /// Files the client plays as they are.
+    pub fn direct_plays(&self) -> impl Iterator<Item = (&AuditEntry, &Stat, &Conformance)> {
+        self.assessed()
+            .filter(|(_, _, conformance)| conformance.direct_plays())
     }
 
-    /// Files with no picture, which no cost bucket holds.
+    /// Files that need work of one cost.
+    pub fn bucket(&self, cost: Cost) -> impl Iterator<Item = (&AuditEntry, &Stat, &Conformance)> {
+        self.assessed()
+            .filter(move |(_, _, conformance)| conformance.cost() == Some(cost))
+    }
+
+    /// Files with no picture, which neither of the above holds.
     pub fn no_picture(&self) -> impl Iterator<Item = (&AuditEntry, &Stat, &Conformance)> {
         self.assessed()
             .filter(|(_, _, conformance)| **conformance == Conformance::NoPicture)
@@ -245,26 +243,15 @@ impl AuditCommand {
         let files = self.media_files()?;
         info!("🔍 Found {} media files, probing...", files.len());
 
-        let progress = ProgressBar::new(files.len() as u64);
-        progress.set_style(
-            ProgressStyle::with_template("Probing {bar:30.cyan/blue} {pos}/{len} {msg}")
-                .unwrap()
-                .progress_chars("█▉▊▋▌▍▎▏ "),
-        );
-        progress.set_message("files");
+        let scan_path = self.scan_path.clone();
+        let target = self.target.clone();
+        let mut entries = probe_all(files, move |path, probed| {
+            audit_file(&scan_path, &target, path, probed)
+        })
+        .await?;
 
-        let mut entries: Vec<AuditEntry> = files
-            .par_iter()
-            .map(|path| {
-                let entry = self.audit_file(path);
-                progress.inc(1);
-                entry
-            })
-            .collect();
-        progress.finish_and_clear();
-
-        // Rayon returns work in whatever order it finished; a report is read
-        // top to bottom, so order it the way the library is laid out.
+        // A report is read top to bottom, so order it the way the library is
+        // laid out rather than the way the walk found it.
         entries.sort_by(|left, right| left.path.cmp(&right.path));
 
         let report = AuditReport {
@@ -281,45 +268,6 @@ impl AuditCommand {
         );
 
         Ok(report)
-    }
-
-    fn audit_file(&self, path: &Path) -> AuditEntry {
-        let path_in_report = to_forward_slashes(path.strip_prefix(&self.scan_path).unwrap_or(path));
-
-        // Stat before probing: a file whose size is unknown is not judged, so
-        // no verdict and no bucket total can rest on a size nobody read.
-        let stat = match std::fs::metadata(path) {
-            // One stat, read twice: the length the file claims, and how much
-            // of it the filesystem is actually holding.
-            Ok(metadata) => Stat {
-                size_bytes: metadata.len(),
-                allocation: allocation_of(&metadata),
-                modified: metadata.modified().ok(),
-            },
-            Err(error) => {
-                return AuditEntry {
-                    path: path_in_report,
-                    outcome: Outcome::Unreadable {
-                        stat: None,
-                        reason: format!("could not stat {}: {error}", path.display()),
-                    },
-                }
-            }
-        };
-
-        AuditEntry {
-            path: path_in_report,
-            outcome: match probe(path) {
-                Ok(media) => Outcome::Assessed {
-                    stat,
-                    conformance: evaluate(&media, &self.target),
-                },
-                Err(error) => Outcome::Unreadable {
-                    stat: Some(stat),
-                    reason: format!("{error:#}"),
-                },
-            },
-        }
     }
 
     fn media_files(&self) -> Result<Vec<PathBuf>> {
@@ -370,13 +318,13 @@ impl AuditCommand {
         let _ = writeln!(out, "───────────");
         let no_picture: Vec<_> = report.no_picture().collect();
         for (files, label) in [
-            (report.bucket(None).collect(), "✅ Direct Plays as it is"),
+            (report.direct_plays().collect(), "✅ Direct Plays as it is"),
             (
-                report.bucket(Some(Cost::Remux)).collect(),
+                report.bucket(Cost::Remux).collect(),
                 "🔁 Remux - audio or subtitles, video copied",
             ),
             (
-                report.bucket(Some(Cost::Reencode)).collect(),
+                report.bucket(Cost::Reencode).collect(),
                 "🔥 Re-encode - the video itself",
             ),
             (
@@ -453,7 +401,7 @@ impl AuditCommand {
         ] {
             let tally = tally(
                 report
-                    .bucket(Some(cost))
+                    .bucket(cost)
                     .flat_map(|(_, _, conformance)| conformance.reasons()),
                 Finding::describe,
             );
@@ -487,8 +435,8 @@ impl AuditCommand {
         }
 
         let needing_work: Vec<_> = report
-            .bucket(Some(Cost::Reencode))
-            .chain(report.bucket(Some(Cost::Remux)))
+            .bucket(Cost::Reencode)
+            .chain(report.bucket(Cost::Remux))
             .collect();
         if !needing_work.is_empty() {
             let _ = writeln!(out, "\n📄 Per file:");
@@ -536,6 +484,51 @@ impl AuditCommand {
         );
 
         out
+    }
+}
+
+/// One file's verdict, from what FFprobe said about it and one `stat`.
+fn audit_file(
+    scan_path: &Path,
+    target: &PlaybackTarget,
+    path: &Path,
+    probed: Result<MediaProbe>,
+) -> AuditEntry {
+    let path_in_report = to_forward_slashes(path.strip_prefix(scan_path).unwrap_or(path));
+
+    // A file whose size is unknown is not judged, so no verdict and no bucket
+    // total can rest on a size nobody read.
+    let stat = match std::fs::metadata(path) {
+        // One stat, read twice: the length the file claims, and how much of it
+        // the filesystem is actually holding.
+        Ok(metadata) => Stat {
+            size_bytes: metadata.len(),
+            allocation: allocation_of(&metadata),
+            modified: metadata.modified().ok(),
+        },
+        Err(error) => {
+            return AuditEntry {
+                path: path_in_report,
+                outcome: Outcome::Unreadable {
+                    stat: None,
+                    reason: format!("could not stat {}: {error}", path.display()),
+                },
+            }
+        }
+    };
+
+    AuditEntry {
+        path: path_in_report,
+        outcome: match probed {
+            Ok(media) => Outcome::Assessed {
+                stat,
+                conformance: evaluate(&media, target),
+            },
+            Err(error) => Outcome::Unreadable {
+                stat: Some(stat),
+                reason: format!("{error:#}"),
+            },
+        },
     }
 }
 
@@ -733,9 +726,9 @@ mod tests {
         let report = command.execute().await.unwrap();
 
         assert_eq!(report.entries.len(), 3);
-        assert_eq!(report.bucket(None).count(), 1);
-        assert_eq!(report.bucket(Some(Cost::Remux)).count(), 1);
-        assert_eq!(report.bucket(Some(Cost::Reencode)).count(), 1);
+        assert_eq!(report.direct_plays().count(), 1);
+        assert_eq!(report.bucket(Cost::Remux).count(), 1);
+        assert_eq!(report.bucket(Cost::Reencode).count(), 1);
 
         let rendered = command.render_report(&report);
         assert!(rendered.contains("Series/surround.mkv"), "{rendered}");
@@ -804,7 +797,7 @@ mod tests {
         assert_eq!(report.entries.len(), 3);
         assert_eq!(
             report
-                .bucket(None)
+                .direct_plays()
                 .map(|(entry, ..)| entry.path.as_str())
                 .collect::<Vec<_>>(),
             ["conforms.mp4"],
@@ -834,11 +827,11 @@ mod tests {
         let report = command.execute().await.unwrap();
 
         assert_eq!(
-            report.bucket(None).count(),
+            report.direct_plays().count(),
             0,
             "an AVI is not 'already fine'"
         );
-        assert_eq!(report.bucket(Some(Cost::Remux)).count(), 1);
+        assert_eq!(report.bucket(Cost::Remux).count(), 1);
         assert!(
             command.render_report(&report).contains("container: avi"),
             "{}",
@@ -846,8 +839,8 @@ mod tests {
         );
     }
 
-    /// A work root inside the media root is the mistake CLAUDE.md says people
-    /// make constantly, and its contents are not library files.
+    /// A work root inside the media root is easy to set up, and its contents
+    /// are not library files.
     #[tokio::test]
     async fn the_queues_own_directories_are_never_audited() {
         if !ffmpeg_present() {
@@ -881,7 +874,7 @@ mod tests {
         let report = command.execute().await.unwrap();
 
         assert_eq!(report.unreadable().count(), 1);
-        assert_eq!(report.bucket(None).count(), 0);
+        assert_eq!(report.direct_plays().count(), 0);
         assert!(command
             .render_report(&report)
             .contains("Could not be probed"));
@@ -899,7 +892,12 @@ mod tests {
         let os_reason = std::fs::metadata(&vanished).unwrap_err().to_string();
 
         let command = AuditCommand::new(dir.path().to_path_buf(), "chromecast-gen2-3").unwrap();
-        let entry = command.audit_file(&vanished);
+        let entry = audit_file(
+            dir.path(),
+            &command.target,
+            &vanished,
+            crate::probe::probe(&vanished),
+        );
         assert!(
             matches!(entry.outcome, Outcome::Unreadable { stat: None, .. }),
             "a file nobody could stat holds no size: {entry:?}"
@@ -975,7 +973,7 @@ mod tests {
     fn a_shortfall_is_reported_only_when_it_is_both_a_megabyte_and_a_twentieth() {
         let measured = |allocated_bytes| Allocation::Measured { allocated_bytes };
 
-        // The largest sparse file on the real library, from issue #189.
+        // The largest sparse file on the real library.
         assert_eq!(
             measured(2_173_702_144).shortfall(4_525_286_741),
             Some(2_351_584_597)
@@ -994,8 +992,8 @@ mod tests {
     /// The population this renders, and the two boundaries between the units.
     #[test]
     fn a_size_is_said_in_the_unit_that_leaves_it_some_digits() {
-        // The real library from issue #201: ten small files and one large one,
-        // every one of which printed as `0.0 GB` or `0.1 GB` before.
+        // Sizes from the real library: small files a GB figure would round to
+        // `0.0 GB` or `0.1 GB`, and one large one.
         assert_eq!(in_scale(33_009_664), "33.0 MB");
         assert_eq!(in_scale(39_419_904), "39.4 MB");
         assert_eq!(in_scale(107_479_040), "107.5 MB");
@@ -1067,9 +1065,9 @@ mod tests {
         );
     }
 
-    /// The whole of issue #189: FFprobe reads a sparse file's header and calls
-    /// it conforming, which stays true - and the missing content is now said
-    /// alongside that verdict rather than instead of it.
+    /// FFprobe reads a sparse file's header and calls it conforming, which
+    /// stays true. The missing content is said alongside that verdict rather
+    /// than instead of it.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_sparse_file_keeps_its_verdict_and_is_reported_as_incomplete() {
@@ -1115,7 +1113,7 @@ mod tests {
         let report = command.execute().await.unwrap();
 
         assert_eq!(
-            report.bucket(None).count(),
+            report.direct_plays().count(),
             1,
             "the conformance verdict is not touched: it still Direct Plays"
         );

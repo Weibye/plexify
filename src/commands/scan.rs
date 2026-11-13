@@ -1,13 +1,12 @@
 use anyhow::{anyhow, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
-use rayon::prelude::*;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
 use crate::ignore::IgnoreFilter;
 use crate::job::{MediaFileType, Operation};
 use crate::naming::scope_for;
-use crate::probe::probe;
+use crate::probe::{probe_all, MediaProbe};
 use crate::queue::JobQueue;
 use crate::target::{evaluate, Conformance, PlaybackTarget};
 
@@ -248,36 +247,13 @@ impl ScanCommand {
             .collect();
         let targets = self.targets.clone();
 
-        let probe_pb = ProgressBar::new(paths.len() as u64);
-        probe_pb.set_style(
-            ProgressStyle::with_template("Probing {bar:30.cyan/blue} {pos}/{len}")
-                .unwrap()
-                .progress_chars("█▉▊▋▌▍▎▏ "),
-        );
-
-        // A wall of blocking subprocesses, so they run on the blocking pool
-        // rather than parking a runtime worker for the length of a library.
-        let resolutions = tokio::task::spawn_blocking(move || {
-            let resolutions = paths
-                .par_iter()
-                .map(|path| {
-                    let resolution = resolve_one(path, &targets);
-                    probe_pb.inc(1);
-                    resolution
-                })
-                .collect();
-            probe_pb.finish_and_clear();
-            resolutions
-        })
-        .await?;
-
-        Ok(resolutions)
+        probe_all(paths, move |_, media| resolve_one(media, &targets)).await
     }
 }
 
 /// What one file needs in order to play on every one of `targets`.
-fn resolve_one(path: &Path, targets: &[PlaybackTarget]) -> Resolution {
-    let media = match probe(path) {
+fn resolve_one(media: Result<MediaProbe>, targets: &[PlaybackTarget]) -> Resolution {
+    let media = match media {
         Ok(media) => media,
         Err(error) => return Resolution::Unreadable(format!("{error:#}")),
     };
@@ -311,6 +287,7 @@ mod tests {
     use super::*;
     use crate::job::{AudioAction, QualityPreset, SubtitleAction};
     use std::fs;
+    use std::path::Path;
     use tempfile::TempDir;
 
     /// What `--preset quality` gives when no `FFMPEG_*` override is set.
@@ -679,7 +656,10 @@ mod tests {
         let targets = [PlaybackTarget::load("chromecast-gen2-3").unwrap()];
         for path in [&audio_only, &cover_art] {
             assert!(
-                matches!(resolve_one(path, &targets), Resolution::NoPicture),
+                matches!(
+                    resolve_one(crate::probe::probe(path), &targets),
+                    Resolution::NoPicture
+                ),
                 "{path:?} is neither work nor a file that already plays"
             );
         }

@@ -1,25 +1,21 @@
-//! What one file needs before a given client will Direct Play it.
-//!
-//! A pure function of a [`MediaProbe`] (facts about a file) and a
-//! [`PlaybackTarget`] (beliefs about a device). It proposes nothing and touches
-//! nothing.
+//! What one file needs before a given client will Direct Play it: a pure
+//! function of a [`MediaProbe`] (facts about a file) and a [`PlaybackTarget`]
+//! (beliefs about a device).
 
-use serde::{Deserialize, Serialize};
-
-use super::{Limit, PlaybackTarget, Provenance};
+use super::{Limit, PlaybackTarget, Provenance, Support};
 use crate::probe::{AudioStream, MediaProbe, VideoStream};
 
 /// What fixing a file costs. The two are not comparable: re-encoding video on
 /// a Pi 4 runs slower than realtime, while a remux copies the video bitstream
 /// untouched. Tallying them together hides the difference that matters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cost {
     Remux,
     Reencode,
 }
 
 /// The property a check was about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Field {
     Container,
     VideoCodec,
@@ -37,16 +33,9 @@ pub enum Field {
 impl Field {
     /// Every property a client's Direct Play decision turns on.
     ///
-    /// The list exists to be walked by a test, because the failure it guards
-    /// against has already happened once: `MediaProbe` carried the container
-    /// and nothing checked it, so every AVI in the library reported as
-    /// conforming on the device whose measured stall is the reason the remux
-    /// path exists. Nothing said what evaluating a file *consists of*, so the
-    /// probe and the checks could drift apart in silence.
-    ///
-    /// A variant added here fails `every_field_is_reachable` until something
-    /// produces it, which is the question worth asking of a new field: not
-    /// "does anything read this" but "does the decision account for it".
+    /// It says what evaluating a file consists of, so that the probe and the
+    /// checks cannot drift apart in silence: a variant added here fails
+    /// `every_field_is_reachable` until a check produces it.
     pub const ALL: [Field; 11] = [
         Field::Container,
         Field::VideoCodec,
@@ -104,7 +93,7 @@ impl Field {
 ///
 /// `source` describes the claim, not the file: an observed rejection means the
 /// device was watched refusing this, and an assumed one means nobody has tried.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Finding {
     pub field: Field,
     /// What the file has.
@@ -137,7 +126,7 @@ impl Finding {
 }
 
 /// What a client needs done to a file before it will Direct Play it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Conformance {
     Conforms {
         unverified: Vec<Finding>,
@@ -152,13 +141,18 @@ pub enum Conformance {
         reasons: Vec<Finding>,
         unverified: Vec<Finding>,
     },
-    /// Audio only, or only cover art: nothing to judge. No target says what a
-    /// client does with such a file and no job can give it a picture (D33), so
-    /// it is neither Direct Play nor work, and a report names it on its own.
+    /// Audio only, or only cover art: nothing to judge, so neither Direct Play
+    /// nor work. See D34.
     NoPicture,
 }
 
 impl Conformance {
+    /// Whether the client plays the file as it is. A file with no picture
+    /// needs no job, and does not Direct Play either. See D36.
+    pub fn direct_plays(&self) -> bool {
+        matches!(self, Conformance::Conforms { .. })
+    }
+
     pub fn reasons(&self) -> &[Finding] {
         match self {
             Conformance::Conforms { .. } | Conformance::NoPicture => &[],
@@ -177,8 +171,8 @@ impl Conformance {
         }
     }
 
-    /// `None` is no job, which is not the same as Direct Play: see
-    /// [`Conformance::NoPicture`].
+    /// What the job costs, or `None` where there is no job. That is not
+    /// Direct Play: ask [`Conformance::direct_plays`].
     pub fn cost(&self) -> Option<Cost> {
         match self {
             Conformance::Conforms { .. } | Conformance::NoPicture => None,
@@ -186,6 +180,19 @@ impl Conformance {
             Conformance::Reencode { .. } => Some(Cost::Reencode),
         }
     }
+}
+
+/// How a finding shows a value the probe could not read.
+const NOT_REPORTED: &str = "not reported";
+
+/// Whether the client decodes a codec. One FFprobe could not name is not one
+/// the client is known to play, so it is refused, on an assumption.
+fn codec_verdict(codecs: &Support, codec: Option<&str>) -> (bool, Provenance) {
+    codec.map_or((false, Provenance::Assumed), |codec| codecs.verdict(codec))
+}
+
+fn shown(codec: Option<&str>) -> String {
+    codec.unwrap_or(NOT_REPORTED).to_string()
 }
 
 /// Everything the checks below have to say about one file.
@@ -227,7 +234,7 @@ impl Findings {
         self.check(
             (true, Provenance::Assumed),
             field,
-            "not reported".to_string(),
+            NOT_REPORTED.to_string(),
             claim,
         );
     }
@@ -239,7 +246,7 @@ impl Findings {
         self.check(
             (true, Provenance::Assumed),
             field,
-            value.unwrap_or_else(|| "not reported".to_string()),
+            value.unwrap_or_else(|| NOT_REPORTED.to_string()),
             Some(claim),
         );
     }
@@ -319,25 +326,21 @@ fn container(probe: &MediaProbe, target: &PlaybackTarget, findings: &mut Finding
 fn video(video: &VideoStream, target: &PlaybackTarget, findings: &mut Findings) {
     let envelope = &target.video;
 
-    let (plays, source) = envelope.codecs.verdict(&video.codec);
-    findings.check(
-        (plays, source),
-        Field::VideoCodec,
-        video.codec.clone(),
-        None,
-    );
+    let codec = video.codec.as_deref();
+    let (plays, source) = codec_verdict(&envelope.codecs, codec);
+    findings.check((plays, source), Field::VideoCodec, shown(codec), None);
 
     // Profile and level only mean something once the codec is one the client
     // decodes; "High profile AV1" is not a second reason, it is the same one.
-    if plays {
-        match envelope.profiles.get(&video.codec) {
+    if let (true, Some(codec)) = (plays, codec) {
+        match envelope.profiles.get(codec) {
             Some(accepted) => match &video.profile {
                 Some(profile) => {
                     let source = accepted.provenance_of(profile);
                     findings.check(
                         (source.is_some(), source.unwrap_or(Provenance::Assumed)),
                         Field::VideoProfile,
-                        format!("{} {profile}", video.codec),
+                        format!("{codec} {profile}"),
                         None,
                     );
                 }
@@ -348,12 +351,12 @@ fn video(video: &VideoStream, target: &PlaybackTarget, findings: &mut Findings) 
                 video
                     .profile
                     .as_ref()
-                    .map(|profile| format!("{} {profile}", video.codec)),
-                format!("any {} profile", video.codec),
+                    .map(|profile| format!("{codec} {profile}")),
+                format!("any {codec} profile"),
             ),
         }
 
-        match envelope.max_level.get(&video.codec) {
+        match envelope.max_level.get(codec) {
             Some(limit) => findings.within(
                 video.level.map(|level| level.max(0) as u32),
                 limit,
@@ -366,7 +369,7 @@ fn video(video: &VideoStream, target: &PlaybackTarget, findings: &mut Findings) 
             None => findings.unbounded(
                 Field::VideoLevel,
                 video.level.map(|level| level.to_string()),
-                format!("any {} level", video.codec),
+                format!("any {codec} level"),
             ),
         }
     }
@@ -414,12 +417,13 @@ fn audio(probe: &MediaProbe, target: &PlaybackTarget, findings: &mut Findings) {
     if probe.audio.is_empty() {
         return;
     }
+    let codec = |stream: &AudioStream| codec_verdict(&envelope.codecs, stream.codec.as_deref());
 
     let playable = probe
         .audio
         .iter()
         .filter_map(|stream| {
-            let (plays, codec_source) = envelope.codecs.verdict(&stream.codec);
+            let (plays, codec_source) = codec(stream);
             let (fits, channel_source) = channels(stream, target);
 
             (plays && fits).then(|| (codec_source.weakest(channel_source), stream))
@@ -431,9 +435,9 @@ fn audio(probe: &MediaProbe, target: &PlaybackTarget, findings: &mut Findings) {
     // plays on an assumed codec, and lumping them mislabels which is untested.
     if let Some((_, stream)) = playable {
         findings.check(
-            envelope.codecs.verdict(&stream.codec),
+            codec(stream),
             Field::AudioCodec,
-            stream.codec.clone(),
+            shown(stream.codec.as_deref()),
             None,
         );
         findings.within(
@@ -449,19 +453,15 @@ fn audio(probe: &MediaProbe, target: &PlaybackTarget, findings: &mut Findings) {
     // Nothing plays, and the two ways that can be true are reported separately
     // even when both hold. A verdict that stopped at the codec could not say
     // whether the track a fix produces needs mixing down as well, and the
-    // caller then has to guess: assume it does and a stereo source is upmixed
-    // to a layout it never had, assume it does not and a 5.1 source comes back
-    // in a layout the client refuses. Both guesses have been made in this
-    // project, and each was wrong for a different half of the library.
+    // caller would have to guess: assume it does and a stereo source is
+    // upmixed to a layout it never had, assume it does not and a 5.1 source
+    // comes back in a layout the client refuses.
 
     // The codec is only the fault if it is the fault everywhere. A file whose
     // AAC track is 5.1 and whose AC3 track is stereo needs no new codec - it
     // needs the AAC mixed down - and "only aac/ac3" would point at the wrong
     // property.
-    let codec_plays_somewhere = probe
-        .audio
-        .iter()
-        .any(|stream| envelope.codecs.verdict(&stream.codec).0);
+    let codec_plays_somewhere = probe.audio.iter().any(|stream| codec(stream).0);
 
     if !codec_plays_somewhere {
         // Rejecting on measured evidence only if every track was measured to
@@ -469,10 +469,14 @@ fn audio(probe: &MediaProbe, target: &PlaybackTarget, findings: &mut Findings) {
         let source = probe
             .audio
             .iter()
-            .map(|stream| envelope.codecs.verdict(&stream.codec).1)
+            .map(|stream| codec(stream).1)
             .fold(Provenance::Observed, Provenance::weakest);
 
-        let mut codecs: Vec<&str> = probe.audio.iter().map(|s| s.codec.as_str()).collect();
+        let mut codecs: Vec<&str> = probe
+            .audio
+            .iter()
+            .map(|s| s.codec.as_deref().unwrap_or(NOT_REPORTED))
+            .collect();
         codecs.sort_unstable();
         codecs.dedup();
 
@@ -522,8 +526,8 @@ fn subtitles(probe: &MediaProbe, target: &PlaybackTarget, findings: &mut Finding
         .subtitles
         .iter()
         .filter_map(|stream| {
-            let source = target.subtitles.burns_in.provenance_of(&stream.codec)?;
-            Some((stream.codec.as_str(), source))
+            let codec = stream.codec.as_deref()?;
+            Some((codec, target.subtitles.burns_in.provenance_of(codec)?))
         })
         .collect();
     burned.sort_unstable();
@@ -564,7 +568,7 @@ mod tests {
         MediaProbe {
             container: Some("mov,mp4,m4a,3gp,3g2,mj2".to_string()),
             video: Some(VideoStream {
-                codec: "h264".to_string(),
+                codec: Some("h264".to_string()),
                 profile: Some("high".to_string()),
                 level: Some(41),
                 pixel_format: Some("yuv420p".to_string()),
@@ -574,7 +578,7 @@ mod tests {
                 height: Some(1080),
             }),
             audio: vec![AudioStream {
-                codec: "aac".to_string(),
+                codec: Some("aac".to_string()),
                 channels: Some(2),
                 language: Some("eng".to_string()),
             }],
@@ -585,11 +589,9 @@ mod tests {
     /// Every field in `Field::ALL` is produced by some file, so the list of
     /// properties and the checks that read them cannot drift apart in silence.
     ///
-    /// This is the check that was missing when `MediaProbe` carried a container
-    /// nothing evaluated. It is deliberately not "is this struct field read":
-    /// a `pub` field has no reader the compiler can see, and the question that
-    /// matters is whether the decision accounts for the property, which is what
-    /// walking `ALL` asks.
+    /// It is deliberately not "is this struct field read": a `pub` field has no
+    /// reader the compiler can see, and the question that matters is whether
+    /// the decision accounts for the property, which is what walking `ALL` asks.
     ///
     /// One file cannot exercise them all, and that is a property of the model
     /// rather than a gap in the test: a file with no video stream has no bit
@@ -605,7 +607,10 @@ mod tests {
                     ..plexify_output()
                 },
             ),
-            ("codec", with_video(|video| video.codec = "av1".to_string())),
+            (
+                "codec",
+                with_video(|video| video.codec = Some("av1".to_string())),
+            ),
             (
                 "profile",
                 with_video(|video| video.profile = Some("extended".to_string())),
@@ -625,7 +630,7 @@ mod tests {
                 "audio codec",
                 MediaProbe {
                     audio: vec![AudioStream {
-                        codec: "dts".to_string(),
+                        codec: Some("dts".to_string()),
                         channels: Some(2),
                         language: None,
                     }],
@@ -636,7 +641,7 @@ mod tests {
                 "audio channels",
                 MediaProbe {
                     audio: vec![AudioStream {
-                        codec: "aac".to_string(),
+                        codec: Some("aac".to_string()),
                         channels: Some(6),
                         language: None,
                     }],
@@ -647,7 +652,7 @@ mod tests {
                 "subtitles",
                 MediaProbe {
                     subtitles: vec![SubtitleStream {
-                        codec: "hdmv_pgs_subtitle".to_string(),
+                        codec: Some("hdmv_pgs_subtitle".to_string()),
                         language: None,
                     }],
                     ..plexify_output()
@@ -693,17 +698,16 @@ mod tests {
     fn a_conforming_file_needs_nothing_done_to_it() {
         let verdict = evaluate(&plexify_output(), &chromecast());
 
-        assert_eq!(verdict.cost(), None, "{:?}", claims(&verdict));
+        assert!(verdict.direct_plays(), "{:?}", claims(&verdict));
     }
 
     /// What 598 files in this library are, and the one playback failure we have
-    /// watched happen. Before the container was checked this returned Conforms
-    /// with an empty `unverified` - a false conform, stated as a fact.
+    /// watched happen.
     fn library_avi() -> MediaProbe {
         MediaProbe {
             container: Some("avi".to_string()),
             video: Some(VideoStream {
-                codec: "mpeg4".to_string(),
+                codec: Some("mpeg4".to_string()),
                 profile: Some("simple profile".to_string()),
                 level: Some(1),
                 pixel_format: Some("yuv420p".to_string()),
@@ -713,7 +717,7 @@ mod tests {
                 height: Some(480),
             }),
             audio: vec![AudioStream {
-                codec: "mp3".to_string(),
+                codec: Some("mp3".to_string()),
                 channels: Some(2),
                 language: None,
             }],
@@ -766,7 +770,7 @@ mod tests {
 
         let verdict = evaluate(&probe, &lg());
 
-        assert_eq!(verdict.cost(), None);
+        assert!(verdict.direct_plays(), "{:?}", claims(&verdict));
         assert!(
             container_is_unverified(&verdict, "matroska,webm"),
             "{:?}",
@@ -780,7 +784,7 @@ mod tests {
     fn the_mp4_demuxer_passes_the_chromecast_only_on_an_assumption() {
         let verdict = evaluate(&plexify_output(), &chromecast());
 
-        assert_eq!(verdict.cost(), None);
+        assert!(verdict.direct_plays(), "{:?}", claims(&verdict));
         assert!(
             container_is_unverified(&verdict, "mov,mp4,m4a,3gp,3g2,mj2"),
             "{:?}",
@@ -805,7 +809,11 @@ mod tests {
 
         let verdict = evaluate(&probe, &chromecast());
 
-        assert_eq!(verdict.cost(), None, "an absent value fails nothing");
+        assert!(
+            verdict.direct_plays(),
+            "an absent value fails nothing: {:?}",
+            claims(&verdict)
+        );
         for field in [
             Field::Container,
             Field::VideoProfile,
@@ -833,7 +841,7 @@ mod tests {
     fn ac3_stereo_costs_a_remux_on_the_chromecast_and_that_is_measured() {
         let mut probe = plexify_output();
         probe.audio = vec![AudioStream {
-            codec: "ac3".to_string(),
+            codec: Some("ac3".to_string()),
             channels: Some(2),
             ..Default::default()
         }];
@@ -846,32 +854,33 @@ mod tests {
     }
 
     /// What plexify's own transcoder writes into every .mp4 it produces, and
-    /// it costs nothing on either shipped client.
-    ///
-    /// This asserted a remux on the LG until 2026-09-01. The reading behind
-    /// that was taken with the app's own quality set to 3 Mbps 720p, which
-    /// re-encodes every picture and burns the text into it as a side effect.
-    /// Measured with the setting at Original: `part decision = directplay`,
-    /// no video decision, and the selected `mov_text` track converted into an
-    /// `srt` sidecar with the picture untouched.
+    /// it costs nothing on either shipped client. The LG converts the track
+    /// into a sidecar rather than burning it in; `targets/lg-cx-webos.toml`
+    /// has the measurement.
     #[test]
     fn a_mov_text_track_costs_nothing_on_either_target() {
         let mut probe = plexify_output();
         probe.subtitles = vec![SubtitleStream {
-            codec: "mov_text".to_string(),
+            codec: Some("mov_text".to_string()),
             language: Some("eng".to_string()),
         }];
 
-        let verdict = evaluate(&probe, &lg());
-        assert_eq!(verdict.cost(), None, "{:?}", claims(&verdict));
-        assert_eq!(evaluate(&probe, &chromecast()).cost(), None);
+        for target in [lg(), chromecast()] {
+            let verdict = evaluate(&probe, &target);
+            assert!(
+                verdict.direct_plays(),
+                "{}: {:?}",
+                target.name,
+                claims(&verdict)
+            );
+        }
     }
 
     #[test]
     fn hevc_10_bit_is_a_reencode_for_the_chromecast_and_plays_on_the_lg() {
         let mut probe = plexify_output();
         probe.video = Some(VideoStream {
-            codec: "hevc".to_string(),
+            codec: Some("hevc".to_string()),
             profile: Some("main 10".to_string()),
             level: None,
             pixel_format: Some("yuv420p10le".to_string()),
@@ -885,7 +894,19 @@ mod tests {
         assert_eq!(chromecast.cost(), Some(Cost::Reencode));
         assert!(claims(&chromecast).iter().any(|c| c.contains("hevc")));
 
-        assert_eq!(evaluate(&probe, &lg()).cost(), None);
+        let lg = evaluate(&probe, &lg());
+        assert!(lg.direct_plays(), "{:?}", claims(&lg));
+    }
+
+    /// FFprobe names no codec for a stream it has no decoder for. That is not
+    /// a codec the client is known to play, so it is refused, on an assumption.
+    #[test]
+    fn a_video_codec_ffprobe_could_not_name_is_refused_on_an_assumption() {
+        let verdict = evaluate(&with_video(|video| video.codec = None), &chromecast());
+
+        assert_eq!(verdict.cost(), Some(Cost::Reencode));
+        assert_eq!(verdict.reasons()[0].describe(), "video codec: not reported");
+        assert_eq!(verdict.reasons()[0].source, Provenance::Assumed);
     }
 
     /// A codec nobody has watched play is not a conformance the tool should
@@ -894,14 +915,14 @@ mod tests {
     fn vp9_passes_the_chromecast_only_on_an_assumption() {
         let mut probe = plexify_output();
         probe.video = Some(VideoStream {
-            codec: "vp9".to_string(),
+            codec: Some("vp9".to_string()),
             profile: Some("profile 0".to_string()),
             ..plexify_output().video.unwrap()
         });
 
         let verdict = evaluate(&probe, &chromecast());
 
-        assert_eq!(verdict.cost(), None);
+        assert!(verdict.direct_plays(), "{:?}", claims(&verdict));
         assert!(verdict
             .unverified()
             .iter()
@@ -914,7 +935,7 @@ mod tests {
     fn an_undecodable_codec_produces_one_reason_not_three() {
         let mut probe = plexify_output();
         probe.video = Some(VideoStream {
-            codec: "av1".to_string(),
+            codec: Some("av1".to_string()),
             profile: Some("main".to_string()),
             level: Some(60),
             ..plexify_output().video.unwrap()
@@ -964,14 +985,15 @@ mod tests {
         fields
     }
 
-    /// Both faults at once, because both are true. A verdict that stopped at
-    /// the codec left the caller unable to tell this file from a stereo one,
-    /// and the fix it produced was a 5.1 AAC track the Chromecast refuses.
+    /// Both faults at once, because both are true: a fix that changed only the
+    /// codec would produce a 5.1 AAC track the Chromecast refuses. Both are
+    /// remux work, so the second fault does not move the file to a dearer
+    /// bucket.
     #[test]
     fn a_51_track_in_a_refused_codec_reports_the_codec_and_the_layout() {
         let mut probe = plexify_output();
         probe.audio = vec![AudioStream {
-            codec: "ac3".to_string(),
+            codec: Some("ac3".to_string()),
             channels: Some(6),
             ..Default::default()
         }];
@@ -985,15 +1007,14 @@ mod tests {
         );
     }
 
-    /// The other half, and the one that was wrong in the opposite direction:
-    /// 342 Opus files in this library are stereo or mono, and the LG's cap is
+    /// The other half: 342 Opus files in this library are stereo or mono, and the LG's cap is
     /// six. Reporting a layout fault here would have the fix upmix stereo into
     /// 5.1 to reach a ceiling the file was never near.
     #[test]
     fn a_stereo_track_in_a_refused_codec_reports_only_the_codec() {
         let mut probe = plexify_output();
         probe.audio = vec![AudioStream {
-            codec: "opus".to_string(),
+            codec: Some("opus".to_string()),
             channels: Some(2),
             ..Default::default()
         }];
@@ -1012,12 +1033,12 @@ mod tests {
         let mut probe = plexify_output();
         probe.audio = vec![
             AudioStream {
-                codec: "aac".to_string(),
+                codec: Some("aac".to_string()),
                 channels: Some(6),
                 ..Default::default()
             },
             AudioStream {
-                codec: "ac3".to_string(),
+                codec: Some("ac3".to_string()),
                 channels: Some(2),
                 ..Default::default()
             },
@@ -1028,21 +1049,6 @@ mod tests {
         assert_eq!(fields_of(&verdict), [Field::AudioChannels]);
     }
 
-    /// Reporting a second fault must not move a file between cost buckets:
-    /// both audio fields are remux work, and the library-wide figures this
-    /// project quotes were measured with one reason per file.
-    #[test]
-    fn reporting_both_faults_does_not_change_what_the_file_costs() {
-        let mut probe = plexify_output();
-        probe.audio = vec![AudioStream {
-            codec: "ac3".to_string(),
-            channels: Some(6),
-            ..Default::default()
-        }];
-
-        assert_eq!(evaluate(&probe, &chromecast()).cost(), Some(Cost::Remux));
-    }
-
     /// The worst case in this library, and the one the owner complained about:
     /// 120 .webm files, 500 GB, VP9 or AV1 with Opus audio and an embedded
     /// WebVTT track. They fail the LG on audio, and the re-encode the AV1 half
@@ -1051,7 +1057,7 @@ mod tests {
         MediaProbe {
             container: Some("matroska,webm".to_string()),
             video: Some(VideoStream {
-                codec: video_codec.to_string(),
+                codec: Some(video_codec.to_string()),
                 profile: Some("profile 0".to_string()),
                 pixel_format: Some("yuv420p".to_string()),
                 bit_depth: Some(8),
@@ -1060,23 +1066,19 @@ mod tests {
                 ..Default::default()
             }),
             audio: vec![AudioStream {
-                codec: "opus".to_string(),
+                codec: Some("opus".to_string()),
                 channels: Some(2),
                 ..Default::default()
             }],
             subtitles: vec![SubtitleStream {
-                codec: "webvtt".to_string(),
+                codec: Some("webvtt".to_string()),
                 language: Some("eng".to_string()),
             }],
             ..Default::default()
         }
     }
 
-    /// Opus, and only Opus. The WebVTT track was a second reason here until
-    /// 2026-09-01, and it was the cap's doing: the session it was read from
-    /// was re-encoding the picture because the app asked for 3 Mbps 720p, and
-    /// a re-encode burns a text track in for free. Its removal changes no
-    /// file's cost, because every one of these already fails on the audio.
+    /// Opus, and only Opus: the LG is not claimed to burn WebVTT in.
     #[test]
     fn the_webm_population_fails_the_lg_on_its_audio() {
         let verdict = evaluate(&critical_role("vp9"), &lg());
@@ -1095,12 +1097,9 @@ mod tests {
         assert_eq!(verdict.cost(), Some(Cost::Reencode));
     }
 
-    /// VP9 on this app is believed, not seen. The Critical Role session was
-    /// once read as evidence against it - a VP9 source arriving as H.264 - and
-    /// that reading is withdrawn: the app was capped to 3 Mbps 720p, which
-    /// re-encodes any source whatever its codec. So VP9 is untested in both
-    /// directions, and the marker is what tells a reader the verdict is a
-    /// prediction.
+    /// VP9 on this app is untested in both directions: the one session that
+    /// carried it was under a client cap, which re-encodes any source. The
+    /// marker is what tells a reader the verdict is a prediction.
     #[test]
     fn vp9_on_the_lg_still_reads_as_unverified() {
         let verdict = evaluate(&critical_role("vp9"), &lg());
@@ -1117,18 +1116,18 @@ mod tests {
         let mut probe = plexify_output();
         probe.audio = vec![
             AudioStream {
-                codec: "ac3".to_string(),
+                codec: Some("ac3".to_string()),
                 channels: Some(6),
                 ..Default::default()
             },
             AudioStream {
-                codec: "aac".to_string(),
+                codec: Some("aac".to_string()),
                 channels: Some(2),
                 ..Default::default()
             },
         ];
 
-        assert_eq!(evaluate(&probe, &chromecast()).cost(), None);
+        assert!(evaluate(&probe, &chromecast()).direct_plays());
     }
 
     /// Nothing can be remuxed into a file that has no audio, and a silent file
@@ -1138,7 +1137,7 @@ mod tests {
         let mut probe = plexify_output();
         probe.audio.clear();
 
-        assert_eq!(evaluate(&probe, &chromecast()).cost(), None);
+        assert!(evaluate(&probe, &chromecast()).direct_plays());
     }
 
     fn unverified_claims(conformance: &Conformance) -> Vec<String> {
@@ -1171,7 +1170,7 @@ mod tests {
             container: Some("matroska,webm".to_string()),
             video: None,
             audio: vec![AudioStream {
-                codec: "dts".to_string(),
+                codec: Some("dts".to_string()),
                 channels: Some(6),
                 language: None,
             }],
@@ -1187,13 +1186,13 @@ mod tests {
     #[test]
     fn a_profile_or_level_the_target_does_not_bound_passes_on_an_assumption() {
         let xvid = with_video(|video| {
-            video.codec = "mpeg4".to_string();
+            video.codec = Some("mpeg4".to_string());
             video.profile = Some("advanced simple profile".to_string());
             video.level = Some(5);
         });
         let verdict = evaluate(&xvid, &lg());
 
-        assert_eq!(verdict.cost(), None, "{:?}", claims(&verdict));
+        assert!(verdict.direct_plays(), "{:?}", claims(&verdict));
         let unverified = unverified_claims(&verdict);
         assert!(
             unverified.contains(&"video profile: any mpeg4 profile".to_string()),
@@ -1257,7 +1256,7 @@ mod tests {
         let mut surround = plexify_output();
         surround.audio[0].channels = Some(6);
         let surround = evaluate(&surround, &lg());
-        assert_eq!(surround.cost(), None);
+        assert!(surround.direct_plays(), "{:?}", claims(&surround));
         assert!(
             surround
                 .unverified()
@@ -1273,8 +1272,8 @@ mod tests {
     #[test]
     fn a_video_reason_outranks_an_audio_one() {
         let mut probe = plexify_output();
-        probe.video.as_mut().unwrap().codec = "mpeg4".to_string();
-        probe.audio[0].codec = "ac3".to_string();
+        probe.video.as_mut().unwrap().codec = Some("mpeg4".to_string());
+        probe.audio[0].codec = Some("ac3".to_string());
 
         let verdict = evaluate(&probe, &chromecast());
 
