@@ -3,8 +3,8 @@ use std::path::Path;
 use tracing::{debug, info, warn};
 
 use crate::job::{
-    AudioAction, Job, MediaFileType, Operation, PostProcessingSettings, QualitySettings,
-    SubtitleAction,
+    AudioAction, Job, MediaFileType, Operation, PostProcessingSettings, QualityPreset,
+    QualitySettings, SubtitleAction,
 };
 use crate::queue::JobQueue;
 
@@ -20,11 +20,11 @@ pub struct JobProcessorConfig {
 
 impl JobProcessorConfig {
     /// Create job processor config from preset or environment
-    pub fn from_preset(preset: Option<&str>) -> Result<Self> {
+    pub fn from_preset(preset: Option<QualityPreset>) -> Self {
         let quality_settings = match preset {
-            Some(preset_name) => {
-                info!("Using quality preset: '{}'", preset_name);
-                QualitySettings::from_preset_name(preset_name)?
+            Some(preset) => {
+                info!("Using quality preset: {:?}", preset);
+                QualitySettings::from_preset(preset)
             }
             None => {
                 info!("Using quality settings from environment variables");
@@ -33,10 +33,10 @@ impl JobProcessorConfig {
         };
         let post_processing = PostProcessingSettings::default();
 
-        Ok(Self {
+        Self {
             quality_settings,
             post_processing,
-        })
+        }
     }
 }
 
@@ -212,7 +212,7 @@ mod tests {
     async fn test_job_processor_config_from_preset() {
         clear_encoding_env();
 
-        let config = JobProcessorConfig::from_preset(Some("quality")).unwrap();
+        let config = JobProcessorConfig::from_preset(Some(QualityPreset::Quality));
         // Just verify it doesn't panic and creates a config
         assert_eq!(config.quality_settings.ffmpeg_preset, "slow");
     }
@@ -222,7 +222,7 @@ mod tests {
     async fn test_job_processor_config_from_env() {
         clear_encoding_env();
 
-        let config = JobProcessorConfig::from_preset(None).unwrap();
+        let config = JobProcessorConfig::from_preset(None);
         // Just verify it doesn't panic and creates a config with defaults
         assert_eq!(config.quality_settings.ffmpeg_preset, "veryfast");
     }

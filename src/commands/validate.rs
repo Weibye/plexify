@@ -127,8 +127,8 @@ impl ValidationReport {
 /// Command to validate library naming conformity
 pub struct ValidateCommand {
     scope: Scope,
-    /// Whether the caller intends to act on the report. Validation itself is
-    /// read-only either way; this only decides what the report says it is.
+    /// Whether `execute` carries out the renames after reporting them.
+    /// `report` is read-only either way.
     fixing: bool,
 }
 
@@ -168,15 +168,28 @@ impl ValidateCommand {
         })
     }
 
-    /// State that the report will be acted on, so it does not describe itself
-    /// as a dry run.
+    /// Carry out the renames, rather than only reporting them as a dry run.
     pub fn fixing(mut self) -> Self {
         self.fixing = true;
         self
     }
 
-    /// Execute the validation command
-    pub async fn execute(&self) -> Result<ValidationReport> {
+    /// Print the report, and when fixing, carry out the renames it proposes.
+    pub async fn execute(&self) -> Result<()> {
+        let report = self.report().await?;
+        self.print_report(&report);
+
+        // The report the user just read is exactly what is about to be attempted.
+        if self.fixing {
+            let plan = crate::fix::plan(&report);
+            let plan_file = crate::fix::default_plan_file(plan.created_unix_seconds);
+            self.print_fix_outcome(&crate::fix::apply(&plan, &plan_file)?);
+        }
+        Ok(())
+    }
+
+    /// Report what is not in canonical form, changing nothing on disk.
+    pub async fn report(&self) -> Result<ValidationReport> {
         let start_time = Instant::now();
 
         if !self.scope.scan_path.exists() {
@@ -410,7 +423,7 @@ impl ValidateCommand {
     }
 
     /// Print what a fix run did to stdout
-    pub fn print_fix_outcome(&self, outcome: &FixOutcome) {
+    fn print_fix_outcome(&self, outcome: &FixOutcome) {
         print!("{}", self.render_fix_outcome(outcome));
     }
 
@@ -490,7 +503,7 @@ impl ValidateCommand {
     }
 
     /// Print the validation report to stdout
-    pub fn print_report(&self, report: &ValidationReport) {
+    fn print_report(&self, report: &ValidationReport) {
         print!("{}", self.render_report(report));
     }
 
@@ -646,7 +659,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let validate_cmd = ValidateCommand::new(temp_dir.path().to_path_buf());
 
-        let result = validate_cmd.execute().await;
+        let result = validate_cmd.report().await;
         assert!(result.is_ok());
 
         let report = result.unwrap();
@@ -666,7 +679,7 @@ mod tests {
         fs::write(tv_path.join("Breaking Bad - S01E01 - Pilot.mkv"), "").unwrap();
 
         let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
-        let result = validate_cmd.execute().await;
+        let result = validate_cmd.report().await;
 
         assert!(result.is_ok());
         let report = result.unwrap();
@@ -689,7 +702,7 @@ mod tests {
         .unwrap();
 
         let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
-        let result = validate_cmd.execute().await;
+        let result = validate_cmd.report().await;
 
         assert!(result.is_ok());
         let report = result.unwrap();
@@ -708,7 +721,7 @@ mod tests {
         fs::write(movie_path.join("The Dark Knight (2008).mkv"), "").unwrap();
 
         let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
-        let result = validate_cmd.execute().await;
+        let result = validate_cmd.report().await;
 
         assert!(result.is_ok());
         let report = result.unwrap();
@@ -729,7 +742,7 @@ mod tests {
         fs::write(media_root.join("Series/Show/episode.mkv"), "").unwrap();
 
         let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
-        let result = validate_cmd.execute().await;
+        let result = validate_cmd.report().await;
 
         assert!(result.is_ok());
         let report = result.unwrap();
@@ -741,7 +754,7 @@ mod tests {
     async fn test_validate_nonexistent_directory() {
         let validate_cmd = ValidateCommand::new(PathBuf::from("/nonexistent/path"));
 
-        let result = validate_cmd.execute().await;
+        let result = validate_cmd.report().await;
         assert!(result.is_err());
     }
 
@@ -773,7 +786,7 @@ mod tests {
         .unwrap();
 
         let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
-        let result = validate_cmd.execute().await;
+        let result = validate_cmd.report().await;
 
         assert!(result.is_ok());
         let report = result.unwrap();
@@ -807,7 +820,7 @@ mod tests {
         .unwrap();
 
         let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
-        let result = validate_cmd.execute().await;
+        let result = validate_cmd.report().await;
 
         assert!(result.is_ok());
         let report = result.unwrap();
@@ -833,7 +846,7 @@ mod tests {
         .unwrap();
 
         let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
-        let result = validate_cmd.execute().await;
+        let result = validate_cmd.report().await;
 
         assert!(result.is_ok());
         let report = result.unwrap();
@@ -862,7 +875,7 @@ mod tests {
         .unwrap();
 
         let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
-        let result = validate_cmd.execute().await;
+        let result = validate_cmd.report().await;
 
         assert!(result.is_ok());
         let report = result.unwrap();
@@ -890,7 +903,7 @@ mod tests {
         .unwrap();
 
         let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
-        let result = validate_cmd.execute().await;
+        let result = validate_cmd.report().await;
 
         assert!(result.is_ok());
         let report = result.unwrap();
@@ -934,7 +947,7 @@ mod tests {
         .unwrap();
 
         let validate_cmd = ValidateCommand::new(media_root.to_path_buf());
-        let result = validate_cmd.execute().await;
+        let result = validate_cmd.report().await;
         assert!(result.is_ok());
         let report = result.unwrap();
 
@@ -1026,7 +1039,7 @@ mod tests {
         .unwrap();
 
         let report = ValidateCommand::new(media_root.to_path_buf())
-            .execute()
+            .report()
             .await
             .unwrap();
 
@@ -1075,7 +1088,7 @@ mod tests {
         fs::write(season.join("Final Fantasy X - s01e13 - Zanarkand.webm"), "").unwrap();
 
         let report = ValidateCommand::new(media_root.to_path_buf())
-            .execute()
+            .report()
             .await
             .unwrap();
 
@@ -1132,7 +1145,7 @@ mod tests {
         }
 
         let report = ValidateCommand::new(media_root.to_path_buf())
-            .execute()
+            .report()
             .await
             .unwrap();
 
@@ -1164,7 +1177,7 @@ mod tests {
         fs::write(season.join("Final Fantasy X - S01E13 - Zanarkand.webm"), "").unwrap();
 
         let report = ValidateCommand::new(media_root.to_path_buf())
-            .execute()
+            .report()
             .await
             .unwrap();
         assert_eq!(report.notes.len(), 1);
@@ -1190,7 +1203,7 @@ mod tests {
         fs::write(season.join("Breaking Bad - S01E01 - Pilot.mkv"), "").unwrap();
 
         let report = ValidateCommand::new(media_root.to_path_buf())
-            .execute()
+            .report()
             .await
             .unwrap();
 
@@ -1211,7 +1224,7 @@ mod tests {
         fs::write(season.join("Breaking Bad - s01e01 - Pilot.mkv"), "").unwrap();
 
         let report = ValidateCommand::new(media_root.to_path_buf())
-            .execute()
+            .report()
             .await
             .unwrap();
 
@@ -1231,7 +1244,7 @@ mod tests {
         fs::write(nested.join("Veronica Mars S02E04.mp4"), "").unwrap();
 
         let report = ValidateCommand::new(media_root.to_path_buf())
-            .execute()
+            .report()
             .await
             .unwrap();
 
@@ -1261,7 +1274,7 @@ mod tests {
         fs::create_dir_all(media_root.join("Anime")).unwrap();
 
         let report = ValidateCommand::new(media_root.clone())
-            .execute()
+            .report()
             .await
             .unwrap();
 
@@ -1304,10 +1317,7 @@ mod tests {
 
         fs::create_dir_all(temp_dir.path().join("lib").join("Series")).unwrap();
 
-        let report = ValidateCommand::new(movies.clone())
-            .execute()
-            .await
-            .unwrap();
+        let report = ValidateCommand::new(movies.clone()).report().await.unwrap();
 
         assert_eq!(report.library_root, temp_dir.path().join("lib"));
         assert_eq!(
@@ -1345,7 +1355,7 @@ mod tests {
         fs::write(film.join("Batman Begins 2005.mkv"), "").unwrap();
 
         let inferred = ValidateCommand::new(media_root.clone())
-            .execute()
+            .report()
             .await
             .unwrap();
         assert_eq!(
@@ -1357,7 +1367,7 @@ mod tests {
 
         let stated = ValidateCommand::rooted_at(media_root.clone(), media_root.clone())
             .unwrap()
-            .execute()
+            .report()
             .await
             .unwrap();
 
@@ -1387,7 +1397,7 @@ mod tests {
 
         let report = ValidateCommand::rooted_at(media_root.clone(), media_root.clone())
             .unwrap()
-            .execute()
+            .report()
             .await
             .unwrap();
 
@@ -1434,7 +1444,7 @@ mod tests {
 
         let report = ValidateCommand::rooted_at(season, media_root)
             .unwrap()
-            .execute()
+            .report()
             .await
             .unwrap();
 
@@ -1467,10 +1477,7 @@ mod tests {
         fs::create_dir_all(&real).unwrap();
         fs::write(real.join("Elementary - S01E01 - Pilot.mkv"), "").unwrap();
 
-        let report = ValidateCommand::new(series.clone())
-            .execute()
-            .await
-            .unwrap();
+        let report = ValidateCommand::new(series.clone()).report().await.unwrap();
 
         assert_eq!(report.library_root, temp_dir.path().join("lib"));
         assert_eq!(
@@ -1500,7 +1507,7 @@ mod tests {
         }
 
         let report = ValidateCommand::new(media_root.to_path_buf())
-            .execute()
+            .report()
             .await
             .unwrap();
 
@@ -1525,7 +1532,7 @@ mod tests {
         fs::write(series.join("Loose Show - S02E03 - Wandering.mkv"), "").unwrap();
 
         let report = ValidateCommand::new(media_root.to_path_buf())
-            .execute()
+            .report()
             .await
             .unwrap();
 
@@ -1545,7 +1552,7 @@ mod tests {
         fs::write(season.join("Misfiled - S04E02 - Wrong Home.mkv"), "").unwrap();
 
         let report = ValidateCommand::new(media_root.to_path_buf())
-            .execute()
+            .report()
             .await
             .unwrap();
 
@@ -1571,7 +1578,7 @@ mod tests {
         fs::write(other.join("Firefly - s01e02 - The Train Job.mkv"), "").unwrap();
 
         let report = ValidateCommand::new(media_root.join("Series/Elementary"))
-            .execute()
+            .report()
             .await
             .unwrap();
 
@@ -1595,7 +1602,7 @@ mod tests {
         fs::write(season.join("Cowboy Bebop.S01E05.Ballad.mkv"), "").unwrap();
 
         let report = ValidateCommand::new(media_root.join("Anime/Cowboy Bebop/Season 1"))
-            .execute()
+            .report()
             .await
             .unwrap();
 
@@ -1623,7 +1630,7 @@ Series/Elementary/
         fs::write(season.join("Elementary - S06E08 Sand Trap.mkv"), "").unwrap();
 
         let report = ValidateCommand::new(media_root.join("Series/Elementary"))
-            .execute()
+            .report()
             .await
             .unwrap();
 
@@ -1647,7 +1654,7 @@ Series/Elementary/
         .unwrap();
 
         let result = ValidateCommand::new(media_root.to_path_buf())
-            .execute()
+            .report()
             .await;
 
         let message = format!("{:#}", result.unwrap_err());
