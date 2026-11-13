@@ -1,40 +1,14 @@
 //! What a media path in this library is supposed to look like.
 //!
-//! The library has one canonical shape, and this module is the only description
-//! of it. Everything here follows from a single decision: instead of asking
-//! *"does this path match an accepted form?"*, we **parse** a path into the
-//! fields it is made of and **render** those fields back into the one canonical
-//! form. A path is correct exactly when rendering its own parse reproduces it.
-//!
-//! That inversion is what makes renaming possible. A yes/no matcher can only
-//! reject a path; it cannot say what the path should have been, which is why
-//! a destination must never be produced by patching the source string.
+//! A path is parsed into its fields and rendered back in the one canonical form,
+//! and is correct when the two agree; a path that cannot be parsed is
+//! [`Assessment::Unresolvable`] with a reason, never a guess. See D19.
 //!
 //! ```text
 //! Series/Elementary/Season 6/Elementary - S06E08 Sand Trap.mkv
 //!   parse  -> series "Elementary", season 6, episode 8, title "Sand Trap"
 //!   render -> Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap.mkv
 //! ```
-//!
-//! ## What is deliberately left alone
-//!
-//! Rules apply per path component, and a component with no rule is preserved as
-//! it is. The series directory is never renamed here, so a file whose name
-//! disagrees with its directory keeps its own name rather than being pulled
-//! toward a directory that may itself be wrong.
-//!
-//! The season directory is the exception, and it is not preserved but derived:
-//! every episode belongs in the season its own marker names, so a file with no
-//! season directory is moved into one and a file in the wrong one is moved
-//! across. The directory is evidence of where a file ended up; the marker is
-//! evidence of what it is, and the marker wins.
-//!
-//! ## When we refuse
-//!
-//! A path we cannot decompose produces [`Assessment::Unresolvable`] with a
-//! reason, never a guess. A duplicated library root is the clearest case: in
-//! `Series/Veronica Mars/Series/...` the correct destination is genuinely
-//! ambiguous, so it is reported for a human to resolve.
 
 mod parse;
 mod render;
@@ -229,11 +203,11 @@ pub fn scope_for(path: &Path) -> Scope {
 /// library contains two others, so a directory holding `Series/` and `Movies/`
 /// is a media root and nothing else, whatever it is called.
 ///
-/// The cost of that is one shape left unfixed: a media root named after a
-/// library root that holds exactly *one* root - `/srv/Movies` containing only
-/// `Movies/`. It is refused rather than descended into, which is what happened
-/// before this probe existed. Refusing a library is recoverable by hand; a file
-/// moved to the wrong place is not.
+/// The cost of that is one shape the probe cannot read: a media root named after
+/// a library root that holds exactly *one* root - `/srv/Movies` containing only
+/// `Movies/`. It is refused rather than descended into, and `--library-root`
+/// ([`Scope::stated`]) is how a person says which reading is right. Refusing a
+/// library is recoverable by hand; a file moved to the wrong place is not.
 ///
 /// Directories are counted, not names: a stray *file* called `Series` is not a
 /// library root. A path that cannot be read - it does not exist, or the caller
@@ -671,10 +645,7 @@ mod tests {
         (temp_dir, media_root)
     }
 
-    /// The acceptance cases from issue #51, asserted end to end.
-    ///
-    /// Each is a real path from the library, with the destination the issue
-    /// specifies for it.
+    /// Real paths from the library, with the destination each should get.
     #[test]
     fn pads_the_season_directory_and_separates_the_episode_title() {
         assert_eq!(
@@ -724,13 +695,8 @@ mod tests {
         );
     }
 
-    /// The quality metadata moves into brackets, and the file moves into a
-    /// season directory.
-    ///
-    /// Issue #51 wrote this case out with the file staying loose in the series
-    /// directory, because at the time nothing created season directories.
-    /// Issue #86 supersedes that: an episode belongs in the season its marker
-    /// names, and `Season 01` here does not exist yet.
+    /// The quality metadata moves into brackets, and the file moves into the
+    /// season directory its marker names, which does not exist yet.
     #[test]
     fn moves_quality_metadata_into_brackets_and_the_file_into_its_season() {
         assert_eq!(
@@ -803,7 +769,7 @@ mod tests {
         );
     }
 
-    /// Issue #137: the reason has to be true of the path it is printed against.
+    /// The reason has to be true of the path it is printed against.
     /// A `Series` directory inside a `Movies` root is a duplicated root, but
     /// neither name appears twice, so saying so sends the reader hunting for a
     /// nesting that is not there.
@@ -824,7 +790,7 @@ mod tests {
         );
     }
 
-    /// Cases the library already contains, beyond the issue's list.
+    /// More cases the library contains.
     #[test]
     fn uppercases_a_lowercase_episode_marker() {
         assert_eq!(
@@ -1137,7 +1103,7 @@ mod tests {
         directories.split('/').map(str::to_string).collect()
     }
 
-    /// Issue #138: the year is what tells two shows of one name apart, and it
+    /// The year is what tells two shows of one name apart, and it
     /// lives on the directory precisely because the canonical *filename* does
     /// not carry it. Grouping by the rendered name throws it away and leaves the
     /// comparator returning `Equal` for every pair, so the two are interleaved.
@@ -1203,7 +1169,7 @@ mod tests {
         }
     }
 
-    /// Issue #191: the contiguity `--priority episode` offers rests on every
+    /// The contiguity `--priority episode` offers rests on every
     /// file of one series producing the same group, and a subdirectory holding
     /// episodes with no season directory above them produces a different one.
     /// Two groups of one series still sort together when they are compared
@@ -1292,8 +1258,8 @@ mod tests {
         );
     }
 
-    /// Issue #137: a media root named after a library root made `validate`
-    /// refuse every file in the library at once.
+    /// A media root named after a library root is still the library root, not
+    /// a reason to refuse every file in the library at once.
     #[test]
     fn a_media_root_named_after_a_library_root_is_still_the_library_root() {
         for name in ["Movies", "Anime", "Series"] {
@@ -1546,9 +1512,9 @@ mod tests {
         );
     }
 
-    /// Issue #198, the four files it found, verbatim. All four were already
-    /// named the way Plex reads a double episode, and were being proposed a name
-    /// that says the file holds one.
+    /// Four files from the library, verbatim, each already named the way Plex
+    /// reads a double episode. Reading only the first number would propose a
+    /// name that says the file holds one.
     #[test]
     fn leaves_a_double_episode_that_is_already_named_correctly_alone() {
         for path in [
@@ -1561,10 +1527,9 @@ mod tests {
         }
     }
 
-    /// The other four files, found by sweeping the library for the shape rather
-    /// than by eye. They carry a release tag and no title, so the second episode
-    /// number did not fall *into* a title - it became one, and the destination
-    /// asserted an episode called `E228`.
+    /// A double episode with a release tag and no title. Read short, the second
+    /// episode number would not fall *into* a title - it would become one, and
+    /// the destination would assert an episode called `E228`.
     #[test]
     fn a_double_episode_with_no_title_keeps_both_numbers_and_gains_no_title() {
         assert_eq!(
@@ -1580,8 +1545,8 @@ mod tests {
     }
 
     /// Shapes with no canonical form and no instance in the library. Each is
-    /// refused rather than read short, because reading one short is what issue
-    /// #198 was: a name that quietly asserts less than the file said.
+    /// refused rather than read short, because a name read short quietly
+    /// asserts less than the file said. See D20.
     #[test]
     fn refuses_the_range_shapes_that_have_no_canonical_form() {
         for (path, expected) in [

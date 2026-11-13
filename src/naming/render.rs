@@ -164,7 +164,7 @@ mod tests {
         );
     }
 
-    /// Issue #198: one file holding two episodes states both, and states them
+    /// One file holding two episodes states both, and states them
     /// where a reader and a scanner both look for them - in the marker.
     #[test]
     fn a_double_episode_keeps_both_of_its_numbers() {
