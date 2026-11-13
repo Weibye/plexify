@@ -320,6 +320,7 @@ mod tests {
         AudioAction, Job, MediaFileType, Operation, PostProcessingSettings, QualitySettings,
         SubtitleAction,
     };
+    use crate::test_support::ffmpeg_present;
     use std::process::Stdio;
     use tempfile::TempDir;
 

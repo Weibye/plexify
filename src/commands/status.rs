@@ -487,40 +487,19 @@ pub fn render(status: &QueueStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::{MediaFileType, Operation, PostProcessingSettings, QualitySettings};
     use crate::queue::{JobQueue, HEARTBEAT_INTERVAL};
+    use crate::test_support::{age, mkv_reencode};
     use crate::JobPriority;
     use tempfile::TempDir;
-
-    fn a_job(input: &str, media_root: &Path) -> Job {
-        Job::new(
-            PathBuf::from(input),
-            MediaFileType::Mkv,
-            Operation::Reencode { channels: None },
-            QualitySettings::default(),
-            PostProcessingSettings::default(),
-            media_root,
-        )
-    }
-
-    /// Backdate a file, so a job looks as though nothing has touched it.
-    ///
-    /// Unwrapped throughout: a helper that quietly did nothing would leave the
-    /// stranded test asserting that a *fresh* job is not stranded, which it
-    /// would pass without testing anything.
-    fn age(paths: &[PathBuf], by: Duration) {
-        let when = std::fs::FileTimes::new().set_modified(SystemTime::now() - by);
-        for path in paths {
-            let file = std::fs::File::options().write(true).open(path).unwrap();
-            file.set_times(when).unwrap();
-        }
-    }
 
     /// Claim one job and backdate it, which is exactly what a worker that
     /// stopped checking in `by` ago leaves behind: the job file sits in
     /// `_in_progress` and neither it nor its heartbeat has moved since.
     async fn claim_and_age(queue: &JobQueue, media_root: &Path, input: &str, by: Duration) {
-        queue.enqueue_job(&a_job(input, media_root)).await.unwrap();
+        queue
+            .enqueue_job(&mkv_reencode(input, media_root))
+            .await
+            .unwrap();
 
         let job_name = {
             let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
@@ -583,7 +562,7 @@ mod tests {
         let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
         queue.init().await.unwrap();
 
-        let job = a_job("done.mkv", temp_dir.path());
+        let job = mkv_reencode("done.mkv", temp_dir.path());
         queue.enqueue_job(&job).await.unwrap();
         queue
             .claim_job(JobPriority::None)
@@ -613,7 +592,7 @@ mod tests {
 
         for name in ["one.mkv", "two.mkv", "three.mkv"] {
             queue
-                .enqueue_job(&a_job(name, temp_dir.path()))
+                .enqueue_job(&mkv_reencode(name, temp_dir.path()))
                 .await
                 .unwrap();
         }
@@ -638,7 +617,7 @@ mod tests {
         let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
         queue.init().await.unwrap();
 
-        let job = a_job(
+        let job = mkv_reencode(
             "Series/Elementary/Season 01/Elementary - S01E01.mkv",
             temp_dir.path(),
         );
@@ -740,7 +719,7 @@ mod tests {
         queue.init().await.unwrap();
 
         queue
-            .enqueue_job(&a_job("running.mkv", temp_dir.path()))
+            .enqueue_job(&mkv_reencode("running.mkv", temp_dir.path()))
             .await
             .unwrap();
         let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
@@ -772,7 +751,7 @@ mod tests {
         queue.init().await.unwrap();
 
         queue
-            .enqueue_job(&a_job("long-film.mkv", temp_dir.path()))
+            .enqueue_job(&mkv_reencode("long-film.mkv", temp_dir.path()))
             .await
             .unwrap();
         let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
@@ -803,7 +782,7 @@ mod tests {
         queue.init().await.unwrap();
 
         queue
-            .enqueue_job(&a_job(
+            .enqueue_job(&mkv_reencode(
                 "Movies/Broken (2011)/Broken (2011).mkv",
                 temp_dir.path(),
             ))
@@ -1037,7 +1016,7 @@ mod tests {
 
         for name in ["c.mkv", "a.mkv", "b.mkv"] {
             queue
-                .enqueue_job(&a_job(name, temp_dir.path()))
+                .enqueue_job(&mkv_reencode(name, temp_dir.path()))
                 .await
                 .unwrap();
             let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();

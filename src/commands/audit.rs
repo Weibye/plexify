@@ -624,51 +624,8 @@ fn tally<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::{Command, Stdio};
+    use crate::test_support::{build_test_file, ffmpeg_present};
     use tempfile::TempDir;
-
-    fn ffmpeg_present() -> bool {
-        let available = Command::new("ffmpeg")
-            .arg("-version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-
-        if !available {
-            assert!(
-                std::env::var("CI").is_err(),
-                "FFmpeg must be installed in CI: without it the audit is never run against a real file"
-            );
-            eprintln!("skipping: ffmpeg is not on PATH");
-        }
-
-        available
-    }
-
-    /// A one-second file, encoded the way the argument says.
-    fn build(path: &Path, args: &[&str]) {
-        let built = Command::new("ffmpeg")
-            .args([
-                "-f",
-                "lavfi",
-                "-i",
-                "testsrc=duration=1:size=320x240:rate=24",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=duration=1",
-            ])
-            .args(args)
-            .args(["-y"])
-            .arg(path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
-        assert!(built.success(), "could not build {path:?}");
-    }
 
     #[tokio::test]
     async fn an_empty_directory_audits_to_nothing() {
@@ -709,15 +666,15 @@ mod tests {
             "yuv420p",
         ];
 
-        build(
+        build_test_file(
             &dir.path().join("conforms.mp4"),
             &[&h264[..], &["-c:a", "aac", "-ac", "2"]].concat(),
         );
-        build(
+        build_test_file(
             &dir.path().join("Series/surround.mkv"),
             &[&h264[..], &["-c:a", "aac", "-ac", "6"]].concat(),
         );
-        build(
+        build_test_file(
             &dir.path().join("Series/mpeg4.avi"),
             &["-c:v", "mpeg4", "-c:a", "aac", "-ac", "2"],
         );
@@ -754,7 +711,7 @@ mod tests {
         }
 
         let dir = TempDir::new().unwrap();
-        build(
+        build_test_file(
             &dir.path().join("conforms.mp4"),
             &[
                 "-c:v",
@@ -769,15 +726,15 @@ mod tests {
                 "2",
             ],
         );
-        build(
+        build_test_file(
             &dir.path().join("audio-only.mkv"),
             &["-map", "1:a", "-c:a", "aac"],
         );
         // MKV carries cover art as an attached JPEG, which FFprobe lists as
         // a video stream marked `attached_pic`.
         let cover = dir.path().join("cover.jpg");
-        build(&cover, &["-map", "0:v", "-frames:v", "1"]);
-        build(
+        build_test_file(&cover, &["-map", "0:v", "-frames:v", "1"]);
+        build_test_file(
             &dir.path().join("cover-art.mkv"),
             &[
                 "-map",
@@ -821,7 +778,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         // No audio track: the container is then the only thing that can fail,
         // which is exactly the claim under test.
-        build(&dir.path().join("stalls.avi"), &["-c:v", "mpeg4", "-an"]);
+        build_test_file(&dir.path().join("stalls.avi"), &["-c:v", "mpeg4", "-an"]);
 
         let command = AuditCommand::new(dir.path().to_path_buf(), "lg-cx-webos").unwrap();
         let report = command.execute().await.unwrap();
@@ -850,7 +807,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         for queue_dir in ["_queue", "_in_progress", "_completed", "_failed"] {
             std::fs::create_dir_all(dir.path().join(queue_dir)).unwrap();
-            build(
+            build_test_file(
                 &dir.path().join(queue_dir).join("half-written.mp4"),
                 &["-c:v", "libx264", "-c:a", "aac"],
             );
@@ -1079,7 +1036,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("half-there.mp4");
-        build(
+        build_test_file(
             &path,
             &[
                 "-c:v",
@@ -1142,7 +1099,7 @@ mod tests {
         }
 
         let dir = TempDir::new().unwrap();
-        build(
+        build_test_file(
             &dir.path().join("whole.mp4"),
             &["-c:v", "libx264", "-c:a", "aac"],
         );
@@ -1171,7 +1128,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         std::fs::create_dir_all(dir.path().join("extras")).unwrap();
         std::fs::write(dir.path().join(".plexifyignore"), "extras/\n").unwrap();
-        build(
+        build_test_file(
             &dir.path().join("extras/skipped.mp4"),
             &["-c:v", "libx264", "-c:a", "aac"],
         );

@@ -628,6 +628,7 @@ pub fn assess(relative_path: &Path) -> Assessment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::group;
     use std::fs;
     use tempfile::TempDir;
 
@@ -1096,11 +1097,6 @@ mod tests {
 
     fn key(path: &str) -> EpisodeSortKey {
         sort_key(Path::new(path)).unwrap_or_else(|| panic!("no sort key for {path}"))
-    }
-
-    /// A group written the way a path reads, for an assertion to state.
-    fn group(directories: &str) -> Vec<String> {
-        directories.split('/').map(str::to_string).collect()
     }
 
     /// The year is what tells two shows of one name apart, and it

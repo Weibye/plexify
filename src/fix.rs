@@ -502,6 +502,7 @@ fn is_empty(directory: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::commands::validate::{IssueKind, ValidationIssue};
+    use crate::test_support::touch;
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -525,12 +526,6 @@ mod tests {
         }
     }
 
-    fn touch(root: &Path, relative: &str) {
-        let path = absolute(root, relative);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, "").unwrap();
-    }
-
     #[test]
     fn moves_a_file_to_its_canonical_path() {
         let temp = TempDir::new().unwrap();
@@ -538,6 +533,7 @@ mod tests {
         touch(
             root,
             "Series/Elementary/Season 6/Elementary - S06E08 Sand Trap.mkv",
+            "",
         );
 
         let report = report(
@@ -567,8 +563,8 @@ mod tests {
     fn refuses_to_overwrite_a_file_that_is_already_there() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
-        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.mkv");
-        touch(root, "Series/Show/Season 01/Show - S01E01 - Pilot.mkv");
+        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.mkv", "");
+        touch(root, "Series/Show/Season 01/Show - S01E01 - Pilot.mkv", "");
 
         let report = report(
             root,
@@ -600,8 +596,9 @@ mod tests {
         touch(
             root,
             "Series/Show/Season 01 - The Arc/Show - S01E01 - Pilot.mkv",
+            "",
         );
-        touch(root, "Series/Show/Season 1/Show - S01E01 - Pilot.mkv");
+        touch(root, "Series/Show/Season 1/Show - S01E01 - Pilot.mkv", "");
 
         let destination = "Series/Show/Season 01/Show - S01E01 - Pilot.mkv";
         let report = report(
@@ -633,7 +630,7 @@ mod tests {
     fn corrects_a_marker_that_differs_only_in_case() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
-        touch(root, "Series/Show/Season 01/Show - s01e01 - Pilot.mkv");
+        touch(root, "Series/Show/Season 01/Show - s01e01 - Pilot.mkv", "");
 
         let report = report(
             root,
@@ -683,7 +680,7 @@ mod tests {
     fn reports_a_directory_it_emptied_without_removing_it() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
-        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.mkv");
+        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.mkv", "");
 
         let report = report(
             root,
@@ -706,8 +703,8 @@ mod tests {
     fn leaves_a_directory_off_the_emptied_list_when_something_remains() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
-        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.mkv");
-        touch(root, "Series/Show/Season 1/artwork.tmp");
+        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.mkv", "");
+        touch(root, "Series/Show/Season 1/artwork.tmp", "");
 
         let report = report(
             root,
@@ -726,7 +723,7 @@ mod tests {
     fn writes_the_plan_before_moving_anything() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
-        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.mkv");
+        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.mkv", "");
 
         let report = report(
             root,
@@ -759,7 +756,7 @@ mod tests {
     fn never_overwrites_an_existing_plan_file() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
-        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.mkv");
+        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.mkv", "");
         let plan_file = root.join("plan.json");
         fs::write(&plan_file, "an earlier run's record").unwrap();
 
@@ -800,7 +797,7 @@ mod tests {
     fn planning_alone_changes_nothing() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
-        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.mkv");
+        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.mkv", "");
 
         let report = report(
             root,
@@ -822,8 +819,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
         let show = "Series/Super Best Friends Play - FFX";
-        touch(root, &format!("{show}/Play - S01E13 (1080p60).webm"));
-        touch(root, &format!("{show}/Play - S01E13 (1080p60).vtt"));
+        touch(root, &format!("{show}/Play - S01E13 (1080p60).webm"), "");
+        touch(root, &format!("{show}/Play - S01E13 (1080p60).vtt"), "");
 
         let report = report(
             root,
@@ -845,9 +842,9 @@ mod tests {
     fn a_language_tagged_subtitle_keeps_its_tag() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
-        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.mkv");
-        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.en.srt");
-        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.nfo");
+        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.mkv", "");
+        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.en.srt", "");
+        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.nfo", "");
 
         let report = report(
             root,
@@ -871,9 +868,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
         let season = "Series/Show/Season 1";
-        touch(root, &format!("{season}/Show - S01E01 Pilot.mkv"));
+        touch(root, &format!("{season}/Show - S01E01 Pilot.mkv"), "");
         for suffix in ["eng.srt", "eng.forced.srt", "eng.2.srt", "eng.ass", "srt"] {
-            touch(root, &format!("{season}/Show - S01E01 Pilot.{suffix}"));
+            touch(root, &format!("{season}/Show - S01E01 Pilot.{suffix}"), "");
         }
 
         let report = report(
@@ -903,8 +900,8 @@ mod tests {
     fn another_video_sharing_a_stem_is_not_dragged_along() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
-        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.mkv");
-        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.mp4");
+        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.mkv", "");
+        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.mp4", "");
 
         let report = report(
             root,
@@ -924,10 +921,10 @@ mod tests {
     fn a_blocked_subtitle_holds_back_the_video_too() {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
-        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.mkv");
-        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.srt");
+        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.mkv", "");
+        touch(root, "Series/Show/Season 1/Show - S01E01 Pilot.srt", "");
         // Something already occupies where the subtitle would go.
-        touch(root, "Series/Show/Season 01/Show - S01E01 - Pilot.srt");
+        touch(root, "Series/Show/Season 01/Show - S01E01 - Pilot.srt", "");
 
         let report = report(
             root,
@@ -955,9 +952,13 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let root = temp.path();
         let season = "Series/Show/Season 1";
-        touch(root, &format!("{season}/Show - S01E01 Pilot.mkv"));
-        touch(root, &format!("{season}/Show - S01E01 Pilot.Part2.mkv"));
-        touch(root, &format!("{season}/Show - S01E01 Pilot.Part2.en.srt"));
+        touch(root, &format!("{season}/Show - S01E01 Pilot.mkv"), "");
+        touch(root, &format!("{season}/Show - S01E01 Pilot.Part2.mkv"), "");
+        touch(
+            root,
+            &format!("{season}/Show - S01E01 Pilot.Part2.en.srt"),
+            "",
+        );
 
         let report = report(
             root,
@@ -991,6 +992,7 @@ mod tests {
         touch(
             root,
             "Series/Elementary/Season 6/Elementary - S06E08 Sand Trap.mkv",
+            "",
         );
 
         // What `validate` produces when pointed at the season directory: paths
@@ -1039,7 +1041,7 @@ mod tests {
             "Series/S01E01/Season 01/S01E01 - x.mkv",
             "Anime/Cowboy Bebop/Cowboy Bebop - s01e05 - Ballad.mkv",
         ] {
-            touch(root, path);
+            touch(root, path, "");
         }
 
         let first = apply(&plan(&assess_tree(root)), &root.join("first.json")).unwrap();

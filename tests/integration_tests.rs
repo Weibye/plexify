@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -14,6 +14,22 @@ use plexify::JobPriority;
 /// later test fails behind it.
 const PLEXIFY_BIN: &str = env!("CARGO_BIN_EXE_plexify");
 
+/// `plexify scan <media> --work-dir <work>`, for a test to add to and run.
+fn scan(media: &Path, work: &Path) -> Command {
+    let mut command = Command::new(PLEXIFY_BIN);
+    command.arg("scan").arg(media).arg("--work-dir").arg(work);
+    command
+}
+
+/// Every job file in the queue under `work_root`.
+fn job_files(work_root: &Path) -> Vec<PathBuf> {
+    fs::read_dir(work_root.join("_queue"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension() == Some("job".as_ref()))
+        .collect()
+}
+
 /// Test the complete scan -> clean workflow
 #[test]
 fn test_scan_and_clean_workflow() {
@@ -27,13 +43,7 @@ fn test_scan_and_clean_workflow() {
     fs::write(temp_path.join("video3.webm"), "").unwrap(); // No .vtt file
 
     // Test scan command (use temp_path as both media dir and queue dir)
-    let scan_output = Command::new(PLEXIFY_BIN)
-        .args([
-            "scan",
-            temp_path.to_str().unwrap(),
-            "--work-dir",
-            temp_path.to_str().unwrap(),
-        ])
+    let scan_output = scan(temp_path, temp_path)
         .output()
         .expect("Failed to execute scan command");
 
@@ -56,19 +66,7 @@ fn test_scan_and_clean_workflow() {
     assert!(temp_path.join("_queue").exists());
 
     // Check that job files were created (they will have UUID names now)
-    let queue_dir = temp_path.join("_queue");
-    let job_files: Vec<_> = std::fs::read_dir(&queue_dir)
-        .unwrap()
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let path = entry.path();
-            if path.extension()? == "job" {
-                Some(path)
-            } else {
-                None
-            }
-        })
-        .collect();
+    let job_files = job_files(temp_path);
 
     assert_eq!(job_files.len(), 2, "Expected 2 job files to be created");
 
@@ -158,17 +156,9 @@ fn test_invalid_paths() {
 #[test]
 fn test_scan_refuses_an_unknown_preset() {
     let temp_dir = TempDir::new().unwrap();
-    let temp_path = temp_dir.path().to_str().unwrap();
 
-    let scan_output = Command::new(PLEXIFY_BIN)
-        .args([
-            "scan",
-            temp_path,
-            "--work-dir",
-            temp_path,
-            "--preset",
-            "invalid_preset",
-        ])
+    let scan_output = scan(temp_dir.path(), temp_dir.path())
+        .args(["--preset", "invalid_preset"])
         .output()
         .expect("Failed to execute scan command");
 
@@ -195,16 +185,10 @@ fn test_job_files_contain_complete_details() {
 
     // Run scan command (use temp_path as both media dir and queue dir), with
     // custom settings in its environment to test they're captured
-    let scan_output = Command::new(PLEXIFY_BIN)
+    let scan_output = scan(temp_path, temp_path)
         .env("FFMPEG_PRESET", "fast")
         .env("FFMPEG_CRF", "20")
         .env("FFMPEG_AUDIO_BITRATE", "192k")
-        .args([
-            "scan",
-            temp_path.to_str().unwrap(),
-            "--work-dir",
-            temp_path.to_str().unwrap(),
-        ])
         .output()
         .expect("Failed to execute scan command");
 
@@ -214,18 +198,7 @@ fn test_job_files_contain_complete_details() {
     let queue_dir = temp_path.join("_queue");
     assert!(queue_dir.exists());
 
-    let job_files: Vec<_> = std::fs::read_dir(&queue_dir)
-        .unwrap()
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let path = entry.path();
-            if path.extension()? == "job" {
-                Some(path)
-            } else {
-                None
-            }
-        })
-        .collect();
+    let job_files = job_files(temp_path);
 
     assert_eq!(job_files.len(), 2, "Expected 2 job files to be created");
 
@@ -295,14 +268,8 @@ fn test_work_folder_workflow() {
     fs::write(media_path.join("test_video.mkv"), "fake mkv content").unwrap();
 
     // First, scan to create jobs, with the fastest encoder preset
-    let scan_output = Command::new(PLEXIFY_BIN)
+    let scan_output = scan(&media_path, &work_path)
         .env("FFMPEG_PRESET", "ultrafast")
-        .args([
-            "scan",
-            media_path.to_str().unwrap(),
-            "--work-dir",
-            work_path.to_str().unwrap(),
-        ])
         .output()
         .expect("Failed to run scan command");
 
@@ -316,13 +283,7 @@ fn test_work_folder_workflow() {
     let queue_dir = work_path.join("_queue");
     assert!(queue_dir.exists(), "Queue directory should exist");
 
-    let mut job_files = Vec::new();
-    for entry in fs::read_dir(&queue_dir).unwrap() {
-        let entry = entry.unwrap();
-        if entry.path().extension().unwrap_or_default() == "job" {
-            job_files.push(entry.path());
-        }
-    }
+    let job_files = job_files(&work_path);
     assert!(
         !job_files.is_empty(),
         "Should have created at least one job file"
@@ -400,10 +361,7 @@ fn test_add_command_individual_files() {
     let queue_dir = temp_path.join("_queue");
     assert!(queue_dir.exists(), "Queue directory should exist");
 
-    let job_count = fs::read_dir(&queue_dir)
-        .unwrap()
-        .filter(|entry| entry.as_ref().unwrap().path().extension() == Some("job".as_ref()))
-        .count();
+    let job_count = job_files(temp_path).len();
     assert_eq!(job_count, 2, "Should have created 2 job files");
 
     // Test error case: WebM without subtitle
@@ -468,13 +426,7 @@ fn test_hierarchical_directory_scanning() {
     fs::write(temp_path.join("TV Shows/Show2/episode.mkv"), "").unwrap();
 
     // Run scan command
-    let scan_output = Command::new(PLEXIFY_BIN)
-        .args([
-            "scan",
-            temp_path.to_str().unwrap(),
-            "--work-dir",
-            temp_path.to_str().unwrap(),
-        ])
+    let scan_output = scan(temp_path, temp_path)
         .output()
         .expect("Failed to execute scan command");
 
@@ -513,10 +465,7 @@ fn test_hierarchical_directory_scanning() {
     let queue_dir = temp_path.join("_queue");
     assert!(queue_dir.exists());
 
-    let job_count = std::fs::read_dir(&queue_dir)
-        .unwrap()
-        .filter(|entry| entry.as_ref().unwrap().path().extension() == Some("job".as_ref()))
-        .count();
+    let job_count = job_files(temp_path).len();
 
     assert_eq!(job_count, 5);
 
@@ -568,33 +517,15 @@ fn test_absolute_paths_in_jobs() {
     .unwrap();
 
     // Run scan command from a different directory
-    let scan_output = Command::new(PLEXIFY_BIN)
+    let scan_output = scan(&media_path, &work_path)
         .current_dir(&scan_from_path)
-        .args([
-            "scan",
-            media_path.to_str().unwrap(),
-            "--work-dir",
-            work_path.to_str().unwrap(),
-        ])
         .output()
         .expect("Failed to execute scan command");
 
     assert!(scan_output.status.success(), "Scan command failed");
 
     // Verify jobs were created
-    let queue_dir = work_path.join("_queue");
-    let job_files: Vec<_> = fs::read_dir(&queue_dir)
-        .unwrap()
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let path = entry.path();
-            if path.extension()? == "job" {
-                Some(path)
-            } else {
-                None
-            }
-        })
-        .collect();
+    let job_files = job_files(&work_path);
 
     assert_eq!(job_files.len(), 2, "Should have created 2 job files");
 
@@ -671,14 +602,8 @@ fn test_plexifyignore_integration() {
     fs::write(temp_path.join("movie.mkv"), "").unwrap();
 
     // Test scan command with debug logging to see ignore messages
-    let scan_output = Command::new(PLEXIFY_BIN)
+    let scan_output = scan(temp_path, temp_path)
         .env("RUST_LOG", "info")
-        .args([
-            "scan",
-            temp_path.to_str().unwrap(),
-            "--work-dir",
-            temp_path.to_str().unwrap(),
-        ])
         .output()
         .expect("Failed to execute scan command");
 
@@ -700,19 +625,7 @@ fn test_plexifyignore_integration() {
     );
 
     // Verify only non-ignored files were processed
-    let queue_dir = temp_path.join("_queue");
-    let job_files: Vec<_> = fs::read_dir(&queue_dir)
-        .unwrap()
-        .filter_map(|entry| {
-            let entry = entry.ok()?;
-            let path = entry.path();
-            if path.extension()? == "job" {
-                Some(path)
-            } else {
-                None
-            }
-        })
-        .collect();
+    let job_files = job_files(temp_path);
 
     // Should only create jobs for Anime/episode1.mkv and movie.mkv (2 jobs)
     assert_eq!(job_files.len(), 2, "Expected 2 job files to be created");
@@ -774,13 +687,7 @@ async fn test_episode_prioritization_integration() {
         fs::write(&path, "dummy content").unwrap();
     }
 
-    let scan_output = Command::new(PLEXIFY_BIN)
-        .args([
-            "scan",
-            temp_path.to_str().unwrap(),
-            "--work-dir",
-            temp_path.to_str().unwrap(),
-        ])
+    let scan_output = scan(temp_path, temp_path)
         .output()
         .expect("Failed to run scan command");
 
@@ -837,13 +744,7 @@ fn test_work_priority_defaults() {
     fs::write(temp_path.join("movie.mkv"), "dummy content").unwrap();
 
     // Scan to create a job
-    let scan_output = Command::new(PLEXIFY_BIN)
-        .args([
-            "scan",
-            temp_path.to_str().unwrap(),
-            "--work-dir",
-            temp_path.to_str().unwrap(),
-        ])
+    let scan_output = scan(temp_path, temp_path)
         .output()
         .expect("Failed to run scan command");
 
@@ -881,33 +782,19 @@ fn test_rescanning_a_library_does_not_duplicate_jobs() {
     fs::write(temp_path.join("video1.mkv"), "").unwrap();
     fs::write(temp_path.join("video2.mkv"), "").unwrap();
 
-    let count_jobs = || {
-        std::fs::read_dir(temp_path.join("_queue"))
-            .unwrap()
-            .filter_map(|entry| {
-                let path = entry.ok()?.path();
-                (path.extension()? == "job").then_some(path)
-            })
-            .count()
-    };
+    let count_jobs = || job_files(temp_path).len();
 
-    let scan = || {
-        let output = Command::new(PLEXIFY_BIN)
-            .args([
-                "scan",
-                temp_path.to_str().unwrap(),
-                "--work-dir",
-                temp_path.to_str().unwrap(),
-            ])
+    let scan_succeeds = || {
+        let output = scan(temp_path, temp_path)
             .output()
             .expect("Failed to execute scan command");
         assert!(output.status.success(), "Scan command failed");
     };
 
-    scan();
+    scan_succeeds();
     assert_eq!(count_jobs(), 2, "first scan should queue both files");
 
-    scan();
+    scan_succeeds();
     assert_eq!(
         count_jobs(),
         2,
@@ -1230,13 +1117,7 @@ fn test_status_tells_an_empty_queue_apart_from_a_misaddressed_one() {
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path();
 
-    let scan = Command::new(PLEXIFY_BIN)
-        .args([
-            "scan",
-            temp_path.to_str().unwrap(),
-            "--work-dir",
-            temp_path.to_str().unwrap(),
-        ])
+    let scan = scan(temp_path, temp_path)
         .output()
         .expect("Failed to execute scan command");
     assert!(scan.status.success());
@@ -1300,13 +1181,7 @@ fn test_status_reports_a_scanned_queue_without_changing_it() {
     fs::write(temp_path.join("one.mkv"), "").unwrap();
     fs::write(temp_path.join("two.mkv"), "").unwrap();
 
-    let scan = Command::new(PLEXIFY_BIN)
-        .args([
-            "scan",
-            temp_path.to_str().unwrap(),
-            "--work-dir",
-            temp_path.to_str().unwrap(),
-        ])
+    let scan = scan(temp_path, temp_path)
         .output()
         .expect("Failed to execute scan command");
     assert!(scan.status.success());
@@ -1459,13 +1334,7 @@ fn clean_refuses_rather_than_blocking_when_there_is_no_terminal() {
 
     fs::write(temp_path.join("video1.mkv"), "").unwrap();
 
-    let scan = Command::new(PLEXIFY_BIN)
-        .args([
-            "scan",
-            temp_path.to_str().unwrap(),
-            "--work-dir",
-            temp_path.to_str().unwrap(),
-        ])
+    let scan = scan(temp_path, temp_path)
         .output()
         .expect("Failed to execute scan command");
     assert!(scan.status.success(), "Scan command failed");
@@ -1530,13 +1399,7 @@ fn clean_dry_run_reports_without_deleting() {
 
     fs::write(temp_path.join("video1.mkv"), "").unwrap();
 
-    let scan = Command::new(PLEXIFY_BIN)
-        .args([
-            "scan",
-            temp_path.to_str().unwrap(),
-            "--work-dir",
-            temp_path.to_str().unwrap(),
-        ])
+    let scan = scan(temp_path, temp_path)
         .output()
         .expect("Failed to execute scan command");
     assert!(scan.status.success(), "Scan command failed");

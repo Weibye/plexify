@@ -299,6 +299,7 @@ fn report_completion(job_name: &str, disposition: CompletionDisposition) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::mkv_reencode;
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -319,8 +320,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_job_whose_output_already_exists_is_completed_without_transcoding() {
-        use crate::job::{Job, MediaFileType, Operation, PostProcessingSettings, QualitySettings};
-
         let temp_dir = TempDir::new().unwrap();
         let media_root = temp_dir.path();
 
@@ -330,14 +329,7 @@ mod tests {
         let queue = JobQueue::new(media_root.to_path_buf(), media_root.to_path_buf());
         queue.init().await.unwrap();
 
-        let job = Job::new(
-            PathBuf::from("show.mkv"),
-            MediaFileType::Mkv,
-            Operation::Reencode { channels: None },
-            QualitySettings::default(),
-            PostProcessingSettings::default(),
-            media_root,
-        );
+        let job = mkv_reencode("show.mkv", media_root);
         queue.enqueue_job(&job).await.unwrap();
 
         let work_cmd = WorkCommand::new(

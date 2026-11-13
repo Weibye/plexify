@@ -557,7 +557,7 @@ fn identify(job_file: &Path, job: Option<&Job>) -> JobIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::{Job, MediaFileType, Operation, PostProcessingSettings, QualitySettings};
+    use crate::test_support::mkv_reencode;
     use tempfile::TempDir;
 
     /// Says yes, and records that it was asked.
@@ -606,7 +606,7 @@ mod tests {
             true
         }
         fn ask(&mut self, _question: &str) -> Result<bool> {
-            let job = job_for("/media/ClaimedLate.mkv");
+            let job = mkv_reencode("/media/ClaimedLate.mkv", Path::new("/media"));
             let path = self
                 .work_root
                 .join(QueueDirectory::InProgress.on_disk_name())
@@ -635,17 +635,6 @@ mod tests {
         }
     }
 
-    fn job_for(input: &str) -> Job {
-        Job::new(
-            PathBuf::from(input),
-            MediaFileType::Mkv,
-            Operation::Reencode { channels: None },
-            QualitySettings::default(),
-            PostProcessingSettings::default(),
-            Path::new("/media"),
-        )
-    }
-
     /// A work root with one job in each of the four directories.
     async fn populated_work_root() -> TempDir {
         let temp = TempDir::new().unwrap();
@@ -658,7 +647,7 @@ mod tests {
             (QueueDirectory::Completed, "/media/Done.mkv"),
             (QueueDirectory::Failed, "/media/Broken.mkv"),
         ] {
-            let mut job = job_for(input);
+            let mut job = mkv_reencode(input, Path::new("/media"));
             if directory == QueueDirectory::Failed {
                 job.attempts = 3;
                 job.last_error = Some("ffmpeg exited with 1".to_string());
@@ -893,7 +882,7 @@ mod tests {
         let queue = JobQueue::new(temp.path().to_path_buf(), temp.path().to_path_buf());
         queue.init().await.unwrap();
 
-        let job = job_for("/media/Stranded.mkv");
+        let job = mkv_reencode("/media/Stranded.mkv", Path::new("/media"));
         let path = queue.in_progress_dir.join(job.job_filename());
         async_fs::write(&path, serde_json::to_string_pretty(&job).unwrap())
             .await
@@ -971,7 +960,7 @@ mod tests {
         let queue = JobQueue::new(temp.path().to_path_buf(), temp.path().to_path_buf());
         queue.init().await.unwrap();
 
-        let job = job_for("/media/Waiting.mkv");
+        let job = mkv_reencode("/media/Waiting.mkv", Path::new("/media"));
         async_fs::write(
             queue.queue_dir.join(job.job_filename()),
             serde_json::to_string_pretty(&job).unwrap(),
@@ -1099,7 +1088,7 @@ mod tests {
         write_unreadable_job(&queue, QueueDirectory::Failed).await;
         // A readable one beside it, so this is about the report being complete
         // rather than about it being empty.
-        let readable = job_for("/media/Broken.mkv");
+        let readable = mkv_reencode("/media/Broken.mkv", Path::new("/media"));
         async_fs::write(
             queue.failed_dir.join(readable.job_filename()),
             serde_json::to_string_pretty(&readable).unwrap(),

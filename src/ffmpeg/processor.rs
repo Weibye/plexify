@@ -466,6 +466,7 @@ mod tests {
     use super::*;
     use crate::ffmpeg::test_support::*;
     use crate::job::{AudioAction, PostProcessingSettings, QualitySettings, SubtitleAction};
+    use crate::test_support::{ffmpeg_present, mkv_reencode};
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -862,14 +863,7 @@ mod tests {
     }
 
     fn transcode(input: &Path) -> PathBuf {
-        let job = Job::new(
-            input.to_path_buf(),
-            MediaFileType::Mkv,
-            Operation::Reencode { channels: None },
-            QualitySettings::default(),
-            PostProcessingSettings::default(),
-            input.parent().expect("input has a parent"),
-        );
+        let job = mkv_reencode(input, input.parent().expect("input has a parent"));
         let work_folder = input.parent().expect("input has a parent");
 
         let runtime = tokio::runtime::Runtime::new().unwrap();

@@ -261,6 +261,7 @@ fn positive(value: &Value, key: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{build_test_file, ffmpeg_present};
     use std::process::Stdio;
 
     const H264_AAC: &str = r#"{
@@ -392,26 +393,6 @@ mod tests {
         assert!(parse("ffprobe: command not found").is_err());
     }
 
-    fn ffmpeg_present() -> bool {
-        let available = Command::new("ffmpeg")
-            .arg("-version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-
-        if !available {
-            assert!(
-                std::env::var("CI").is_err(),
-                "FFmpeg must be installed in CI: this is the only check that the probe reads a real file rather than a fixture"
-            );
-            eprintln!("skipping: ffmpeg is not on PATH");
-        }
-
-        available
-    }
-
     #[test]
     fn probes_a_real_file() {
         if !ffmpeg_present() {
@@ -420,16 +401,9 @@ mod tests {
 
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("sample.mp4");
-        let built = Command::new("ffmpeg")
-            .args([
-                "-f",
-                "lavfi",
-                "-i",
-                "testsrc=duration=1:size=320x240:rate=24",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=duration=1",
+        build_test_file(
+            &path,
+            &[
                 "-c:v",
                 "libx264",
                 "-profile:v",
@@ -440,14 +414,8 @@ mod tests {
                 "aac",
                 "-ac",
                 "2",
-                "-y",
-            ])
-            .arg(&path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .unwrap();
-        assert!(built.success(), "could not build the test source");
+            ],
+        );
 
         let probe = probe(&path).unwrap();
         let video = probe.video.expect("the file has a video stream");
