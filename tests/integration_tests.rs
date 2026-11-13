@@ -372,7 +372,7 @@ fn test_add_command_individual_files() {
     // is read from stderr along with every other one.
     let add_mkv_log = String::from_utf8_lossy(&add_mkv_output.stderr);
     assert!(
-        add_mkv_log.contains("Successfully created transcoding job"),
+        add_mkv_log.contains(r#"Queueing re-encode job for: "movie.mkv""#),
         "Should create job for MKV file"
     );
 
@@ -392,7 +392,7 @@ fn test_add_command_individual_files() {
     assert!(add_webm_output.status.success(), "Add WebM command failed");
     let add_webm_log = String::from_utf8_lossy(&add_webm_output.stderr);
     assert!(
-        add_webm_log.contains("Successfully created transcoding job"),
+        add_webm_log.contains(r#"Queueing re-encode job for: "video.webm""#),
         "Should create job for WebM file with subtitles"
     );
 

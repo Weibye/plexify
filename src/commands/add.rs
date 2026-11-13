@@ -1,8 +1,7 @@
 use anyhow::{anyhow, Result};
 use std::path::PathBuf;
-use tracing::{info, warn};
+use tracing::info;
 
-use crate::job::MediaFileType;
 use crate::queue::JobQueue;
 
 use super::job_processor::{operation_for, JobProcessResult, JobProcessor, JobProcessorConfig};
@@ -34,11 +33,11 @@ impl AddCommand {
 
         info!("📄 Processing file: {:?}", self.file_path);
 
-        // Determine file type from extension
         let file_type =
             JobProcessor::determine_file_type(&self.file_path).map_err(|err| anyhow!(err))?;
 
-        // Get the directory containing the file (this will be our media root)
+        // The file's own directory is the media root, so the job's paths are
+        // resolved against it.
         let media_root = self
             .file_path
             .parent()
@@ -53,55 +52,27 @@ impl AddCommand {
         let queue = JobQueue::new(media_root.clone(), self.work_root.clone());
         queue.init().await?;
 
-        // Get relative path from media root
         let relative_path = self
             .file_path
             .strip_prefix(&media_root)
             .map_err(|_| anyhow!("Unable to create relative path for: {:?}", self.file_path))?
             .to_path_buf();
 
-        // Process the file
         let processor = JobProcessor::new(&queue, &self.config, &media_root);
         // `add` names one file and asks no client about it, so the extension
         // decides. `scan --target` is where a conformance check belongs.
+        let operation = operation_for(&file_type);
         let result = processor
-            .process_media_file(&relative_path, file_type.clone(), operation_for(&file_type))
+            .process_media_file(&relative_path, file_type, operation)
             .await?;
 
-        // Handle the result
-        match result {
-            JobProcessResult::Created => match file_type {
-                MediaFileType::WebM => {
-                    info!(
-                        "✅ Successfully created transcoding job for: {:?}",
-                        relative_path
-                    );
-                }
-                MediaFileType::Mkv => {
-                    info!(
-                        "✅ Successfully created transcoding job for: {:?} (embedded subs assumed)",
-                        relative_path
-                    );
-                }
-                MediaFileType::Avi => {
-                    info!("✅ Successfully created remux job for: {:?}", relative_path);
-                }
-            },
-            JobProcessResult::OutputExists => {
-                warn!("⚠️ Output file already exists for: {:?}", relative_path);
-                info!("✅ No action needed - output file already exists.");
-            }
-            JobProcessResult::AlreadyQueued => {
-                warn!("⚠️ Job already exists in queue for: {:?}", relative_path);
-                info!("✅ No action needed - job already queued.");
-            }
-            JobProcessResult::MissingSubtitle => {
-                return Err(anyhow!(
-                    "Missing required subtitle file (.vtt) for WebM file: {:?}",
-                    self.file_path
-                ));
-            }
+        if result == JobProcessResult::MissingSubtitle {
+            return Err(anyhow!(
+                "Missing required subtitle file (.vtt) for WebM file: {:?}",
+                self.file_path
+            ));
         }
+        processor.log_result(&relative_path, operation, &result);
 
         Ok(())
     }
@@ -113,6 +84,16 @@ mod tests {
     use crate::job::QualityPreset;
     use std::fs;
     use tempfile::TempDir;
+
+    /// Every job `add` left in the queue under `work_root`.
+    fn queued_jobs(work_root: &std::path::Path) -> Vec<crate::job::Job> {
+        fs::read_dir(work_root.join("_queue"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension() == Some("job".as_ref()))
+            .map(|path| serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap())
+            .collect()
+    }
 
     #[tokio::test]
     async fn test_add_webm_file_with_subtitle() {
@@ -127,19 +108,13 @@ mod tests {
 
         let add_cmd = AddCommand::new(webm_file, temp_dir.path().to_path_buf(), Default::default());
 
-        let result = add_cmd.execute().await;
-        assert!(result.is_ok());
+        add_cmd.execute().await.unwrap();
 
-        // Verify queue directory was created
-        let queue_dir = temp_dir.path().join("_queue");
-        assert!(queue_dir.exists());
-
-        // Verify job file was created
-        let job_count = fs::read_dir(&queue_dir)
-            .unwrap()
-            .filter(|entry| entry.as_ref().unwrap().path().extension() == Some("job".as_ref()))
-            .count();
-        assert_eq!(job_count, 1);
+        assert_eq!(
+            queued_jobs(temp_dir.path()).len(),
+            1,
+            "video.webm is queued beside its video.vtt"
+        );
     }
 
     #[tokio::test]
@@ -153,19 +128,9 @@ mod tests {
 
         let add_cmd = AddCommand::new(mkv_file, temp_dir.path().to_path_buf(), Default::default());
 
-        let result = add_cmd.execute().await;
-        assert!(result.is_ok());
+        add_cmd.execute().await.unwrap();
 
-        // Verify queue directory was created
-        let queue_dir = temp_dir.path().join("_queue");
-        assert!(queue_dir.exists());
-
-        // Verify job file was created
-        let job_count = fs::read_dir(&queue_dir)
-            .unwrap()
-            .filter(|entry| entry.as_ref().unwrap().path().extension() == Some("job".as_ref()))
-            .count();
-        assert_eq!(job_count, 1);
+        assert_eq!(queued_jobs(temp_dir.path()).len(), 1, "video.mkv is queued");
     }
 
     #[tokio::test]
@@ -243,16 +208,15 @@ mod tests {
             },
         );
 
-        let result = add_cmd.execute().await;
-        assert!(result.is_ok());
+        add_cmd.execute().await.unwrap();
 
-        // Verify job was created
-        let queue_dir = temp_dir.path().join("_queue");
-        let job_count = fs::read_dir(&queue_dir)
-            .unwrap()
-            .filter(|entry| entry.as_ref().unwrap().path().extension() == Some("job".as_ref()))
-            .count();
-        assert_eq!(job_count, 1);
+        let jobs = queued_jobs(temp_dir.path());
+        assert_eq!(jobs.len(), 1, "video.mkv is queued");
+        assert_eq!(
+            jobs[0].quality_settings,
+            QualityPreset::Quality.to_quality_settings(),
+            "the job for video.mkv carries the preset it was added with"
+        );
     }
 
     #[tokio::test]
@@ -260,26 +224,19 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let media_path = temp_dir.path();
 
-        // Create test files
         let mkv_file = media_path.join("video.mkv");
-        let mp4_file = media_path.join("video.mp4"); // Output already exists
+        let mp4_file = media_path.join("video.mp4");
         fs::write(&mkv_file, "").unwrap();
         fs::write(&mp4_file, "").unwrap();
 
         let add_cmd = AddCommand::new(mkv_file, temp_dir.path().to_path_buf(), Default::default());
 
-        let result = add_cmd.execute().await;
-        assert!(result.is_ok());
+        add_cmd.execute().await.unwrap();
 
-        // Verify no job was created since output already exists
-        let queue_dir = temp_dir.path().join("_queue");
-        if queue_dir.exists() {
-            let job_count = fs::read_dir(&queue_dir)
-                .unwrap()
-                .filter(|entry| entry.as_ref().unwrap().path().extension() == Some("job".as_ref()))
-                .count();
-            assert_eq!(job_count, 0);
-        }
+        assert!(
+            queued_jobs(temp_dir.path()).is_empty(),
+            "video.mkv is not queued, because video.mp4 already exists"
+        );
     }
 
     #[tokio::test]

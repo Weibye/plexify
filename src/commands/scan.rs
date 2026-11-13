@@ -31,7 +31,7 @@ pub struct ScanCommand {
     work_root: PathBuf,
     config: JobProcessorConfig,
     /// The clients every queued file has to play on. Empty means none was
-    /// named, and the extension decides as it did before.
+    /// named, and the extension decides.
     targets: Vec<PlaybackTarget>,
 }
 
@@ -176,7 +176,7 @@ impl ScanCommand {
             let result = processor
                 .process_media_file(path, file_type.clone(), operation)
                 .await?;
-            processor.log_result(path, file_type, &result);
+            processor.log_result(path, operation, &result);
 
             if result == JobProcessResult::Created {
                 job_count += 1;
@@ -220,9 +220,9 @@ impl ScanCommand {
 
     /// What each file needs, asked of every target.
     ///
-    /// With no target named nothing is probed and the extension decides, which
-    /// is what this command did before it could ask. Naming a target costs one
-    /// FFprobe per file, and no more than one however many targets are named.
+    /// With no target named nothing is probed and the extension decides. Naming
+    /// a target costs one FFprobe per file, and no more than one however many
+    /// targets are named.
     async fn resolve(&self, files: &[(PathBuf, MediaFileType)]) -> Result<Vec<Resolution>> {
         if self.targets.is_empty() {
             return Ok(files
@@ -328,21 +328,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_scan_with_preset() {
-        let temp_dir = TempDir::new().unwrap();
-        let scan_cmd = ScanCommand::new(
-            temp_dir.path().to_path_buf(),
-            temp_dir.path().to_path_buf(),
-            quality(),
-            &[],
-        )
-        .unwrap();
-
-        let result = scan_cmd.execute().await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
     async fn test_scan_hierarchical_directories() {
         let temp_dir = TempDir::new().unwrap();
         let media_root = temp_dir.path();
@@ -390,8 +375,11 @@ mod tests {
             })
             .collect();
 
-        // Should have 4 jobs: 2 webm files with subtitles + 2 mkv files
-        assert_eq!(job_files.len(), 4);
+        assert_eq!(
+            job_files.len(),
+            4,
+            "episode1.webm and deep.webm with their .vtt, episode2.mkv and movie1.mkv"
+        );
     }
 
     #[tokio::test]
@@ -422,13 +410,12 @@ mod tests {
         let queue_dir = temp_dir.path().join("_queue");
         assert!(queue_dir.exists());
 
-        // Should find all 3 mkv files regardless of nesting depth
         let job_count = fs::read_dir(&queue_dir)
             .unwrap()
             .filter(|entry| entry.as_ref().unwrap().path().extension() == Some("job".as_ref()))
             .count();
 
-        assert_eq!(job_count, 3);
+        assert_eq!(job_count, 3, "root.mkv, l1.mkv and deep.mkv at any depth");
     }
 
     #[tokio::test]
@@ -472,9 +459,10 @@ mod tests {
             .filter(|entry| entry.as_ref().unwrap().path().extension() == Some("job".as_ref()))
             .count();
 
-        // Should create jobs for: 2 webm files with VTT + 3 mkv files = 5 jobs
-        // (video2.webm without VTT should be skipped)
-        assert_eq!(job_count, 5);
+        assert_eq!(
+            job_count, 5,
+            "video1.webm and mixed1.webm with their .vtt and the three .mkv,              but not webm_folder/video2.webm, which has none"
+        );
     }
 
     fn ffmpeg_present() -> bool {
@@ -563,10 +551,11 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let media_root = temp_dir.path();
 
-        // H.264 high, 8-bit, stereo AAC: what the Chromecast is observed to
-        // Direct Play, in an MKV that only needs its container changed.
+        // H.264 high, 8-bit, stereo AAC in Matroska: what the Chromecast is
+        // observed to Direct Play. An MKV rather than an MP4, because scan
+        // never reads an MP4, so one would not be queued whatever it held.
         build(
-            &media_root.join("conforms.mp4"),
+            &media_root.join("conforms.mkv"),
             &[
                 "-c:v",
                 "libx264",
@@ -607,8 +596,6 @@ mod tests {
         .await
         .unwrap();
 
-        // The MP4 is not a job because nothing needs doing to it - not because
-        // scan does not look at MP4s, which it never has.
         assert_eq!(
             queued(media_root),
             vec![(
@@ -663,6 +650,98 @@ mod tests {
                 "{path:?} is neither work nor a file that already plays"
             );
         }
+    }
+
+    /// Run a scan and return what it logged, as `main`'s subscriber prints it.
+    fn logs_of(scan: ScanCommand) -> String {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        // While only one dispatcher is registered, tracing decides whether a
+        // log line is wanted by asking the dispatcher of whichever thread
+        // reaches it first. That is often another test's thread, which has
+        // none, and the answer "never" is cached for every thread. A second
+        // registered dispatcher makes it ask all of them.
+        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
+
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(scan.execute())
+                .unwrap()
+        });
+        let logs = sink.0.lock().unwrap().clone();
+        String::from_utf8(logs).unwrap()
+    }
+
+    /// The log says what a job does, which a target decides rather than the
+    /// extension: against the Chromecast an MPEG-4 AVI is a re-encode, and an
+    /// MKV whose only fault is 5.1 audio is a remux.
+    #[test]
+    fn a_queued_job_is_logged_by_what_it_does() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+        build(
+            &media_root.join("film.avi"),
+            &["-c:v", "mpeg4", "-c:a", "aac", "-ac", "2"],
+        );
+        build(
+            &media_root.join("surround.mkv"),
+            &[
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                "high",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-ac",
+                "6",
+            ],
+        );
+
+        let logs = logs_of(
+            ScanCommand::new(
+                media_root.to_path_buf(),
+                media_root.to_path_buf(),
+                JobProcessorConfig::default(),
+                &["chromecast-gen2-3".to_string()],
+            )
+            .unwrap(),
+        );
+
+        assert!(
+            logs.contains(r#"Queueing re-encode job for: "film.avi""#),
+            "film.avi is a re-encode against the Chromecast: {logs}"
+        );
+        assert!(
+            logs.contains(r#"Queueing remux job for: "surround.mkv""#),
+            "surround.mkv is a remux against the Chromecast: {logs}"
+        );
     }
 
     /// The rule that decides a quarter of this library. The LG decodes MPEG-4
@@ -732,8 +811,7 @@ mod tests {
     /// target's envelope, and the copy the first was playing is not kept.
     ///
     /// This is a description of a gap, not of an intended behaviour, and it
-    /// asserts what the code does today so that changing it is deliberate
-    /// (#180).
+    /// asserts what the code does so that changing it is deliberate.
     /// `resolve_one` folds every target's answer into one `Operation` and
     /// `Job::new` derives one output from the input's name, so a pair of
     /// clients that disagree has exactly one destination to land in - and
@@ -787,7 +865,10 @@ mod tests {
         .execute()
         .await
         .unwrap();
-        assert!(queued_jobs(&lg_only).is_empty());
+        assert!(
+            queued_jobs(&lg_only).is_empty(),
+            "legacy.mkv already plays on the LG"
+        );
 
         let both = media_root.join("both");
         fs::create_dir_all(&both).unwrap();
@@ -842,7 +923,7 @@ mod tests {
             .filter(|entry| entry.as_ref().unwrap().path().extension() == Some("job".as_ref()))
             .count();
 
-        assert_eq!(job_count, 2);
+        assert_eq!(job_count, 2, "film.avi and episode.mkv, but not done.mp4");
     }
 
     #[tokio::test]
@@ -887,8 +968,10 @@ mod tests {
             .filter(|entry| entry.as_ref().unwrap().path().extension() == Some("job".as_ref()))
             .count();
 
-        // Should only create jobs for Anime/episode1.mkv and movie.mkv (2 jobs)
-        assert_eq!(job_count, 2);
+        assert_eq!(
+            job_count, 2,
+            "Anime/episode1.mkv and movie.mkv, but nothing under Downloads/ or tools/"
+        );
     }
 
     #[tokio::test]
@@ -933,9 +1016,10 @@ mod tests {
             .filter(|entry| entry.as_ref().unwrap().path().extension() == Some("job".as_ref()))
             .count();
 
-        // Should create jobs for: Series/show.mkv, Series/important.mkv, movie.mkv (3 jobs)
-        // Should ignore: test.tmp (root pattern), Series/old/episode.mkv (nested pattern)
-        assert_eq!(job_count, 3);
+        assert_eq!(
+            job_count, 3,
+            "Series/show.mkv, Series/important.mkv and movie.mkv,              but not Series/old/episode.mkv, which the nested rule ignores"
+        );
     }
 
     #[tokio::test]
@@ -955,7 +1039,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(queued_jobs(&work).is_empty());
+        assert!(
+            queued_jobs(&work).is_empty(),
+            "Extras/bonus.mkv is ignored by the library root's rule"
+        );
     }
 
     #[tokio::test]

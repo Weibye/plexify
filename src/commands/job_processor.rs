@@ -1,11 +1,12 @@
 use anyhow::Result;
 use std::path::Path;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::job::{
     AudioAction, Job, MediaFileType, Operation, PostProcessingSettings, QualityPreset,
     QualitySettings, SubtitleAction,
 };
+use crate::paths::to_forward_slashes;
 use crate::queue::JobQueue;
 
 /// Shared job processing configuration.
@@ -53,27 +54,25 @@ pub enum JobProcessResult {
     MissingSubtitle,
 }
 
-/// What to do to a file, decided from its extension.
+/// What to do to a file when no client was asked, decided from its extension.
 ///
-/// A placeholder for the conformance check (#158), which decides it from what
-/// the file and the target actually hold. Everything here is measured, but the
-/// extension is not what makes it true:
+/// `scan --target` asks what the file and the target hold instead. The
+/// extension is not what makes these answers true, but they are measured on
+/// this library:
 ///
 /// - All 598 `.avi` files carry MPEG-4 or H.264 video both targets decode, and
 ///   MP3 or AC-3 audio. Only the container is wrong, so the video is copied.
 /// - No `.avi` in this library carries a subtitle stream, and 586 of the 598
 ///   need a full re-encode for the Chromecast whatever happens to the audio.
 ///   So copying the audio and keeping a track list that is always empty costs
-///   nothing measurable today - and both answers become the target's to give
-///   the moment #158 lands.
+///   nothing measurable.
 pub(crate) fn operation_for(file_type: &MediaFileType) -> Operation {
     match file_type {
         MediaFileType::Avi => Operation::Remux {
             audio: AudioAction::Copy,
             subtitles: SubtitleAction::Keep,
         },
-        // No client was asked, so no cap is known. `scan --target` is
-        // where one comes from.
+        // No client was asked, so no channel cap is known.
         MediaFileType::WebM | MediaFileType::Mkv => Operation::Reencode { channels: None },
     }
 }
@@ -101,7 +100,6 @@ impl<'a> JobProcessor<'a> {
         file_type: MediaFileType,
         operation: Operation,
     ) -> Result<JobProcessResult> {
-        // Create the job
         let job = Job::new(
             relative_path.to_path_buf(),
             file_type.clone(),
@@ -111,56 +109,44 @@ impl<'a> JobProcessor<'a> {
             self.media_root,
         );
 
-        // Check if output already exists
         if job.output_exists(Some(self.media_root)) {
-            debug!("Output already exists for: {:?}", relative_path);
             return Ok(JobProcessResult::OutputExists);
         }
 
-        // Check if job already exists in queue
         if self.queue.job_exists(&job).await? {
-            debug!("Job already exists for: {:?}", relative_path);
             return Ok(JobProcessResult::AlreadyQueued);
         }
 
-        // For WebM files, check if required subtitle file exists
         if file_type == MediaFileType::WebM && !job.has_required_subtitle(Some(self.media_root))? {
             return Ok(JobProcessResult::MissingSubtitle);
         }
 
-        // Create the job
         self.queue.enqueue_job(&job).await?;
 
         Ok(JobProcessResult::Created)
     }
 
-    /// Log the result of job processing with appropriate messages
+    /// Say what became of one file, and for a queued one, what its job does.
     pub fn log_result(
         &self,
         relative_path: &Path,
-        file_type: &MediaFileType,
+        operation: Operation,
         result: &JobProcessResult,
     ) {
+        let path = to_forward_slashes(relative_path);
         match result {
-            JobProcessResult::Created => match file_type {
-                MediaFileType::WebM => {
-                    info!("➕ Queueing job for: {:?}", relative_path);
-                }
-                MediaFileType::Mkv => {
-                    info!(
-                        "➕ Queueing job for: {:?} (embedded subs assumed)",
-                        relative_path
-                    );
-                }
-                MediaFileType::Avi => {
-                    info!("➕ Queueing remux job for: {:?}", relative_path);
-                }
-            },
+            JobProcessResult::Created => {
+                let work = match operation {
+                    Operation::Remux { .. } => "remux",
+                    Operation::Reencode { .. } => "re-encode",
+                };
+                info!("➕ Queueing {work} job for: {path:?}");
+            }
             JobProcessResult::OutputExists => {
-                // Only debug log for scan command, add command handles this differently
+                info!("⏭️ Not queued, because its output already exists: {path:?}");
             }
             JobProcessResult::AlreadyQueued => {
-                // Only debug log for scan command, add command handles this differently
+                info!("⏭️ Not queued, because it already has a job: {path:?}");
             }
             JobProcessResult::MissingSubtitle => {
                 warn!(
@@ -213,7 +199,6 @@ mod tests {
         clear_encoding_env();
 
         let config = JobProcessorConfig::from_preset(Some(QualityPreset::Quality));
-        // Just verify it doesn't panic and creates a config
         assert_eq!(config.quality_settings.ffmpeg_preset, "slow");
     }
 
@@ -223,7 +208,6 @@ mod tests {
         clear_encoding_env();
 
         let config = JobProcessorConfig::from_preset(None);
-        // Just verify it doesn't panic and creates a config with defaults
         assert_eq!(config.quality_settings.ffmpeg_preset, "veryfast");
     }
 
@@ -290,7 +274,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(result, JobProcessResult::Created));
+        assert!(
+            matches!(result, JobProcessResult::Created),
+            "video.mkv is queued"
+        );
     }
 
     #[tokio::test]
@@ -320,7 +307,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(result, JobProcessResult::Created));
+        assert!(
+            matches!(result, JobProcessResult::Created),
+            "video.webm is queued beside its video.vtt"
+        );
     }
 
     #[tokio::test]
@@ -348,6 +338,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(matches!(result, JobProcessResult::MissingSubtitle));
+        assert!(
+            matches!(result, JobProcessResult::MissingSubtitle),
+            "video.webm has no video.vtt"
+        );
     }
 }
