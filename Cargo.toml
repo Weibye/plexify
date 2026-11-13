@@ -2,7 +2,8 @@
 name = "plexify"
 version = "0.1.0"
 edition = "2021"
-description = "A simple, distributed media transcoding CLI tool"
+rust-version = "1.85"
+description = "Standardises a Plex library: names files the way Plex reads them and converts what its clients cannot Direct Play"
 license = "MIT"
 readme = "README.md"
 homepage = "https://github.com/Weibye/plexify"
@@ -30,7 +31,6 @@ toml = "1.1.4"
 serial_test = "4.0.1"
 tempfile = "3.8"
 criterion = { version = "0.8", features = ["html_reports"] }
-rayon = "1.8"
 
 [[bench]]
 name = "validate_bench"

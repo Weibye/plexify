@@ -15,9 +15,10 @@ parse:  Series/Elementary/Season 6/Elementary - S06E08 Sand Trap.mkv
 render: Series/Elementary/Season 06/Elementary - S06E08 - Sand Trap.mkv
 ```
 
-**A path is correct exactly when rendering its own parse reproduces it.** That is the whole
-definition, and it is why validation and renaming are the same code path: the destination is
-whatever `render` produces, never a patched-up copy of the input string.
+**A path is correct exactly when rendering its own parse reproduces it**
+([D19](../../../docs/decisions.md#19-a-name-is-correct-when-it-survives-parse-and-render)). That is why validation
+and renaming are the same code path: the destination is whatever `render` produces, never a
+patched-up copy of the input string.
 
 Three files, and the split matters when changing them:
 
@@ -50,18 +51,14 @@ Rules that hold across every entry:
   usually something a person curated — the One Piece arcs in the observed library carry their
   episode ranges. It is dropped only when the file is moving to a different season, which the
   old arc name does not describe. `Specials` keeps its own name.
-
-  This was the other way round once, on the strength of a forum thread. The library itself
-  settled it: three arc-named Critical Role seasons all render correctly, and the one season
-  that failed to appear in Plex was the one whose *files* carried no `SxxExx` marker. The
-  marker is what Plex reads; the directory name is decoration.
 - `SxxExx` markers are uppercase. One file holding two episodes states both, glued to the
   marker with a bare hyphen: `Charmed - S04E01-E02 - Charmed Again.avi`, where the second
   number is the last episode covered. A bare `S01E01-02` is not read as a range, because a
   number that does not say it is an episode could be a part number and reading it as one
   would invent a value. `S01E01-S01E02`, `S01E01-E02-E03` and `S01E01-E02.5` are matched and
   then **refused**: none is in the library, and a marker that stopped short of them would
-  hand the remainder to the title, which is the bug in #198 one episode along.
+  hand the remainder to the title
+  ([D20](../../../docs/decisions.md#20-a-multi-episode-marker-is-read-whole-or-refused)).
 - A dash with surrounding spaces separates series name, episode marker, and episode title.
 - Quality metadata goes in square brackets and comes after the title, with no dash before
   it: `... - Uno [1080p].mkv`.
@@ -86,9 +83,8 @@ Constraints that are easy to get wrong:
   file, and the next run moves it again. `what_is_rendered_parses_back_to_the_same_fields`
   and `every_proposed_destination_is_itself_canonical` guard this; keep both passing.
 - **A stable round trip is not a lossless one.** Those tests ask whether a destination would
-  be renamed again, which a parse that quietly discarded half the marker also satisfies —
-  that is how a double episode was proposed a name saying it holds one. Whatever the parser
-  drops, it has to be something no grammar reads as a value:
+  be renamed again, which a parse that quietly discarded half the marker also satisfies.
+  Whatever the parser drops, it has to be something no grammar reads as a value:
   `a_marker_never_stops_in_the_middle_of_a_marker` is the check with teeth here, and adding a
   form to the marker means adding it there too.
 - **Rules apply per path component.** A component with no rule is preserved, and the series
@@ -111,8 +107,8 @@ an ordinary title in capitals survives.
 
 ## Canonical test cases
 
-These come from issue #51 and are the acceptance bar for any renaming work. The fixture
-built by the `media-fixture` skill contains all of them.
+These are the acceptance bar for any renaming work. The fixture built by the
+`media-fixture` skill contains all of them.
 
 | Input | Expected |
 |---|---|
@@ -124,11 +120,8 @@ built by the `media-fixture` skill contains all of them.
 | `Series/Veronica Mars/Series/Veronica Mars S02E04/Season 01/...` | invalid, reported, not rewritten |
 
 Note the third case: unrecoverable scene-release cruft is discarded rather than guessed at.
-Only quality metadata worth keeping (resolution, frame rate) survives.
-
-The fifth case is written differently here than in #51. That issue expected the file to stay
-loose in the series directory, because nothing created season directories at the time; #86
-supersedes it, and the file now moves into `Season 01`.
+Only quality metadata worth keeping (resolution, frame rate) survives. In the fifth, the loose
+file moves into the season directory its marker names.
 
 ## Renaming safely
 
@@ -136,16 +129,18 @@ Any code that renames files in a real library has to assume it will be run on a 
 user cannot easily reconstruct:
 
 - Report the proposed destination as a full path from the media root. A bare
-  `Season 01/file.mkv` is ambiguous and has previously led to files being moved into
-  `Season 6/Season 01/` instead of replacing the season directory.
+  `Season 01/file.mkv` is ambiguous: it reads as `Season 6/Season 01/` as easily as a
+  replacement for `Season 6`.
 - Rewriting a season directory means **replacing** that path component, not appending to the
   original path.
 - Refuse to overwrite an existing destination, and refuse a destination that two sources
   both resolve to.
 - Dry-run is the default; actually moving files is opt-in.
 
-`src/fix.rs` implements all of that and is the only place a library file is moved. Two things
-about it are easy to break by accident:
+`src/fix.rs` implements all of that. Only `fix.rs` and `undo.rs` give a library file another
+media name ([D31](../../../docs/decisions.md#31-only-fix-and-undo-give-a-library-file-another-media-name)); `work`
+writes to the library only to deliver its output and retire the source. Two things about
+`fix.rs` are easy to break by accident:
 
 - **Sidecars move with their media file.** A `.vtt` left behind when its `.webm` is renamed
   breaks the pairing `work` depends on, and does it silently. The group moves together or

@@ -27,7 +27,6 @@ jobs:
       uses: dtolnay/rust-toolchain@master
       with:
         toolchain: ${{ matrix.rust }}
-        components: rustfmt, clippy
 
     # The transcoding tests are the only check that every stream survives a
     # conversion, and they skip themselves when FFmpeg is missing. The runner
@@ -35,6 +34,10 @@ jobs:
     # which is why they refuse to skip when CI is set.
     - name: Install FFmpeg
       run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+    # Some test results depend on the FFmpeg version (D26), so the log names it.
+    - name: FFmpeg version
+      run: ffmpeg -version
 
     - name: Cache cargo dependencies
       uses: actions/cache@v6

@@ -22,15 +22,14 @@ this one red.
 repository they have reliably meant a refactor landed only halfway, with a new abstraction
 built and the old call sites never migrated.
 
-**Then check the PR's CI.** It runs on Ubuntu with a different FFmpeg, plus a dependency
-audit that has no local equivalent. A green local run is not a finished change.
+**Then check the PR's CI.** A green local run is not a finished change; see
+[D26](../../../docs/decisions.md#26-linux-ci-is-the-oracle).
 
 ## Flaky tests
 
-`cargo test` runs tests in parallel threads of a single process, and this codebase reads
-FFMPEG-prefixed environment variables as process-wide global state. A test touching those
-variables without `#[serial(env)]` will pass in isolation and fail intermittently in a full
-run.
+A test that reads or sets an `FFMPEG_*` variable without `#[serial(env)]` passes alone and
+fails at random in a full run; see
+[D25](../../../docs/decisions.md#25-environment-variables-are-global-state).
 
 If a test fails, re-run it two ways before concluding anything:
 
