@@ -456,11 +456,7 @@ impl Job {
         post_processing: PostProcessingSettings,
         media_root: &Path,
     ) -> Self {
-        let absolute_input_path = if input_path.is_absolute() {
-            input_path
-        } else {
-            media_root.join(&input_path)
-        };
+        let absolute_input_path = resolve(&input_path, Some(media_root));
 
         let output_path = absolute_input_path.with_extension("mp4");
 
@@ -489,64 +485,31 @@ impl Job {
         format!("{}.job", self.id)
     }
 
-    /// Check if the output file already exists (works with both absolute and relative paths)
+    /// Whether the output file already exists.
     pub fn output_exists(&self, media_root: Option<&Path>) -> bool {
-        let output_path = if self.output_path.is_absolute() {
-            self.output_path.clone()
-        } else {
-            match media_root {
-                Some(root) => root.join(&self.output_path),
-                None => self.output_path.clone(),
-            }
-        };
-        output_path.exists()
+        self.full_output_path(media_root).exists()
     }
 
-    /// For WebM files, check if the required subtitle file exists (works with both absolute and relative paths)
+    /// For WebM files, whether the required subtitle file exists.
     pub fn has_required_subtitle(&self, media_root: Option<&Path>) -> Result<bool> {
         match self.file_type {
-            MediaFileType::WebM => {
-                if let Some(subtitle_path) = &self.subtitle_path {
-                    let full_subtitle_path = if subtitle_path.is_absolute() {
-                        subtitle_path.clone()
-                    } else {
-                        match media_root {
-                            Some(root) => root.join(subtitle_path),
-                            None => subtitle_path.clone(),
-                        }
-                    };
-                    Ok(full_subtitle_path.exists())
-                } else {
-                    Err(anyhow!("WebM job should have subtitle path"))
-                }
-            }
+            MediaFileType::WebM => match self.full_subtitle_path(media_root) {
+                Some(subtitle_path) => Ok(subtitle_path.exists()),
+                None => Err(anyhow!("WebM job should have subtitle path")),
+            },
             // MKV and AVI carry their own subtitles.
             MediaFileType::Mkv | MediaFileType::Avi => Ok(true),
         }
     }
 
-    /// Get the full input path (for absolute paths, returns as-is; for relative paths, joins with media_root)
+    /// Where the input is on disk. See [`resolve`].
     pub fn full_input_path(&self, media_root: Option<&Path>) -> PathBuf {
-        if self.input_path.is_absolute() {
-            self.input_path.clone()
-        } else {
-            match media_root {
-                Some(root) => root.join(&self.input_path),
-                None => self.input_path.clone(),
-            }
-        }
+        resolve(&self.input_path, media_root)
     }
 
-    /// Get the full output path (for absolute paths, returns as-is; for relative paths, joins with media_root)
+    /// Where the output goes on disk. See [`resolve`].
     pub fn full_output_path(&self, media_root: Option<&Path>) -> PathBuf {
-        if self.output_path.is_absolute() {
-            self.output_path.clone()
-        } else {
-            match media_root {
-                Some(root) => root.join(&self.output_path),
-                None => self.output_path.clone(),
-            }
-        }
+        resolve(&self.output_path, media_root)
     }
 
     /// Get the work folder output path (where the file is written during transcoding)
@@ -560,18 +523,12 @@ impl Job {
         work_folder.join(format!("{}_{}", self.id, output_filename))
     }
 
-    /// Get the full subtitle path if it exists (for absolute paths, returns as-is; for relative paths, joins with media_root)
+    /// Where the sidecar subtitle is on disk, for a job that has one. See
+    /// [`resolve`].
     pub fn full_subtitle_path(&self, media_root: Option<&Path>) -> Option<PathBuf> {
-        self.subtitle_path.as_ref().map(|path| {
-            if path.is_absolute() {
-                path.clone()
-            } else {
-                match media_root {
-                    Some(root) => root.join(path),
-                    None => path.clone(),
-                }
-            }
-        })
+        self.subtitle_path
+            .as_deref()
+            .map(|path| resolve(path, media_root))
     }
 
     /// Where this job's input sits in the order episodes should be worked in.
@@ -657,16 +614,23 @@ impl Job {
     }
 }
 
+/// Where a path a job stores is on disk.
+///
+/// `Job::new` stores absolute paths, and `join` returns those unchanged. A
+/// job file written before that holds paths relative to the media root, which
+/// are joined to `root`; with no root, such a path stays relative to the
+/// working directory.
+fn resolve(path: &Path, root: Option<&Path>) -> PathBuf {
+    match root {
+        Some(root) => root.join(path),
+        None => path.to_path_buf(),
+    }
+}
+
 impl QualitySettings {
-    /// Create quality settings from environment variables with defaults
+    /// The `fast` preset, with any `FFMPEG_*` overrides.
     pub fn from_env() -> Self {
-        use std::env;
-        Self {
-            ffmpeg_preset: env::var("FFMPEG_PRESET").unwrap_or_else(|_| "veryfast".to_string()),
-            ffmpeg_crf: env::var("FFMPEG_CRF").unwrap_or_else(|_| "23".to_string()),
-            ffmpeg_audio_bitrate: env::var("FFMPEG_AUDIO_BITRATE")
-                .unwrap_or_else(|_| "128k".to_string()),
-        }
+        Self::from_preset(QualityPreset::Fast)
     }
 
     /// Create quality settings from a preset, with optional environment variable overrides
@@ -717,12 +681,9 @@ impl QualityPreset {
 }
 
 impl Default for QualitySettings {
+    /// The `fast` preset, without the environment's overrides.
     fn default() -> Self {
-        Self {
-            ffmpeg_preset: "veryfast".to_string(),
-            ffmpeg_crf: "23".to_string(),
-            ffmpeg_audio_bitrate: "128k".to_string(),
-        }
+        QualityPreset::Fast.to_quality_settings()
     }
 }
 
@@ -1352,6 +1313,92 @@ mod tests {
             job.post_processing.disable_source_files,
             deserialized.post_processing.disable_source_files
         );
+    }
+
+    /// A job file outlives the code that wrote it, so a file in today's format
+    /// has to keep loading as the same job, with the same id, at the same
+    /// paths.
+    #[test]
+    fn a_job_file_loads_as_the_job_that_wrote_it() {
+        let written = r#"{
+            "id": "03f29441-af05-5e6f-9241-8fe50e38a26c",
+            "input_path": "/media/Series/Show/Season 01/Show - S01E01.webm",
+            "output_path": "/media/Series/Show/Season 01/Show - S01E01.mp4",
+            "subtitle_path": "/media/Series/Show/Season 01/Show - S01E01.vtt",
+            "file_type": "WebM",
+            "operation": { "Reencode": { "channels": null } },
+            "quality_settings": {
+                "ffmpeg_preset": "veryfast",
+                "ffmpeg_crf": "23",
+                "ffmpeg_audio_bitrate": "128k"
+            },
+            "post_processing": { "disable_source_files": true },
+            "attempts": 0
+        }"#;
+
+        let job = Job::new(
+            PathBuf::from("/media/Series/Show/Season 01/Show - S01E01.webm"),
+            MediaFileType::WebM,
+            Operation::Reencode { channels: None },
+            QualitySettings::default(),
+            PostProcessingSettings::default(),
+            Path::new("/media"),
+        );
+        assert_eq!(
+            serde_json::to_value(&job).unwrap(),
+            serde_json::from_str::<serde_json::Value>(written).unwrap()
+        );
+
+        let loaded: Job = serde_json::from_str(written).unwrap();
+        assert_eq!(loaded, job);
+        assert_eq!(loaded.id, Job::id_for_input(&loaded.input_path));
+
+        for root in [None, Some(Path::new("/media"))] {
+            assert_eq!(loaded.full_input_path(root), job.input_path);
+            assert_eq!(loaded.full_output_path(root), job.output_path);
+            assert_eq!(loaded.full_subtitle_path(root), job.subtitle_path);
+        }
+    }
+
+    /// Job files once stored paths relative to the media root. Every way a job
+    /// reaches the disk has to find them there.
+    #[test]
+    fn a_relative_job_file_resolves_against_the_media_root() {
+        let legacy = r#"{
+            "id": "b0a1c2d3-0000-0000-0000-000000000000",
+            "input_path": "Series/Show/Show - S01E01.webm",
+            "output_path": "Series/Show/Show - S01E01.mp4",
+            "subtitle_path": "Series/Show/Show - S01E01.vtt",
+            "file_type": "WebM",
+            "quality_settings": {
+                "ffmpeg_preset": "veryfast",
+                "ffmpeg_crf": "23",
+                "ffmpeg_audio_bitrate": "128k"
+            },
+            "post_processing": { "disable_source_files": true }
+        }"#;
+        let job: Job = serde_json::from_str(legacy).unwrap();
+
+        let media_root = tempfile::tempdir().unwrap();
+        let show = media_root.path().join("Series").join("Show");
+        std::fs::create_dir_all(&show).unwrap();
+        std::fs::write(show.join("Show - S01E01.mp4"), "").unwrap();
+        std::fs::write(show.join("Show - S01E01.vtt"), "").unwrap();
+
+        let root = Some(media_root.path());
+        assert_eq!(job.full_input_path(root), show.join("Show - S01E01.webm"));
+        assert_eq!(job.full_output_path(root), show.join("Show - S01E01.mp4"));
+        assert_eq!(
+            job.full_subtitle_path(root),
+            Some(show.join("Show - S01E01.vtt"))
+        );
+        assert!(job.output_exists(root));
+        assert!(job.has_required_subtitle(root).unwrap());
+
+        // Without a root the paths stay relative to the working directory,
+        // where this library is not.
+        assert!(!job.output_exists(None));
+        assert!(!job.has_required_subtitle(None).unwrap());
     }
 
     #[test]
