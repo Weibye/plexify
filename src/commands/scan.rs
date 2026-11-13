@@ -286,6 +286,7 @@ fn resolve_one(media: Result<MediaProbe>, targets: &[PlaybackTarget]) -> Resolut
 mod tests {
     use super::*;
     use crate::job::{AudioAction, QualityPreset, SubtitleAction};
+    use crate::test_support::{build_test_file, ffmpeg_present, logs_of, queued_jobs};
     use std::fs;
     use std::path::Path;
     use tempfile::TempDir;
@@ -465,64 +466,6 @@ mod tests {
         );
     }
 
-    fn ffmpeg_present() -> bool {
-        let available = std::process::Command::new("ffmpeg")
-            .arg("-version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-
-        if !available {
-            assert!(
-                std::env::var("CI").is_err(),
-                "FFmpeg must be installed in CI: these tests are the only check that a scan asks a real file what it needs"
-            );
-            eprintln!("skipping: ffmpeg is not on PATH");
-        }
-
-        available
-    }
-
-    fn build(path: &Path, args: &[&str]) {
-        let built = std::process::Command::new("ffmpeg")
-            .args([
-                "-f",
-                "lavfi",
-                "-i",
-                "testsrc=duration=1:size=160x120:rate=10",
-                "-f",
-                "lavfi",
-                "-i",
-                "sine=duration=1",
-            ])
-            .args(args)
-            .arg("-y")
-            .arg(path)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap();
-        assert!(built.success(), "could not build {path:?}");
-    }
-
-    /// Every job the queue holds, ordered by the file it transcodes.
-    fn queued_jobs(work_root: &Path) -> Vec<crate::job::Job> {
-        let mut jobs: Vec<crate::job::Job> = fs::read_dir(work_root.join("_queue"))
-            .unwrap()
-            .filter_map(|entry| {
-                let path = entry.ok()?.path();
-                if path.extension()? != "job" {
-                    return None;
-                }
-                serde_json::from_str(&fs::read_to_string(&path).ok()?).ok()
-            })
-            .collect();
-        jobs.sort_by(|left, right| left.input_path.cmp(&right.input_path));
-        jobs
-    }
-
     /// Every job the queue holds, by the file it transcodes.
     fn queued(work_root: &Path) -> Vec<(String, Operation)> {
         queued_jobs(work_root)
@@ -554,7 +497,7 @@ mod tests {
         // H.264 high, 8-bit, stereo AAC in Matroska: what the Chromecast is
         // observed to Direct Play. An MKV rather than an MP4, because scan
         // never reads an MP4, so one would not be queued whatever it held.
-        build(
+        build_test_file(
             &media_root.join("conforms.mkv"),
             &[
                 "-c:v",
@@ -569,7 +512,7 @@ mod tests {
                 "2",
             ],
         );
-        build(
+        build_test_file(
             &media_root.join("surround.mkv"),
             &[
                 "-c:v",
@@ -620,13 +563,13 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let media_root = temp_dir.path();
         let audio_only = media_root.join("audio-only.mkv");
-        build(&audio_only, &["-map", "1:a", "-c:a", "aac"]);
+        build_test_file(&audio_only, &["-map", "1:a", "-c:a", "aac"]);
         // MKV carries cover art as an attached JPEG, which FFprobe lists as
         // a video stream marked `attached_pic`.
         let cover = media_root.join("cover.jpg");
-        build(&cover, &["-map", "0:v", "-frames:v", "1"]);
+        build_test_file(&cover, &["-map", "0:v", "-frames:v", "1"]);
         let cover_art = media_root.join("cover-art.mkv");
-        build(
+        build_test_file(
             &cover_art,
             &[
                 "-map",
@@ -652,47 +595,6 @@ mod tests {
         }
     }
 
-    /// Run a scan and return what it logged, as `main`'s subscriber prints it.
-    fn logs_of(scan: ScanCommand) -> String {
-        use std::sync::{Arc, Mutex};
-
-        #[derive(Clone, Default)]
-        struct Sink(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Sink {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        // While only one dispatcher is registered, tracing decides whether a
-        // log line is wanted by asking the dispatcher of whichever thread
-        // reaches it first. That is often another test's thread, which has
-        // none, and the answer "never" is cached for every thread. A second
-        // registered dispatcher makes it ask all of them.
-        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
-
-        let sink = Sink::default();
-        let writer = sink.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::with_default(subscriber, || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(scan.execute())
-                .unwrap()
-        });
-        let logs = sink.0.lock().unwrap().clone();
-        String::from_utf8(logs).unwrap()
-    }
-
     /// The log says what a job does, which a target decides rather than the
     /// extension: against the Chromecast an MPEG-4 AVI is a re-encode, and an
     /// MKV whose only fault is 5.1 audio is a remux.
@@ -704,11 +606,11 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let media_root = temp_dir.path();
-        build(
+        build_test_file(
             &media_root.join("film.avi"),
             &["-c:v", "mpeg4", "-c:a", "aac", "-ac", "2"],
         );
-        build(
+        build_test_file(
             &media_root.join("surround.mkv"),
             &[
                 "-c:v",
@@ -724,15 +626,18 @@ mod tests {
             ],
         );
 
-        let logs = logs_of(
-            ScanCommand::new(
-                media_root.to_path_buf(),
-                media_root.to_path_buf(),
-                JobProcessorConfig::default(),
-                &["chromecast-gen2-3".to_string()],
-            )
-            .unwrap(),
-        );
+        let scan = ScanCommand::new(
+            media_root.to_path_buf(),
+            media_root.to_path_buf(),
+            JobProcessorConfig::default(),
+            &["chromecast-gen2-3".to_string()],
+        )
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (_, logs) = logs_of(|| runtime.block_on(scan.execute()).unwrap());
 
         assert!(
             logs.contains(r#"Queueing re-encode job for: "film.avi""#),
@@ -755,7 +660,7 @@ mod tests {
 
         let temp_dir = TempDir::new().unwrap();
         let media_root = temp_dir.path();
-        build(
+        build_test_file(
             &media_root.join("film.avi"),
             &["-c:v", "mpeg4", "-c:a", "aac", "-ac", "2"],
         );
@@ -833,7 +738,7 @@ mod tests {
 
         // MPEG-4 video in Matroska, stereo AAC. Nothing but the video codec
         // separates the two targets on it.
-        build(&source, &["-c:v", "mpeg4", "-c:a", "aac", "-ac", "2"]);
+        build_test_file(&source, &["-c:v", "mpeg4", "-c:a", "aac", "-ac", "2"]);
 
         let probed = crate::probe::probe(&source).unwrap();
         assert!(
