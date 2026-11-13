@@ -792,7 +792,7 @@ async fn test_episode_prioritization_integration() {
 
     let queue = JobQueue::new(temp_path.to_path_buf(), temp_path.to_path_buf());
     let mut claimed_order = Vec::new();
-    while let Some(claimed) = queue.claim_job(Some(JobPriority::Episode)).await.unwrap() {
+    while let Some(claimed) = queue.claim_job(JobPriority::Episode).await.unwrap() {
         claimed_order.push(
             claimed
                 .job
