@@ -264,8 +264,8 @@ impl StatusCommand {
 /// The `.job` files in a queue directory, or `None` if the directory is not
 /// there at all.
 ///
-/// Only `.job` files count. `_queue` also holds the `.lock` directories enqueue
-/// uses, and `_in_progress` holds `.heartbeat` files and `.chunks` directories;
+/// Only `.job` files count. `_queue` may hold `.lock` directories an older
+/// version left, and `_in_progress` holds `.heartbeat` files and `.chunks` directories;
 /// none of those is a job and counting one would inflate the answer.
 ///
 /// "Not there" is the only absence that reads as an empty directory. Every other
@@ -500,6 +500,7 @@ mod tests {
     use super::*;
     use crate::job::{MediaFileType, Operation, PostProcessingSettings, QualitySettings};
     use crate::queue::{JobQueue, HEARTBEAT_INTERVAL};
+    use crate::JobPriority;
     use tempfile::TempDir;
 
     fn a_job(input: &str, media_root: &Path) -> Job {
@@ -533,7 +534,7 @@ mod tests {
         queue.enqueue_job(&a_job(input, media_root)).await.unwrap();
 
         let job_name = {
-            let claimed = queue.claim_job(None).await.unwrap().unwrap();
+            let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
             claimed.job_name().to_string()
         };
 
@@ -596,7 +597,7 @@ mod tests {
         let job = a_job("done.mkv", temp_dir.path());
         queue.enqueue_job(&job).await.unwrap();
         queue
-            .claim_job(None)
+            .claim_job(JobPriority::None)
             .await
             .unwrap()
             .unwrap()
@@ -628,8 +629,8 @@ mod tests {
                 .unwrap();
         }
 
-        // An interrupted enqueue leaves a `.lock` directory behind. It is not a
-        // job and must not be counted as one.
+        // An older version's interrupted enqueue left a `.lock` directory
+        // behind. It is not a job and must not be counted as one.
         std::fs::create_dir(queue.queue_dir.join("abandoned.job.lock")).unwrap();
 
         let status = StatusCommand::new(temp_dir.path().to_path_buf())
@@ -657,7 +658,7 @@ mod tests {
         // Claiming and dropping the claim is exactly what an interrupted worker
         // leaves behind: the job file stays put and the heartbeat stops.
         let job_name = {
-            let claimed = queue.claim_job(None).await.unwrap().unwrap();
+            let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
             claimed.job_name().to_string()
         };
 
@@ -753,7 +754,7 @@ mod tests {
             .enqueue_job(&a_job("running.mkv", temp_dir.path()))
             .await
             .unwrap();
-        let claimed = queue.claim_job(None).await.unwrap().unwrap();
+        let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
 
         let status = StatusCommand::new(temp_dir.path().to_path_buf())
             .execute()
@@ -785,7 +786,7 @@ mod tests {
             .enqueue_job(&a_job("long-film.mkv", temp_dir.path()))
             .await
             .unwrap();
-        let claimed = queue.claim_job(None).await.unwrap().unwrap();
+        let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
         let in_progress = queue.in_progress_dir.join(claimed.job_name());
 
         // Only the job file is aged; the heartbeat stays fresh.
@@ -821,7 +822,7 @@ mod tests {
             .unwrap();
 
         for _ in 0..MAX_ATTEMPTS {
-            let claimed = queue.claim_job(None).await.unwrap().unwrap();
+            let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
             claimed
                 .fail("Opening input\nStream mapping failed\nNo such file or directory")
                 .await
@@ -1050,13 +1051,13 @@ mod tests {
                 .enqueue_job(&a_job(name, temp_dir.path()))
                 .await
                 .unwrap();
-            let claimed = queue.claim_job(None).await.unwrap().unwrap();
+            let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
             claimed.fail("first failure").await.unwrap();
         }
 
         // Park them all, so `_failed` holds three jobs in filesystem order.
         for _ in 0..(MAX_ATTEMPTS - 1) {
-            while let Some(claimed) = queue.claim_job(None).await.unwrap() {
+            while let Some(claimed) = queue.claim_job(JobPriority::None).await.unwrap() {
                 claimed.fail("later failure").await.unwrap();
             }
         }

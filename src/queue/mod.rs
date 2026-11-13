@@ -5,6 +5,7 @@ use tokio::fs as async_fs;
 use tracing::{debug, info, warn};
 
 use crate::job::Job;
+use crate::JobPriority;
 
 /// How many times a job may fail before it is parked in `_failed` instead of
 /// being handed back to the queue.
@@ -76,26 +77,22 @@ pub struct JobQueue {
 impl JobQueue {
     /// Create a new job queue with queue directory separate from media directory
     pub fn new(media_root: PathBuf, queue_root: PathBuf) -> Self {
-        let queue_dir = queue_root.join("_queue");
-        let in_progress_dir = queue_root.join("_in_progress");
-        let completed_dir = queue_root.join("_completed");
-        let failed_dir = queue_root.join("_failed");
+        let dir = |directory: QueueDirectory| queue_root.join(directory.on_disk_name());
 
         Self {
+            queue_dir: dir(QueueDirectory::Queue),
+            in_progress_dir: dir(QueueDirectory::InProgress),
+            completed_dir: dir(QueueDirectory::Completed),
+            failed_dir: dir(QueueDirectory::Failed),
             media_root,
-            queue_dir,
-            in_progress_dir,
-            completed_dir,
-            failed_dir,
         }
     }
 
     /// Initialize queue directories
     pub async fn init(&self) -> Result<()> {
-        async_fs::create_dir_all(&self.queue_dir).await?;
-        async_fs::create_dir_all(&self.in_progress_dir).await?;
-        async_fs::create_dir_all(&self.completed_dir).await?;
-        async_fs::create_dir_all(&self.failed_dir).await?;
+        for directory in QueueDirectory::ALL {
+            async_fs::create_dir_all(self.path_of(directory)).await?;
+        }
         Ok(())
     }
 
@@ -119,22 +116,15 @@ impl JobQueue {
             .await
             .map_err(|e| anyhow!("Failed to create job file: {e}"))?;
 
-        // A lock directory left in the queue by an older writer is debris: names
-        // are no longer claimed that way, and a job now sits beside it.
-        let _ = async_fs::remove_dir(self.queue_dir.join(format!("{job_filename}.lock"))).await;
-
         debug!("Created job: {}", job_filename);
         Ok(())
     }
 
-    /// Atomically claim a job from the queue with optional prioritization
-    pub async fn claim_job(
-        &self,
-        priority: Option<crate::JobPriority>,
-    ) -> Result<Option<ClaimedJob<'_>>> {
+    /// Atomically claim a job from the queue, in the order `priority` asks for.
+    pub async fn claim_job(&self, priority: JobPriority) -> Result<Option<ClaimedJob<'_>>> {
         match priority {
-            Some(crate::JobPriority::Episode) => self.claim_prioritized_job().await,
-            _ => self.claim_first_available_job().await,
+            JobPriority::Episode => self.claim_prioritized_job().await,
+            JobPriority::None => self.claim_first_available_job().await,
         }
     }
 
@@ -383,15 +373,14 @@ impl JobQueue {
             }
 
             match reclaimed {
-                Reclaimed::Lost => debug!("Another worker got to {job_name} first"),
-                Reclaimed::Counted { parked: false, .. } => {
+                Reclaimed::Attempt(FailureDisposition::Lost) => {
+                    debug!("Another worker got to {job_name} first")
+                }
+                Reclaimed::Attempt(FailureDisposition::Requeued { .. }) => {
                     info!("♻️ Reclaimed abandoned job: {job_name}");
                     outcome.reclaimed.push(job_name);
                 }
-                Reclaimed::Counted {
-                    attempts,
-                    parked: true,
-                } => {
+                Reclaimed::Attempt(FailureDisposition::Parked { attempts }) => {
                     warn!(
                         "🚫 {job_name} has taken down {attempts} workers; parking it in _failed."
                     );
@@ -426,8 +415,8 @@ impl JobQueue {
     /// forever, at the cost of a worker each time round rather than ten seconds.
     /// It is the same loop `_failed` exists to break, so it ends the same way.
     ///
-    /// [`Reclaimed::Lost`] means the job is not this sweep's to move, which is
-    /// not an error: the loser of a race simply does nothing.
+    /// [`FailureDisposition::Lost`] means the job is not this sweep's to move,
+    /// which is not an error: the loser of a race simply does nothing.
     ///
     /// The caller's staleness check is only a way of not disturbing claims that
     /// are obviously live. It cannot be the decision, because the sweep reads
@@ -458,7 +447,7 @@ impl JobQueue {
         let job_last_written = modified_at(in_progress_path).await;
 
         let Some(taken_path) = take_for_move(in_progress_path).await? else {
-            return Ok(Reclaimed::Lost);
+            return Ok(Reclaimed::Attempt(FailureDisposition::Lost));
         };
         let taken_path = taken_path.as_path();
 
@@ -478,7 +467,7 @@ impl JobQueue {
             // Putting it back cannot land on anything: this sweep holds the only
             // copy, and while it does, no scan re-enqueues the input.
             async_fs::rename(taken_path, in_progress_path).await?;
-            return Ok(Reclaimed::Lost);
+            return Ok(Reclaimed::Attempt(FailureDisposition::Lost));
         }
 
         let content = async_fs::read_to_string(taken_path)
@@ -497,37 +486,60 @@ impl JobQueue {
             }
         };
 
-        job.attempts += 1;
-        job.last_error = Some(format!(
+        let error = format!(
             "the worker running this job stopped without finishing it (attempt {})",
-            job.attempts
-        ));
+            job.attempts + 1
+        );
+        let disposition = self
+            .record_attempt(taken_path, job_name, &mut job, &error)
+            .await?;
+        Ok(Reclaimed::Attempt(disposition))
+    }
+
+    /// Count a failed attempt against a job its caller has taken, and move the
+    /// job on: back to `_queue`, or to `_failed` once it has had
+    /// [`MAX_ATTEMPTS`].
+    ///
+    /// [`ClaimedJob::fail`] and the sweep both end here, so they cannot disagree
+    /// on what an attempt is or when a job is parked.
+    ///
+    /// The count lives in the job file rather than in its name, because the name
+    /// is the v5 id of the input and is what makes the queue addressable.
+    ///
+    /// `taken_path` is the job under the name [`take_for_move`] gave it, which
+    /// nothing else looks for, so the rewrite cannot land on anybody's claim.
+    /// Whether the job was there to take is the take's answer, so this never
+    /// returns [`FailureDisposition::Lost`].
+    async fn record_attempt(
+        &self,
+        taken_path: &std::path::Path,
+        job_name: &str,
+        job: &mut Job,
+        error: &str,
+    ) -> Result<FailureDisposition> {
+        job.attempts += 1;
+        // Keep the tail of the message: that is where FFmpeg says what actually
+        // went wrong, and a job file is no place for a megabyte of log.
+        job.last_error = Some(tail(error, 2000));
 
         let attempts = job.attempts;
-        let park = attempts >= MAX_ATTEMPTS;
+        let (directory, disposition) = if attempts >= MAX_ATTEMPTS {
+            (&self.failed_dir, FailureDisposition::Parked { attempts })
+        } else {
+            (&self.queue_dir, FailureDisposition::Requeued { attempts })
+        };
 
         // The count goes in under a staging name and is renamed over the job, so
-        // a sweeper interrupted here leaves a job file that still parses.
-        write_job_atomically(taken_path, &job).await?;
-
-        let destination = if park {
-            self.failed_dir.join(job_name)
-        } else {
-            self.queue_dir.join(job_name)
-        };
-        if let Some(parent) = destination.parent() {
-            async_fs::create_dir_all(parent).await?;
-        }
+        // a mover killed here leaves a job file the next sweep can still read.
+        write_job_atomically(taken_path, job).await?;
 
         // Nothing can be at the destination: the job is in no directory a scan
         // consults except under the `.taken` name this holds, so it cannot have
         // been enqueued again while the count was being written.
-        async_fs::rename(taken_path, &destination).await?;
+        async_fs::create_dir_all(directory).await?;
+        async_fs::rename(taken_path, directory.join(job_name)).await?;
 
-        Ok(Reclaimed::Counted {
-            attempts,
-            parked: park,
-        })
+        Ok(disposition)
     }
 
     /// Move a job file that cannot be read as a job out of `_in_progress`.
@@ -672,24 +684,18 @@ impl SweepOutcome {
 
 /// What the sweep did with one file in `_in_progress`.
 enum Reclaimed {
-    /// The attempt was counted and the job moved on: to `_failed` when `parked`,
-    /// otherwise back to `_queue`.
-    ///
-    /// Its own shape rather than a [`FailureDisposition`], because a sweep that
-    /// did not take the job reports [`Reclaimed::Lost`] before it has an attempt
-    /// to count - so a counted-but-lost reclaim is not a state that exists.
-    Counted { attempts: u32, parked: bool },
+    /// The job was a stopped attempt, and went where a failed one goes - or it
+    /// was not this sweep's to move.
+    Attempt(FailureDisposition),
     /// The file could not be read as a job and was moved to `_failed`.
     Unreadable,
-    /// Another sweeper moved the file first; this one did nothing.
-    Lost,
 }
 
 impl Reclaimed {
     /// Whether this sweep is the one that moved the file out of `_in_progress`,
     /// and so the one that owns whatever was left beside it.
     fn moved_the_job(&self) -> bool {
-        !matches!(self, Reclaimed::Lost)
+        !matches!(self, Reclaimed::Attempt(FailureDisposition::Lost))
     }
 }
 
@@ -739,7 +745,7 @@ const TAKEN_EXTENSION: &str = "taken";
 ///
 /// The name is derived, not random, so a `.taken` file left by a mover that died
 /// is replaced by the next one to take that job rather than accumulating.
-pub(crate) fn taken_path_for(in_progress_path: &std::path::Path) -> PathBuf {
+fn taken_path_for(in_progress_path: &std::path::Path) -> PathBuf {
     let mut name = in_progress_path.as_os_str().to_os_string();
     name.push(".");
     name.push(TAKEN_EXTENSION);
@@ -784,7 +790,7 @@ pub(crate) async fn last_activity(
 }
 
 /// When a file was last written, or `None` if that cannot be read.
-pub(crate) async fn modified_at(path: &std::path::Path) -> Option<SystemTime> {
+async fn modified_at(path: &std::path::Path) -> Option<SystemTime> {
     async_fs::metadata(path).await.ok()?.modified().ok()
 }
 
@@ -933,10 +939,8 @@ async fn take_for_move(in_progress_path: &std::path::Path) -> Result<Option<Path
     }
 }
 
-/// Whether a claimed job has gone quiet for longer than `stale_after`.
-///
-/// A timestamp that cannot be read at all is treated as not stale: refusing to
-/// reclaim is always the safe answer.
+/// Whether a claimed job has gone quiet for longer than `stale_after`, by
+/// [`last_activity`] and [`quiet_for`].
 ///
 /// `clean` asks the same question for the opposite reason - a job that is *not*
 /// stale is one a worker is still running, and deleting its claim would leave
@@ -948,13 +952,7 @@ pub(crate) async fn is_stale(
     heartbeat_path: &std::path::Path,
     stale_after: Duration,
 ) -> bool {
-    match last_activity(job_path, heartbeat_path)
-        .await
-        .and_then(|t| SystemTime::now().duration_since(t).ok())
-    {
-        Some(age) => age >= stale_after,
-        None => false,
-    }
+    quiet_for(last_activity(job_path, heartbeat_path).await, stale_after)
 }
 
 /// Represents a job that has been claimed by a worker
@@ -996,9 +994,10 @@ pub enum FailureDisposition {
     Requeued { attempts: u32 },
     /// The job has failed too often and was parked in `_failed`.
     Parked { attempts: u32 },
-    /// The claim was gone before the failure could be recorded: a sweep judged
-    /// this worker stranded and gave the job to somebody else. Nothing was
-    /// written, because the job is no longer this worker's to describe.
+    /// The job was gone before the failure could be recorded. For a worker, a
+    /// sweep judged it stranded and gave the job to somebody else; for a sweep,
+    /// another sweeper moved it first, or a worker claimed it since. Nothing was
+    /// written, because the job is no longer this one's to describe.
     Lost,
 }
 
@@ -1076,12 +1075,8 @@ impl<'a> ClaimedJob<'a> {
         }
     }
 
-    /// Record a failed attempt and move the job on.
-    ///
-    /// The attempt count lives in the job file rather than in its name, because
-    /// the name is the v5 id of the file being transcoded and is what makes the
-    /// queue addressable. Counting in the file also means the count survives a
-    /// worker restart, and gives the error somewhere to be written down.
+    /// Record a failed attempt and move the job on, through
+    /// [`JobQueue::record_attempt`].
     ///
     /// After [`MAX_ATTEMPTS`] the job is parked in `_failed` instead of being
     /// handed back, so a job that can never succeed stops holding the worker up.
@@ -1105,59 +1100,34 @@ impl<'a> ClaimedJob<'a> {
             return Ok(FailureDisposition::Lost);
         };
 
-        self.job.attempts += 1;
-        // Keep the tail of the message: that is where FFmpeg says what actually
-        // went wrong, and a job file is no place for a megabyte of log.
-        self.job.last_error = Some(tail(error, 2000));
-
-        let attempts = self.job.attempts;
-        let park = attempts >= MAX_ATTEMPTS;
-
-        // Safe now: the job is held under a name nothing else looks for, so the
-        // rewrite cannot land on anybody's claim. It is itself a rename onto
-        // that file, so a worker killed here leaves a job the next sweep can
-        // still read and put back.
-        write_job_atomically(&taken_path, &self.job).await?;
-
-        let destination = if park {
-            self.queue.failed_dir.join(&self.job_name)
-        } else {
-            self.queue.queue_dir.join(&self.job_name)
-        };
-
-        if let Some(parent) = destination.parent() {
-            async_fs::create_dir_all(parent).await?;
-        }
-        async_fs::rename(&taken_path, &destination).await?;
+        let disposition = self
+            .queue
+            .record_attempt(&taken_path, &self.job_name, &mut self.job, error)
+            .await?;
         let _ = async_fs::remove_file(heartbeat_path_for(&self.in_progress_path)).await;
 
-        if park {
-            // FFmpeg's complaint runs to a screenful. The job file keeps the
-            // tail of it; the log gets the line that sums it up.
-            let summary = failure_summary(error);
-            warn!(
-                "🚫 Parking job in _failed after {attempts} attempts: {} ({summary})",
-                self.job_name
-            );
-            Ok(FailureDisposition::Parked { attempts })
-        } else {
-            warn!(
+        match disposition {
+            FailureDisposition::Parked { attempts } => {
+                // FFmpeg's complaint runs to a screenful. The job file keeps the
+                // tail of it; the log gets the line that sums it up.
+                let summary = failure_summary(error);
+                warn!(
+                    "🚫 Parking job in _failed after {attempts} attempts: {} ({summary})",
+                    self.job_name
+                );
+            }
+            FailureDisposition::Requeued { attempts } => warn!(
                 "Returned job to queue (attempt {attempts} of {MAX_ATTEMPTS}): {}",
                 self.job_name
-            );
-            Ok(FailureDisposition::Requeued { attempts })
+            ),
+            FailureDisposition::Lost => {}
         }
+        Ok(disposition)
     }
 
     /// Get the job name
     pub fn job_name(&self) -> &str {
         &self.job_name
-    }
-
-    /// Get the media file extension
-    #[allow(dead_code)]
-    pub fn file_extension(&self) -> Option<&str> {
-        self.job.input_path.extension()?.to_str()
     }
 }
 
@@ -1204,7 +1174,7 @@ mod tests {
         queue.enqueue_job(job).await.unwrap();
 
         let job_name = {
-            let claimed = queue.claim_job(None).await.unwrap().unwrap();
+            let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
             claimed.job_name().to_string()
         };
 
@@ -1324,7 +1294,7 @@ mod tests {
         assert!(queue.queue_dir.join(&job_name).exists());
 
         // And a worker can pick it up again, which is the whole point.
-        assert!(queue.claim_job(None).await.unwrap().is_some());
+        assert!(queue.claim_job(JobPriority::None).await.unwrap().is_some());
     }
 
     /// The sweep reads the whole of `_in_progress` before it moves anything, so
@@ -1352,7 +1322,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            matches!(reclaimed, Reclaimed::Lost),
+            matches!(reclaimed, Reclaimed::Attempt(FailureDisposition::Lost)),
             "a job whose worker is beating its heart is not this sweep's to take"
         );
         assert!(
@@ -1393,7 +1363,7 @@ mod tests {
             temp_dir.path(),
         );
         queue.enqueue_job(&job).await.unwrap();
-        let claimed = queue.claim_job(None).await.unwrap().unwrap();
+        let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
         let job_name = claimed.job_name().to_string();
         let in_progress_path = queue.in_progress_dir.join(&job_name);
 
@@ -1443,7 +1413,7 @@ mod tests {
             temp_dir.path(),
         );
         queue.enqueue_job(&job).await.unwrap();
-        let claimed = queue.claim_job(None).await.unwrap().unwrap();
+        let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
         let job_name = claimed.job_name().to_string();
         let in_progress_path = queue.in_progress_dir.join(&job_name);
 
@@ -1680,7 +1650,7 @@ mod tests {
             Duration::from_secs(3600),
         );
 
-        let claimed = queue.claim_job(None).await.unwrap().unwrap();
+        let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
 
         let swept = queue
             .reclaim_stranded_jobs(Duration::from_secs(300))
@@ -1710,7 +1680,7 @@ mod tests {
         );
         queue.enqueue_job(&job).await.unwrap();
 
-        let claimed = queue.claim_job(None).await.unwrap().unwrap();
+        let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
         let job_name = claimed.job_name().to_string();
         let in_progress_path = queue.in_progress_dir.join(&job_name);
 
@@ -1773,7 +1743,7 @@ mod tests {
             .unwrap();
             assert_eq!(requeued.attempts, attempt);
 
-            drop(queue.claim_job(None).await.unwrap().unwrap());
+            drop(queue.claim_job(JobPriority::None).await.unwrap().unwrap());
         }
 
         let in_progress_path = queue.in_progress_dir.join(&job_name);
@@ -1893,7 +1863,7 @@ mod tests {
         let job_name = job.job_filename();
 
         for attempt in 1..MAX_ATTEMPTS {
-            let claimed = queue.claim_job(None).await.unwrap().unwrap();
+            let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
             assert_eq!(
                 claimed.fail("ffmpeg not found").await.unwrap(),
                 FailureDisposition::Requeued { attempts: attempt }
@@ -1904,7 +1874,7 @@ mod tests {
             );
         }
 
-        let claimed = queue.claim_job(None).await.unwrap().unwrap();
+        let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
         assert_eq!(
             claimed.fail("ffmpeg not found").await.unwrap(),
             FailureDisposition::Parked {
@@ -1951,40 +1921,6 @@ mod tests {
         assert_eq!(job.last_error, None);
         // It was queued when every job re-encoded, so that is what it still is.
         assert_eq!(job.operation, Operation::Reencode { channels: None });
-    }
-
-    #[test]
-    async fn a_lock_left_by_an_interrupted_scan_does_not_keep_a_file_out_of_the_queue() {
-        let temp_dir = TempDir::new().unwrap();
-        let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
-        queue.init().await.unwrap();
-
-        let job = Job::new(
-            PathBuf::from("show.mkv"),
-            MediaFileType::Mkv,
-            Operation::Reencode { channels: None },
-            QualitySettings::default(),
-            PostProcessingSettings::default(),
-            temp_dir.path(),
-        );
-
-        // A scan that stopped after taking the name and before writing the job.
-        // Nothing in any queue directory records the file, so no later run has
-        // any way to notice it was missed.
-        let lock_dir = queue.queue_dir.join(format!("{}.lock", job.job_filename()));
-        std::fs::create_dir(&lock_dir).unwrap();
-        assert!(!queue.job_exists(&job).await.unwrap());
-
-        queue.enqueue_job(&job).await.unwrap();
-
-        assert!(
-            queue.queue_dir.join(job.job_filename()).exists(),
-            "a name taken by a scan that died must not be taken forever"
-        );
-        assert!(!lock_dir.exists(), "the debris is cleared away with it");
-
-        let claimed = queue.claim_job(None).await.unwrap().unwrap();
-        assert!(claimed.job.input_path.ends_with("show.mkv"));
     }
 
     #[test]
@@ -2146,7 +2082,7 @@ mod tests {
         queue.enqueue_job(&job).await.unwrap();
         std::fs::create_dir(queue.in_progress_dir.join(job.job_filename())).unwrap();
 
-        let claimed = queue.claim_job(None).await;
+        let claimed = queue.claim_job(JobPriority::None).await;
         assert!(claimed.is_err(), "{:?}", claimed.map(|c| c.is_some()));
         assert!(queue.queue_dir.join(job.job_filename()).exists());
     }
@@ -2166,7 +2102,7 @@ mod tests {
             temp_dir.path(),
         );
         queue.enqueue_job(&job).await.unwrap();
-        let claimed = queue.claim_job(None).await.unwrap().unwrap();
+        let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
         let in_progress_path = queue.in_progress_dir.join(claimed.job_name());
         std::fs::create_dir(taken_path_for(&in_progress_path)).unwrap();
 
@@ -2179,7 +2115,7 @@ mod tests {
     /// claim mode, rather than left in the queue unmentioned.
     #[test]
     async fn a_queued_file_that_is_not_a_job_is_reported_by_name() {
-        for priority in [None, Some(crate::JobPriority::Episode)] {
+        for priority in [JobPriority::None, JobPriority::Episode] {
             let temp_dir = TempDir::new().unwrap();
             let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
             queue.init().await.unwrap();
@@ -2256,7 +2192,7 @@ mod tests {
             // Put the job back as the last worker found it and abandon it
             // again, so the next round is the same round.
             queue.enqueue_job(&job).await.unwrap();
-            let claimed = queue.claim_job(None).await.unwrap().unwrap();
+            let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
             drop(claimed);
         }
 
@@ -2326,7 +2262,7 @@ mod tests {
         queue.enqueue_job(&job).await.unwrap();
 
         // Claim job
-        let claimed = queue.claim_job(None).await.unwrap().unwrap();
+        let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
         assert!(claimed.job.input_path.ends_with("test.webm"));
         assert_eq!(claimed.job.file_type, MediaFileType::WebM);
 
@@ -2334,7 +2270,7 @@ mod tests {
         claimed.complete().await.unwrap();
 
         // Should be no more jobs
-        assert!(queue.claim_job(None).await.unwrap().is_none());
+        assert!(queue.claim_job(JobPriority::None).await.unwrap().is_none());
     }
 
     #[test]
@@ -2423,11 +2359,7 @@ mod tests {
 
         // Claim jobs with episode prioritization
         let mut claimed_order = Vec::new();
-        while let Some(claimed) = queue
-            .claim_job(Some(crate::JobPriority::Episode))
-            .await
-            .unwrap()
-        {
+        while let Some(claimed) = queue.claim_job(JobPriority::Episode).await.unwrap() {
             let path_str = claimed.job.input_path.to_string_lossy().to_string();
             claimed_order.push(path_str);
             claimed.complete().await.unwrap();
@@ -2484,11 +2416,7 @@ mod tests {
         }
 
         let mut claimed_order = Vec::new();
-        while let Some(claimed) = queue
-            .claim_job(Some(crate::JobPriority::Episode))
-            .await
-            .unwrap()
-        {
+        while let Some(claimed) = queue.claim_job(JobPriority::Episode).await.unwrap() {
             claimed_order.push(crate::paths::to_forward_slashes(&claimed.job.input_path));
             claimed.complete().await.unwrap();
         }
@@ -2565,8 +2493,8 @@ mod tests {
         }
 
         // With no prioritization, jobs should be claimed in directory order
-        let claimed1 = queue.claim_job(None).await.unwrap().unwrap();
-        let claimed2 = queue.claim_job(None).await.unwrap().unwrap();
+        let claimed1 = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
+        let claimed2 = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
 
         // Both jobs should be claimed regardless of episode order
         assert!(claimed1
@@ -2607,7 +2535,7 @@ mod tests {
 
         // A worker claims it: the file leaves _queue, but re-scanning the library
         // must not queue the same file a second time behind the worker's back.
-        let claimed = queue.claim_job(None).await.unwrap().unwrap();
+        let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
         assert!(
             queue.job_exists(&job).await.unwrap(),
             "a job being worked on still exists"

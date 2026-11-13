@@ -166,13 +166,7 @@ impl WorkCommand {
         queue: &JobQueue,
         processor: &FFmpegProcessor,
     ) -> Result<bool> {
-        let priority = if self.priority_mode == JobPriority::None {
-            None
-        } else {
-            Some(self.priority_mode.clone())
-        };
-
-        if let Some(claimed_job) = queue.claim_job(priority).await? {
+        if let Some(claimed_job) = queue.claim_job(self.priority_mode.clone()).await? {
             info!("➡️ Claimed job: {}", claimed_job.job_name());
 
             // Get the job details directly from the job file
