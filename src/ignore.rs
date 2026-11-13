@@ -2,10 +2,12 @@ use anyhow::{Context, Result};
 use glob::Pattern;
 use std::collections::HashMap;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use tracing::{debug, trace, warn};
 use walkdir::WalkDir;
 
+use crate::paths::to_forward_slashes;
 use crate::queue::QueueDirectory;
 
 /// Handles .plexifyignore files with gitignore-style pattern matching
@@ -76,10 +78,7 @@ impl IgnoreFilter {
         ancestors.dedup();
 
         for ancestor in ancestors {
-            let candidate = ancestor.join(".plexifyignore");
-            if candidate.is_file() {
-                self.load_ignore_file(&candidate)?;
-            }
+            self.load_ignore_file(&ancestor)?;
         }
 
         Ok(())
@@ -112,23 +111,24 @@ impl IgnoreFilter {
                 continue;
             }
 
-            let candidate = dir.join(".plexifyignore");
-            if candidate.is_file() {
-                self.load_ignore_file(&candidate)?;
-            }
+            self.load_ignore_file(dir)?;
         }
 
         Ok(())
     }
 
-    /// Load patterns from a single .plexifyignore file.
+    /// Load the patterns of `dir`'s .plexifyignore, if it has one.
     ///
-    /// Every failure is an error: a rule that is silently dropped lets `work`
-    /// transcode, or `validate --fix` rename, a file the user excluded.
-    fn load_ignore_file(&mut self, ignore_file: &Path) -> Result<()> {
-        let dir = ignore_file.parent().unwrap_or(&self.root).to_path_buf();
-        let content = fs::read_to_string(ignore_file)
-            .with_context(|| format!("could not read {}", ignore_file.display()))?;
+    /// Only a file that is not there is skipped. Every other failure is an
+    /// error: a rule that is silently dropped lets `work` transcode, or
+    /// `validate --fix` rename, a file the user excluded.
+    fn load_ignore_file(&mut self, dir: &Path) -> Result<()> {
+        let ignore_file = dir.join(".plexifyignore");
+        let content = match fs::read_to_string(&ignore_file) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            read => read
+                .with_context(|| format!("could not read {}", to_forward_slashes(&ignore_file)))?,
+        };
 
         let patterns: Vec<IgnorePattern> = content
             .lines()
@@ -154,7 +154,7 @@ impl IgnoreFilter {
                 patterns.len(),
                 ignore_file.display()
             );
-            self.patterns_by_dir.insert(dir, patterns);
+            self.patterns_by_dir.insert(dir.to_path_buf(), patterns);
         }
 
         Ok(())
@@ -203,8 +203,7 @@ impl IgnoreFilter {
             }
         };
 
-        // Convert to forward slashes for consistent matching
-        let path_str = relative_path.to_string_lossy().replace("\\", "/");
+        let path_str = to_forward_slashes(relative_path);
 
         // Check patterns from all applicable directories, starting from root to specific
         let mut ignored = false;
@@ -229,7 +228,7 @@ impl IgnoreFilter {
                     path_str.clone()
                 } else {
                     match path.strip_prefix(dir) {
-                        Ok(rel) => rel.to_string_lossy().replace("\\", "/"),
+                        Ok(rel) => to_forward_slashes(rel),
                         Err(_) => path_str.clone(), // Fallback to full relative path
                     }
                 };
@@ -645,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_ignore_file_is_refused_with_its_name() {
+    fn an_ignore_file_that_is_not_utf8_is_refused_with_its_name() {
         let temp_dir = TempDir::new().unwrap();
         let ignore_file = temp_dir.path().join(".plexifyignore");
         // A Latin-1 'é', which is not UTF-8.
@@ -655,9 +654,31 @@ mod tests {
 
         let message = format!("{error:#}");
         assert!(
-            message.contains(&ignore_file.display().to_string()),
+            message.contains(&to_forward_slashes(&ignore_file)),
             "names the file: {message}"
         );
+    }
+
+    /// A `.plexifyignore` that exists but is not a readable file is an error,
+    /// in the root and in a directory below it. A directory is the trigger
+    /// because it works on every platform; a file this user may not read is
+    /// the same branch, and is covered on Unix below.
+    #[test]
+    fn an_ignore_file_that_exists_but_cannot_be_read_is_refused_with_its_name() {
+        for at in ["", "Series"] {
+            let temp_dir = TempDir::new().unwrap();
+            let ignore_file = temp_dir.path().join(at).join(".plexifyignore");
+            fs::create_dir_all(&ignore_file).unwrap();
+
+            let result = IgnoreFilter::new(temp_dir.path().to_path_buf());
+
+            let message = format!("{:#}", result.unwrap_err());
+            assert!(
+                message.contains(&to_forward_slashes(&ignore_file)),
+                "names {}: {message}",
+                to_forward_slashes(&ignore_file)
+            );
+        }
     }
 
     /// Make `dir` unreadable, or report that this process can read it anyway
@@ -833,6 +854,35 @@ mod tests {
         assert!(
             message.contains(&locked.display().to_string()),
             "names the directory: {message}"
+        );
+    }
+
+    /// A directory that can be listed but not searched: the walk finds its
+    /// `.plexifyignore`, but this user cannot open it.
+    #[cfg(unix)]
+    #[test]
+    fn an_ignore_file_this_user_cannot_open_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = TempDir::new().unwrap();
+        let locked = temp_dir.path().join("Series");
+        fs::create_dir_all(&locked).unwrap();
+        let ignore_file = locked.join(".plexifyignore");
+        fs::write(&ignore_file, "*.mkv\n").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o644)).unwrap();
+        if fs::metadata(&ignore_file).is_ok() {
+            unlock(&locked);
+            eprintln!("skipping: this process can search a mode 644 directory");
+            return;
+        }
+
+        let result = IgnoreFilter::new(temp_dir.path().to_path_buf());
+        unlock(&locked);
+
+        let message = format!("{:#}", result.unwrap_err());
+        assert!(
+            message.contains(&to_forward_slashes(&ignore_file)),
+            "names {}: {message}",
+            to_forward_slashes(&ignore_file)
         );
     }
 
