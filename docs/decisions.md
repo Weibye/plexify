@@ -528,3 +528,24 @@ broken than in need of conversion, and a refused file can be fixed by hand (prin
 - A file FFprobe cannot read at all is refused the same way.
 - Guarded by `a_source_with_no_video_stream_is_refused_for_that` and
   `a_file_with_no_video_stream_is_not_refused_for_its_audio_either`.
+
+## 34. A file with no picture is its own outcome
+
+**Supersedes** the first consequence of 32.
+
+**Decision.** `evaluate` returns `Conformance::NoPicture` for a file FFprobe finds no
+picture in: audio only, or only cover art. It has no cost, reasons or unverified claims.
+`audit` counts it in its own row and names each file. `scan --target` names each one and
+queues none (see 33).
+
+Recorded 2026-11-13.
+
+**Why.** Counting it under "Direct Plays as it is" claimed a playback nobody measured
+(principle 6), and nothing named the file, so nobody could act on it (principle 5).
+
+**Consequences.**
+- `Conformance::cost()` returning `None` means no job, not Direct Play. A caller that
+  wants Direct Play excludes `NoPicture`, as `AuditReport::bucket` does.
+- Guarded by `a_file_with_no_video_stream_is_unassessable_rather_than_refused`,
+  `a_file_with_no_picture_is_named_rather_than_counted_as_direct_play` and
+  `a_file_with_no_picture_is_neither_queued_nor_said_to_play`.

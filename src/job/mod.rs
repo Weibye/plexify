@@ -229,7 +229,7 @@ impl Operation {
     /// touched. A wrong container alone changes nothing but the container.
     pub fn for_conformance(conformance: &Conformance, target: &PlaybackTarget) -> Option<Self> {
         let reasons = match conformance {
-            Conformance::Conforms { .. } => return None,
+            Conformance::Conforms { .. } | Conformance::NoPicture => return None,
             Conformance::Reencode { reasons, .. } | Conformance::Remux { reasons, .. } => reasons,
         };
 

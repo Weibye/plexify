@@ -10,7 +10,7 @@ use crate::job::{MediaFileType, Operation};
 use crate::naming::scope_for;
 use crate::probe::probe;
 use crate::queue::JobQueue;
-use crate::target::{evaluate, PlaybackTarget};
+use crate::target::{evaluate, Conformance, PlaybackTarget};
 
 use super::job_processor::{operation_for, JobProcessResult, JobProcessor, JobProcessorConfig};
 
@@ -20,6 +20,9 @@ enum Resolution {
     Work(Operation),
     /// Every target plays it as it is, so there is no job to make.
     Conforms,
+    /// Audio only, or only cover art. Nothing was judged and no job can give
+    /// it a picture (D33), so it is named rather than queued or passed over.
+    NoPicture,
     /// FFprobe could not read it, so nothing is known about what it needs.
     Unreadable(String),
 }
@@ -195,6 +198,7 @@ impl ScanCommand {
 
         let resolutions = self.resolve(&media_files).await?;
         let mut conforming = 0;
+        let mut no_picture = Vec::new();
         let mut unreadable = Vec::new();
 
         for ((path, file_type), resolution) in media_files.iter().zip(resolutions) {
@@ -211,6 +215,10 @@ impl ScanCommand {
                 Resolution::Conforms => {
                     conforming += 1;
                     debug!("Every target plays {path:?} as it is");
+                    continue;
+                }
+                Resolution::NoPicture => {
+                    no_picture.push(path.clone());
                     continue;
                 }
                 // Doing nothing is the only answer here that cannot be wrong.
@@ -239,6 +247,16 @@ impl ScanCommand {
 
         if conforming > 0 {
             info!("✅ {conforming} files already play on every target, and were not queued.");
+        }
+
+        for path in &no_picture {
+            warn!("⚠️ Not queued, because it has no picture - audio only, or only cover art: {path:?}");
+        }
+        if !no_picture.is_empty() {
+            warn!(
+                "⚠️ {} files have no picture. Nothing was judged about them, so they were not queued.",
+                no_picture.len()
+            );
         }
 
         for (path, reason) in &unreadable {
@@ -323,9 +341,20 @@ fn resolve_one(path: &Path, targets: &[PlaybackTarget]) -> Resolution {
 
     // One probe, every target: the file is read once however many clients are
     // being satisfied, and a conforming answer from all of them is no job.
-    let operation = targets
+    let verdicts: Vec<_> = targets
         .iter()
-        .filter_map(|target| Operation::for_conformance(&evaluate(&media, target), target))
+        .map(|target| (evaluate(&media, target), target))
+        .collect();
+    if verdicts
+        .iter()
+        .any(|(conformance, _)| *conformance == Conformance::NoPicture)
+    {
+        return Resolution::NoPicture;
+    }
+
+    let operation = verdicts
+        .iter()
+        .filter_map(|(conformance, target)| Operation::for_conformance(conformance, target))
         .reduce(Operation::hardest);
 
     match operation {
@@ -338,7 +367,6 @@ fn resolve_one(path: &Path, targets: &[PlaybackTarget]) -> Resolution {
 mod tests {
     use super::*;
     use crate::job::{AudioAction, QualityPreset, SubtitleAction};
-    use crate::target::Conformance;
     use std::fs;
     use tempfile::TempDir;
 
@@ -672,6 +700,46 @@ mod tests {
             )],
             "only the file that needs work is queued, and only for the track that is wrong"
         );
+    }
+
+    /// A file with no picture gets no job (D33), and it is not counted among
+    /// the files that already play either: nothing measured that it does.
+    #[tokio::test]
+    async fn a_file_with_no_picture_is_neither_queued_nor_said_to_play() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let media_root = temp_dir.path();
+        let audio_only = media_root.join("audio-only.mkv");
+        build(&audio_only, &["-map", "1:a", "-c:a", "aac"]);
+        // MKV carries cover art as an attached JPEG, which FFprobe lists as
+        // a video stream marked `attached_pic`.
+        let cover = media_root.join("cover.jpg");
+        build(&cover, &["-map", "0:v", "-frames:v", "1"]);
+        let cover_art = media_root.join("cover-art.mkv");
+        build(
+            &cover_art,
+            &[
+                "-map",
+                "1:a",
+                "-c:a",
+                "aac",
+                "-attach",
+                cover.to_str().unwrap(),
+                "-metadata:s:t",
+                "mimetype=image/jpeg",
+            ],
+        );
+
+        let targets = [PlaybackTarget::load("chromecast-gen2-3").unwrap()];
+        for path in [&audio_only, &cover_art] {
+            assert!(
+                matches!(resolve_one(path, &targets), Resolution::NoPicture),
+                "{path:?} is neither work nor a file that already plays"
+            );
+        }
     }
 
     /// The rule that decides a quarter of this library. The LG decodes MPEG-4
