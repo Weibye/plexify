@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 use tracing::info;
 
+use crate::paths::to_forward_slashes;
 use crate::queue::JobQueue;
 
 use super::job_processor::{operation_for, JobProcessResult, JobProcessor, JobProcessorConfig};
@@ -24,14 +25,23 @@ impl AddCommand {
 
     pub async fn execute(&self) -> Result<()> {
         if !self.file_path.exists() {
-            return Err(anyhow!("File does not exist: {:?}", self.file_path));
+            return Err(anyhow!(
+                "File does not exist: {}",
+                to_forward_slashes(&self.file_path)
+            ));
         }
 
         if !self.file_path.is_file() {
-            return Err(anyhow!("Path is not a file: {:?}", self.file_path));
+            return Err(anyhow!(
+                "Path is not a file: {}",
+                to_forward_slashes(&self.file_path)
+            ));
         }
 
-        info!("📄 Processing file: {:?}", self.file_path);
+        info!(
+            "📄 Processing file: {}",
+            to_forward_slashes(&self.file_path)
+        );
 
         let file_type =
             JobProcessor::determine_file_type(&self.file_path).map_err(|err| anyhow!(err))?;
@@ -43,8 +53,8 @@ impl AddCommand {
             .parent()
             .ok_or_else(|| {
                 anyhow!(
-                    "Unable to determine parent directory for: {:?}",
-                    self.file_path
+                    "Unable to determine parent directory for: {}",
+                    to_forward_slashes(&self.file_path)
                 )
             })?
             .to_path_buf();
@@ -55,7 +65,12 @@ impl AddCommand {
         let relative_path = self
             .file_path
             .strip_prefix(&media_root)
-            .map_err(|_| anyhow!("Unable to create relative path for: {:?}", self.file_path))?
+            .map_err(|_| {
+                anyhow!(
+                    "Unable to create relative path for: {}",
+                    to_forward_slashes(&self.file_path)
+                )
+            })?
             .to_path_buf();
 
         let processor = JobProcessor::new(&queue, &self.config, &media_root);
@@ -68,8 +83,8 @@ impl AddCommand {
 
         if result == JobProcessResult::MissingSubtitle {
             return Err(anyhow!(
-                "Missing required subtitle file (.vtt) for WebM file: {:?}",
-                self.file_path
+                "Missing required subtitle file (.vtt) for WebM file: {}",
+                to_forward_slashes(&self.file_path)
             ));
         }
         processor.log_result(&relative_path, operation, &result);

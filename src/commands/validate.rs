@@ -192,26 +192,26 @@ impl ValidateCommand {
 
         if !self.scope.scan_path.exists() {
             return Err(anyhow!(
-                "Media directory does not exist: {:?}",
-                self.scope.scan_path
+                "Media directory does not exist: {}",
+                to_forward_slashes(&self.scope.scan_path)
             ));
         }
 
         if !self.scope.scan_path.is_dir() {
             return Err(anyhow!(
-                "Path is not a directory: {:?}",
-                self.scope.scan_path
+                "Path is not a directory: {}",
+                to_forward_slashes(&self.scope.scan_path)
             ));
         }
 
         info!(
-            "🔍 Validating library naming in: {:?}",
-            self.scope.scan_path
+            "🔍 Validating library naming in: {}",
+            to_forward_slashes(&self.scope.scan_path)
         );
         if !self.scope.is_whole_library() {
             info!(
-                "📐 Judging against library root: {:?}",
-                self.scope.library_root
+                "📐 Judging against library root: {}",
+                to_forward_slashes(&self.scope.library_root)
             );
         }
         info!("📁 Recursively scanning all subdirectories...");

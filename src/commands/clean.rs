@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use tokio::fs as async_fs;
 
 use crate::job::Job;
+use crate::paths::to_forward_slashes;
 use crate::queue::{heartbeat_path_for, is_stale, JobQueue, QueueDirectory, STALE_AFTER};
 
 /// Command to empty a work root's queue directories.
@@ -94,7 +95,7 @@ pub enum JobIdentity {
 impl fmt::Display for JobIdentity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            JobIdentity::Input(path) => write!(f, "{}", path.display()),
+            JobIdentity::Input(path) => write!(f, "{}", to_forward_slashes(path)),
             JobIdentity::Unreadable(name) => write!(f, "{name} (unreadable job file)"),
         }
     }
@@ -292,7 +293,7 @@ impl CleanCommand {
         if plan.is_empty() {
             eprintln!(
                 "Nothing to clean: {} holds no queue directories.",
-                self.work_root.display()
+                to_forward_slashes(&self.work_root)
             );
             return Ok(CleanOutcome::NothingToDo);
         }
@@ -435,7 +436,10 @@ impl CleanCommand {
         // current working directory. A user who is about to delete the wrong
         // queue is almost always in the wrong directory, and this is the line
         // that says so.
-        out.push_str(&format!("Work root: {}\n\n", self.work_root.display()));
+        out.push_str(&format!(
+            "Work root: {}\n\n",
+            to_forward_slashes(&self.work_root)
+        ));
         out.push_str("clean will permanently delete:\n\n");
 
         for directory in &plan.directories {
@@ -509,14 +513,19 @@ async fn job_files(directory: &Path) -> Result<Option<Vec<PathBuf>>> {
     let mut entries = match async_fs::read_dir(directory).await {
         Ok(entries) => entries,
         Err(e) if crate::queue::is_absent(&e) => return Ok(None),
-        Err(e) => return Err(anyhow!("Could not read {directory:?}: {e}")),
+        Err(e) => {
+            return Err(anyhow!(
+                "Could not read {}: {e}",
+                to_forward_slashes(directory)
+            ))
+        }
     };
 
     let mut paths = Vec::new();
     while let Some(entry) = entries
         .next_entry()
         .await
-        .with_context(|| format!("Could not read {directory:?}"))?
+        .with_context(|| format!("Could not read {}", to_forward_slashes(directory)))?
     {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) == Some("job") && path.is_file() {

@@ -11,6 +11,7 @@ use plexify::commands::{
     work::WorkCommand,
 };
 use plexify::job::QualityPreset;
+use plexify::paths::to_forward_slashes;
 use plexify::queue::QueueDirectory;
 use plexify::JobPriority;
 
@@ -139,7 +140,8 @@ enum Commands {
 /// `absolute` strips trailing dots and spaces, so a walked name ending in one
 /// would come out naming a different file.
 fn resolve(path: &Path) -> Result<PathBuf> {
-    std::path::absolute(path).with_context(|| format!("Cannot resolve {:?}", path))
+    std::path::absolute(path)
+        .with_context(|| format!("Cannot resolve {}", to_forward_slashes(path)))
 }
 
 #[tokio::main]
@@ -179,8 +181,10 @@ async fn run(command: Commands) -> Result<()> {
             let file = resolve(&file)?;
             let work_root = resolve(&work_dir.unwrap_or_else(|| ".".into()))?;
             info!(
-                "Starting add command for file: {:?}, work: {:?}, preset: {:?}",
-                file, work_root, preset
+                "Starting add command for file: {}, work: {}, preset: {:?}",
+                to_forward_slashes(&file),
+                to_forward_slashes(&work_root),
+                preset
             );
             let config = JobProcessorConfig::from_preset(preset);
             AddCommand::new(file, work_root, config).execute().await
@@ -194,8 +198,11 @@ async fn run(command: Commands) -> Result<()> {
             let path = resolve(&path)?;
             let work_root = resolve(&work_dir.unwrap_or_else(|| ".".into()))?;
             info!(
-                "Starting scan command for path: {:?}, work: {:?}, preset: {:?}, targets: {:?}",
-                path, work_root, preset, target
+                "Starting scan command for path: {}, work: {}, preset: {:?}, targets: {:?}",
+                to_forward_slashes(&path),
+                to_forward_slashes(&work_root),
+                preset,
+                target
             );
             let config = JobProcessorConfig::from_preset(preset);
             ScanCommand::new(path, work_root, config, &target)?
@@ -211,8 +218,11 @@ async fn run(command: Commands) -> Result<()> {
             let path = resolve(&path)?;
             let work_root = resolve(&work_dir.unwrap_or_else(|| ".".into()))?;
             info!(
-                "Starting work command for path: {:?}, work: {:?}, background: {}, priority: {:?}",
-                path, work_root, background, priority
+                "Starting work command for path: {}, work: {}, background: {}, priority: {:?}",
+                to_forward_slashes(&path),
+                to_forward_slashes(&work_root),
+                background,
+                priority
             );
             WorkCommand::new(path, work_root, background, priority)
                 .execute()
@@ -220,7 +230,10 @@ async fn run(command: Commands) -> Result<()> {
         }
         Commands::Status { work_dir } => {
             let work_root = resolve(&work_dir.unwrap_or_else(|| ".".into()))?;
-            info!("Starting status command for work: {:?}", work_root);
+            info!(
+                "Starting status command for work: {}",
+                to_forward_slashes(&work_root)
+            );
 
             // No media path is asked for. Nothing this command reports is
             // resolved against the media root, and requiring a directory that
@@ -238,7 +251,10 @@ async fn run(command: Commands) -> Result<()> {
             force,
         } => {
             let work_root = resolve(&work_dir.unwrap_or_else(|| ".".into()))?;
-            info!("Starting clean command for work: {:?}", work_root);
+            info!(
+                "Starting clean command for work: {}",
+                to_forward_slashes(&work_root)
+            );
             CleanCommand::new(work_root)
                 .only(&only)
                 .dry_run(dry_run)
@@ -248,11 +264,19 @@ async fn run(command: Commands) -> Result<()> {
                 .await
         }
         Commands::Undo { plan, apply } => {
-            info!("Starting undo for plan: {:?}, apply: {}", plan, apply);
+            info!(
+                "Starting undo for plan: {}, apply: {}",
+                to_forward_slashes(&plan),
+                apply
+            );
             UndoCommand::new(plan, apply).execute().await
         }
         Commands::Audit { path, target } => {
-            info!("Starting audit for path: {:?}, target: {}", path, target);
+            info!(
+                "Starting audit for path: {}, target: {}",
+                to_forward_slashes(&path),
+                target
+            );
             let audit = AuditCommand::new(path, &target)?;
             let report = audit.execute().await?;
             audit.print_report(&report);
@@ -264,8 +288,12 @@ async fn run(command: Commands) -> Result<()> {
             library_root,
         } => {
             info!(
-                "Starting validate command for path: {:?}, fix: {}, library root: {:?}",
-                path, fix, library_root
+                "Starting validate command for path: {}, fix: {}, library root: {}",
+                to_forward_slashes(&path),
+                fix,
+                library_root
+                    .as_deref()
+                    .map_or_else(|| "none".to_string(), to_forward_slashes)
             );
             let validate = match library_root {
                 Some(root) => ValidateCommand::rooted_at(path, root)?,
