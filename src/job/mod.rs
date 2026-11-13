@@ -681,12 +681,6 @@ impl QualitySettings {
                 .unwrap_or(base.ffmpeg_audio_bitrate),
         }
     }
-
-    /// Create quality settings from a preset name string
-    pub fn from_preset_name(preset_name: &str) -> Result<Self> {
-        let preset = QualityPreset::from_name(preset_name)?;
-        Ok(Self::from_preset(preset))
-    }
 }
 
 impl QualityPreset {
@@ -718,38 +712,6 @@ impl QualityPreset {
                 ffmpeg_crf: "15".to_string(),
                 ffmpeg_audio_bitrate: "320k".to_string(),
             },
-        }
-    }
-
-    /// Parse preset from string name
-    pub fn from_name(name: &str) -> Result<Self> {
-        match name.to_lowercase().as_str() {
-            "fast" => Ok(QualityPreset::Fast),
-            "balanced" => Ok(QualityPreset::Balanced),
-            "quality" => Ok(QualityPreset::Quality),
-            "ultrafast" => Ok(QualityPreset::UltraFast),
-            "archive" => Ok(QualityPreset::Archive),
-            _ => Err(anyhow!(
-                "Unknown quality preset '{name}'. Available presets: fast, balanced, quality, ultrafast, archive"
-            )),
-        }
-    }
-
-    /// Get all available preset names
-    #[allow(dead_code)]
-    pub fn all_names() -> Vec<&'static str> {
-        vec!["fast", "balanced", "quality", "ultrafast", "archive"]
-    }
-
-    /// Get the preset name as string
-    #[allow(dead_code)]
-    pub fn name(&self) -> &'static str {
-        match self {
-            QualityPreset::Fast => "fast",
-            QualityPreset::Balanced => "balanced",
-            QualityPreset::Quality => "quality",
-            QualityPreset::UltraFast => "ultrafast",
-            QualityPreset::Archive => "archive",
         }
     }
 }
@@ -1313,22 +1275,17 @@ mod tests {
     }
 
     #[test]
-    fn test_preset_from_name() {
+    fn a_preset_is_named_in_any_case() {
+        use clap::ValueEnum;
         assert_eq!(
-            QualityPreset::from_name("fast").unwrap(),
-            QualityPreset::Fast
+            QualityPreset::from_str("QUALITY", true),
+            Ok(QualityPreset::Quality)
         );
         assert_eq!(
-            QualityPreset::from_name("QUALITY").unwrap(),
-            QualityPreset::Quality
+            QualityPreset::from_str("ultrafast", true),
+            Ok(QualityPreset::UltraFast)
         );
-        assert_eq!(
-            QualityPreset::from_name("Balanced").unwrap(),
-            QualityPreset::Balanced
-        );
-
-        // Test invalid preset name
-        assert!(QualityPreset::from_name("invalid").is_err());
+        assert!(QualityPreset::from_str("invalid", true).is_err());
     }
 
     #[test]
@@ -1340,20 +1297,6 @@ mod tests {
         assert_eq!(settings.ffmpeg_preset, "slow");
         assert_eq!(settings.ffmpeg_crf, "18");
         assert_eq!(settings.ffmpeg_audio_bitrate, "256k");
-    }
-
-    #[test]
-    #[serial(env)]
-    fn test_quality_settings_from_preset_name() {
-        clear_encoding_env();
-
-        let settings = QualitySettings::from_preset_name("balanced").unwrap();
-        assert_eq!(settings.ffmpeg_preset, "medium");
-        assert_eq!(settings.ffmpeg_crf, "20");
-        assert_eq!(settings.ffmpeg_audio_bitrate, "192k");
-
-        // Test invalid name
-        assert!(QualitySettings::from_preset_name("invalid").is_err());
     }
 
     #[test]

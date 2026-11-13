@@ -34,14 +34,8 @@ enum Commands {
         /// Path to the work directory (defaults to current working directory)
         #[arg(long, short = 'w')]
         work_dir: Option<PathBuf>,
-        /// Quality preset for encoding. Available: fast, balanced, quality, ultrafast, archive
-        #[arg(
-            long,
-            short = 'p',
-            value_enum,
-            ignore_case = true,
-            hide_possible_values = true
-        )]
+        /// Quality preset for encoding
+        #[arg(long, short = 'p', value_enum, ignore_case = true)]
         preset: Option<QualityPreset>,
     },
     /// Scan a directory for media files and create transcoding jobs
@@ -51,14 +45,8 @@ enum Commands {
         /// Path to the work directory (defaults to current working directory)
         #[arg(long, short = 'w')]
         work_dir: Option<PathBuf>,
-        /// Quality preset for encoding. Available: fast, balanced, quality, ultrafast, archive
-        #[arg(
-            long,
-            short = 'p',
-            value_enum,
-            ignore_case = true,
-            hide_possible_values = true
-        )]
+        /// Quality preset for encoding
+        #[arg(long, short = 'p', value_enum, ignore_case = true)]
         preset: Option<QualityPreset>,
         /// A client every queued file has to play on: a built-in envelope's
         /// name, or the path to a TOML one. Repeat it to name more than one,

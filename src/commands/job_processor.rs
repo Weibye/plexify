@@ -23,7 +23,7 @@ impl JobProcessorConfig {
     pub fn from_preset(preset: Option<QualityPreset>) -> Self {
         let quality_settings = match preset {
             Some(preset) => {
-                info!("Using quality preset: '{}'", preset.name());
+                info!("Using quality preset: {:?}", preset);
                 QualitySettings::from_preset(preset)
             }
             None => {
