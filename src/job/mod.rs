@@ -771,7 +771,7 @@ mod tests {
         let with_audio = |codec: &str, channels: u32| MediaProbe {
             container: Some("mov,mp4,m4a,3gp,3g2,mj2".to_string()),
             video: Some(VideoStream {
-                codec: "h264".to_string(),
+                codec: Some("h264".to_string()),
                 profile: Some("high".to_string()),
                 level: Some(41),
                 pixel_format: Some("yuv420p".to_string()),
@@ -781,7 +781,7 @@ mod tests {
                 height: Some(1080),
             }),
             audio: vec![AudioStream {
-                codec: codec.to_string(),
+                codec: Some(codec.to_string()),
                 channels: Some(channels),
                 language: None,
             }],
@@ -872,7 +872,7 @@ mod tests {
         let probe = MediaProbe {
             container: Some("mov,mp4,m4a,3gp,3g2,mj2".to_string()),
             video: Some(VideoStream {
-                codec: "h264".to_string(),
+                codec: Some("h264".to_string()),
                 profile: Some("high".to_string()),
                 level: Some(41),
                 pixel_format: Some("yuv420p".to_string()),
@@ -883,12 +883,12 @@ mod tests {
             }),
             audio: vec![
                 AudioStream {
-                    codec: "ac3".to_string(),
+                    codec: Some("ac3".to_string()),
                     channels: Some(6),
                     language: Some("eng".to_string()),
                 },
                 AudioStream {
-                    codec: "aac".to_string(),
+                    codec: Some("aac".to_string()),
                     channels: Some(2),
                     language: Some("eng".to_string()),
                 },
@@ -929,7 +929,7 @@ mod tests {
         let probe = MediaProbe {
             container: Some("mov,mp4,m4a,3gp,3g2,mj2".to_string()),
             video: Some(VideoStream {
-                codec: "h264".to_string(),
+                codec: Some("h264".to_string()),
                 profile: Some("high".to_string()),
                 level: Some(41),
                 pixel_format: Some("yuv420p".to_string()),
@@ -941,7 +941,7 @@ mod tests {
             // The measured population: AC3, which the Chromecast refuses in
             // every layout, carrying more channels than it will take.
             audio: vec![AudioStream {
-                codec: "ac3".to_string(),
+                codec: Some("ac3".to_string()),
                 channels: Some(6),
                 language: None,
             }],
@@ -985,7 +985,7 @@ mod tests {
         let conforming = || MediaProbe {
             container: Some("mov,mp4,m4a,3gp,3g2,mj2".to_string()),
             video: Some(VideoStream {
-                codec: "h264".to_string(),
+                codec: Some("h264".to_string()),
                 profile: Some("high".to_string()),
                 level: Some(41),
                 pixel_format: Some("yuv420p".to_string()),
@@ -995,7 +995,7 @@ mod tests {
                 height: Some(1080),
             }),
             audio: vec![AudioStream {
-                codec: "aac".to_string(),
+                codec: Some("aac".to_string()),
                 channels: Some(2),
                 language: None,
             }],
@@ -1006,7 +1006,7 @@ mod tests {
         // it can and leave the layout alone. Asking for the cap here would
         // widen a stereo track towards a ceiling it was never near.
         let mut wrong_codec = conforming();
-        wrong_codec.audio[0].codec = "ac3".to_string();
+        wrong_codec.audio[0].codec = Some("ac3".to_string());
         assert_eq!(
             Operation::for_conformance(&evaluate(&wrong_codec, &chromecast), &chromecast),
             Some(Operation::Remux {
@@ -1018,7 +1018,7 @@ mod tests {
         // Both at once, which is the case the two above are each half of: a
         // track that fixes only the codec still does not play.
         let mut wrong_codec_and_layout = conforming();
-        wrong_codec_and_layout.audio[0].codec = "ac3".to_string();
+        wrong_codec_and_layout.audio[0].codec = Some("ac3".to_string());
         wrong_codec_and_layout.audio[0].channels = Some(6);
         assert_eq!(
             Operation::for_conformance(
@@ -1047,7 +1047,7 @@ mod tests {
         // is the subtitles the viewer turned on, so losing it is not a fix.
         let mut burned_in = conforming();
         burned_in.subtitles = vec![SubtitleStream {
-            codec: "hdmv_pgs_subtitle".to_string(),
+            codec: Some("hdmv_pgs_subtitle".to_string()),
             language: None,
         }];
         assert_eq!(
@@ -1068,7 +1068,7 @@ mod tests {
         // container changes.
         let mut avi = conforming();
         avi.container = Some("avi".to_string());
-        avi.video.as_mut().unwrap().codec = "mpeg4".to_string();
+        avi.video.as_mut().unwrap().codec = Some("mpeg4".to_string());
         avi.video.as_mut().unwrap().profile = None;
         avi.video.as_mut().unwrap().level = None;
         assert_eq!(

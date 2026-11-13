@@ -1,16 +1,10 @@
 # Chromecast 2nd/3rd generation: the disc with micro-USB power, 1080p output.
-# Not the Ultra, which has USB-C and decodes HEVC.
-#
-# `observed` was confirmed against a live Plex playback decision on this
-# device. `assumed` is the specification, and is a belief that has never been
-# tested. Do not promote a value from one to the other without a measurement.
+# Not the Ultra, which has USB-C and decodes HEVC. Provenance: see D27 and D35.
 
 name = "chromecast-gen2-3"
 device = "Chromecast gen 2/3, Plex receiver app, Plex Media Server on a Pi 4"
 
-# Containers are keyed by FFprobe's whole `format_name`, one entry per demuxer,
-# and an entry is `observed` only if every format its demuxer reads was
-# measured (D29).
+# One entry per FFprobe demuxer. See D29.
 [containers.accepts]
 # No QuickTime, M4A or 3GP file is recorded as played here, and each reads
 # through the same demuxer as an MP4. The receiver app is fed by the server,
@@ -52,12 +46,8 @@ observed = ["aac"]
 assumed = ["mp3", "opus", "vorbis", "flac"]
 
 [audio.codecs.rejects]
-# Measured, and the single most expensive assumption this project got wrong:
-# AC3 is transcoded in every channel layout, stereo included.
-#
-# The LG envelope has ac3 under `accepts.observed`, measured just as this was.
-# The two do not contradict each other: this is the receiver app, that is the
-# panel, and an envelope is per client so they are allowed to differ.
+# Measured: the receiver app transcodes AC3 in every channel layout, stereo
+# included. The LG panel decodes it; an envelope is per client.
 observed = ["ac3"]
 assumed = ["eac3", "dts", "truehd"]
 

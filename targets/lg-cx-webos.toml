@@ -1,30 +1,14 @@
 # LG OLED65CX, webOS 5, alpha9 Gen3, running the Plex webOS app.
-# No AV1: that arrived with the C1.
-#
-# `observed` was confirmed against a live Plex playback decision on this
-# device. `assumed` is the specification, and is a belief that has never been
-# tested. Do not promote a value from one to the other without a measurement.
+# No AV1: that arrived with the C1. Provenance: see D27 and D35.
 #
 # Every reading taken here before 2026-09-01 was taken with the app's own
-# video quality set to "3 Mbps 720p". Under that setting the server re-encodes
-# and downscales every file whatever it holds, so a session showing work being
-# done says nothing about what the device can decode - it shows the cap. Two
-# entries were promoted to `observed` on exactly that reading and both were
-# wrong. So an `observed` **rejection**, and anything else recorded from a
-# session where the server was working, has to name what tells it apart from
-# the cap: a copied video stream, or a stall with no session in flight.
-#
-# An `observed` **acceptance** is not exposed to this. The cap could only ever
-# manufacture a transcode, and a transcode is not how an acceptance is read -
-# every accepted value here was read off a Direct Play, which the cap cannot
-# produce. That asymmetry is why the corrections below all fall on one side.
+# video quality set to "3 Mbps 720p", under which the server re-encodes every
+# file whatever it holds. Readings since are at Original.
 
 name = "lg-cx-webos"
 device = "LG CX OLED, Plex webOS app, Plex Media Server on a Pi 4"
 
-# Containers are keyed by FFprobe's whole `format_name`, one entry per demuxer,
-# and an entry is `observed` only if every format its demuxer reads was
-# measured (D29).
+# One entry per FFprobe demuxer. See D29.
 [containers.accepts]
 # An MP4 and an MKV were watched Direct Playing (the AC3 and EAC3 sessions
 # below). No QuickTime, M4A, 3GP or WebM file has been, and each reads through
@@ -32,19 +16,11 @@ device = "LG CX OLED, Plex webOS app, Plex Media Server on a Pi 4"
 assumed = ["mov,mp4,m4a,3gp,3g2,mj2", "matroska,webm"]
 
 [containers.rejects]
-# Measured, and not a decode failure: the app plays this video fine and then
-# stalls ~48s mid-episode with the server at 0.5% CPU and nothing in flight,
-# which is the client waiting on an index AVI does not carry up front. It is
-# recorded as a rejection because that is what it costs to fix - a copy into
-# MP4 - and a verdict the reader acts on cannot distinguish "refused" from
-# "played badly".
-#
-# Rechecked against the client cap and kept. The idle CPU alone would not
-# settle it, because a stalled transcode burns no CPU either; what does is
-# that **nothing was in flight** - a capped playback is a transcode session,
-# and a transcode session appears in /status/sessions. There was none. The
-# shape of the failure says the same thing from the other side: the cap
-# produces a downscaled file that plays, not a file that plays and then stops.
+# Measured, and not a decode failure: the app plays this video and then stalls
+# ~48s mid-episode with nothing in /status/sessions, which is the client
+# waiting on an index AVI does not carry up front. A rejection, because the fix
+# is the same as for one: a copy into MP4. The empty session list is what
+# separates it from the client cap.
 observed = ["avi"]
 
 [video]
@@ -70,69 +46,35 @@ vp9.assumed = ["profile 0", "profile 2"]
 h264 = { value = 51, source = "assumed" }
 
 [audio]
-# Both measurements below were stereo Direct Plays with the audio copied, so
-# two channels are observed. Nothing multichannel has been played on this app.
+# Nothing multichannel has been played on this app.
 max_channels = { value = 6, source = "assumed", observed_up_to = 2, note = "the panel's decoder spec; the two AC3/EAC3 Direct Plays measured on 2026-09-01 were both 2-channel" }
 
 [audio.codecs.accepts]
-# AC3 and EAC3 measured 2026-09-01 with the app's video quality set to
-# Original, read from /status/sessions: Fawlty Towers S01E01.mp4 carries AC3
-# stereo and Blackadder S01E01.mkv carries EAC3 stereo, and both reported
-# `part decision = directplay` with the audio copied. The AC3 file produced no
-# audio decision at all, which is the server saying it was never asked a
-# question about that track.
-#
-# This does not contradict the Chromecast envelope, which has `ac3` under
-# `rejects.observed`. They are different clients and are measured separately:
-# the receiver app transcodes AC3 in every layout, the panel decodes it. A
-# per-target envelope exists so two devices are allowed to differ.
-#
-# Both readings were stereo, so they say nothing about a wider layout. That
-# claim is `max_channels` above, and is assumed above two channels.
+# AC3 and EAC3 measured 2026-09-01 at Original, read from /status/sessions:
+# Fawlty Towers S01E01.mp4 (AC3 stereo) and Blackadder S01E01.mkv (EAC3 stereo)
+# both reported `part decision = directplay` with the audio copied. The
+# Chromecast receiver rejects AC3; an envelope is per client.
 observed = ["aac", "ac3", "eac3"]
 assumed = ["mp3", "flac"]
 
 [audio.codecs.rejects]
-# Measured as an Opus track transcoded to MP3 **with the video copied**, which
-# is what separates it from the capped readings: the cap re-encodes the
-# picture, and this session did not. So the transcode was asked for by the
-# codec rather than by a bitrate ceiling.
+# Measured as an Opus track transcoded to MP3 with the video copied, which is
+# what separates it from the client cap.
 observed = ["opus"]
 # LG dropped DTS decoding across the 2020 line.
 assumed = ["dts", "truehd"]
 
 [subtitles]
-# Nothing. This app has not been seen burning in any subtitle format, and two
-# of the three it was once claimed to burn have now been watched not burning.
+# Nothing burns in. Both readings 2026-09-01 at Original:
+# - Fawlty Towers S01E01.mp4: `part decision = directplay`, no video decision,
+#   and its mov_text track `subtitleDecision = transcode` with `container =
+#   srt`. A sidecar, with the picture copied.
+# - Blackadder S01E01.mkv: `part decision = directplay`, HEVC and EAC3 copied,
+#   and its PGS track `subtitleDecision = copy`. The app renders the bitmap.
 #
-# `mov_text` and `webvtt` were here as `observed`, and both readings came from
-# sessions under the 3 Mbps 720p client cap. A server re-encoding the picture
-# anyway burns a text track into it for nothing, so the burn followed from the
-# cap and was never a property of the client. The discriminating playback:
-# 2026-09-01, quality set to Original, Fawlty Towers S01E01.mp4 reported
-# `part decision = directplay` with no video decision at all, and its selected
-# mov_text track `subtitleDecision = transcode` with `container = srt`. The
-# track was converted into a sidecar and the picture was copied.
+# `webvtt` is untested: the only session that carried one was capped.
+# `dvd_subtitle` and `dvb_subtitle` have no reading of their own; the belief
+# that a client cannot overlay a bitmap is the one the PGS reading contradicts.
 #
-# `hdmv_pgs_subtitle` was here as `assumed`, on the belief that a client cannot
-# overlay a bitmap and so the server must burn it. Same evening, same setting:
-# Blackadder S01E01.mkv, `part decision = directplay` at 31.9x with HEVC and
-# EAC3 both copied, and its selected PGS track `subtitleDecision = copy`. The
-# app rendered the bitmap itself.
-#
-# `webvtt` is untested rather than disproven - the only session that carried
-# one is a capped one - and it is still left out rather than assumed, because
-# `assumed` is a belief and the belief that put it here has been withdrawn.
-#
-# `dvd_subtitle` and `dvb_subtitle` are gone too, and that is the one removal
-# with no measurement of its own. They were never read off a session; they were
-# there on the same reasoning that put PGS here, which this device has now been
-# watched contradicting. Keeping them would be carrying the inference forward
-# and dropping only the case that happened to get tested.
-#
-# `ass` and `ssa` were never here. The argument for adding them was that a
-# plain text format burns, and it does not.
-#
-# The key is stated and empty rather than omitted, so that a reader who greps
-# for `burns_in` lands on this comment instead of on nothing.
+# Stated and empty, so that a grep for `burns_in` lands here.
 burns_in = {}
