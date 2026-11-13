@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use glob::Pattern;
 use std::collections::HashMap;
 use std::fs;
@@ -9,6 +9,15 @@ use walkdir::WalkDir;
 
 use crate::paths::to_forward_slashes;
 use crate::queue::QueueDirectory;
+
+/// What a walk could not read, naming the path the way every other line does.
+/// walkdir's own message renders it natively.
+fn unreadable(error: &walkdir::Error) -> String {
+    match (error.path(), error.io_error()) {
+        (Some(path), Some(io)) => format!("{}: {io}", to_forward_slashes(path)),
+        _ => error.to_string(),
+    }
+}
 
 /// Handles .plexifyignore files with gitignore-style pattern matching
 #[derive(Debug, Clone)]
@@ -95,12 +104,14 @@ impl IgnoreFilter {
     fn load_ignore_files_under(&mut self, scan_path: &Path) -> Result<()> {
         let mut walk = WalkDir::new(scan_path).follow_links(false).into_iter();
         while let Some(entry) = walk.next() {
-            let entry = entry.with_context(|| {
-                format!(
-                    "could not look for .plexifyignore files in {}",
-                    scan_path.display()
-                )
-            })?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => bail!(
+                    "could not look for .plexifyignore files in {}: {}",
+                    to_forward_slashes(scan_path),
+                    unreadable(&error)
+                ),
+            };
             if !entry.file_type().is_dir() {
                 continue;
             }
@@ -140,7 +151,7 @@ impl IgnoreFilter {
                 IgnorePattern::new(trimmed).with_context(|| {
                     format!(
                         "{}:{}: invalid pattern '{}'",
-                        ignore_file.display(),
+                        to_forward_slashes(&ignore_file),
                         line_num + 1,
                         trimmed
                     )
@@ -152,7 +163,7 @@ impl IgnoreFilter {
             debug!(
                 "Loaded {} patterns from {}",
                 patterns.len(),
-                ignore_file.display()
+                to_forward_slashes(&ignore_file)
             );
             self.patterns_by_dir.insert(dir.to_path_buf(), patterns);
         }
@@ -241,7 +252,7 @@ impl IgnoreFilter {
                         trace!(
                             "Pattern '{}' from {} {} path '{}'",
                             pattern.original,
-                            dir.display(),
+                            to_forward_slashes(dir),
                             if ignored { "ignores" } else { "includes" },
                             path_str
                         );
@@ -281,7 +292,10 @@ impl Iterator for MediaFiles<'_> {
             let entry = match self.walk.next()? {
                 Ok(entry) => entry,
                 Err(error) => {
-                    warn!("⚠️ Skipped, because it could not be read: {error}");
+                    warn!(
+                        "⚠️ Skipped, because it could not be read: {}",
+                        unreadable(&error)
+                    );
                     continue;
                 }
             };
@@ -298,7 +312,7 @@ impl Iterator for MediaFiles<'_> {
                 // constantly, and its jobs and half-written encodes are not
                 // library files.
                 if is_queue_directory(path) || self.filter.should_skip_dir(path) {
-                    debug!("🚫 Skipping entire directory: {:?}", path);
+                    debug!("🚫 Skipping entire directory: {}", to_forward_slashes(path));
                     self.walk.skip_current_dir();
                 } else {
                     self.directories += 1;
@@ -307,7 +321,7 @@ impl Iterator for MediaFiles<'_> {
             }
 
             if self.filter.is_ignored(path, false) {
-                debug!("🚫 Ignoring path: {:?}", path);
+                debug!("🚫 Ignoring path: {}", to_forward_slashes(path));
                 self.ignored += 1;
                 continue;
             }
@@ -637,7 +651,7 @@ mod tests {
 
         let message = format!("{error:#}");
         assert!(
-            message.contains(&format!("{}:3", ignore_file.display())),
+            message.contains(&format!("{}:3", to_forward_slashes(&ignore_file))),
             "names the file and line: {message}"
         );
         assert!(message.contains("'zz['"), "names the pattern: {message}");
@@ -831,7 +845,7 @@ mod tests {
             .find(|line| line.contains("WARN"))
             .unwrap_or_else(|| panic!("no warning in: {logs}"));
         assert!(
-            warning.contains(&locked.display().to_string()),
+            warning.contains(&to_forward_slashes(&locked)),
             "names the directory: {warning}"
         );
     }
@@ -852,7 +866,7 @@ mod tests {
 
         let message = format!("{:#}", result.unwrap_err());
         assert!(
-            message.contains(&locked.display().to_string()),
+            message.contains(&to_forward_slashes(&locked)),
             "names the directory: {message}"
         );
     }

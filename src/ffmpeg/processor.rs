@@ -12,6 +12,7 @@ use super::operation::{with_operation, with_streams};
 use super::subtitle_streams::SubtitleSource;
 use super::{Chunking, FFmpegCommandBuilder};
 use crate::job::{Job, MediaFileType, Operation};
+use crate::paths::to_forward_slashes;
 
 /// What a run has read off the source file, before either encode path is
 /// chosen.
@@ -141,11 +142,17 @@ impl FFmpegProcessor {
         let input_path = job.full_input_path(media_root);
         let output_path = job.work_folder_output_path(work_folder);
 
-        info!("🚀 Starting conversion for: {:?}", input_path);
+        info!(
+            "🚀 Starting conversion for: {}",
+            to_forward_slashes(&input_path)
+        );
 
         // Ensure input file exists
         if !input_path.exists() {
-            return Err(anyhow!("Input file does not exist: {input_path:?}"));
+            return Err(anyhow!(
+                "Input file does not exist: {}",
+                to_forward_slashes(&input_path)
+            ));
         }
 
         // Every operation maps the picture, and a queue built by extension
@@ -156,7 +163,8 @@ impl FFmpegProcessor {
         // to convert.
         if self.probe_video_stream_count(&input_path).await == Some(0) {
             return Err(anyhow!(
-                "FFprobe finds no video stream in {input_path:?}; plexify only converts video"
+                "FFprobe finds no video stream in {}; plexify only converts video",
+                to_forward_slashes(&input_path)
             ));
         }
 
@@ -182,7 +190,10 @@ impl FFmpegProcessor {
                     .full_subtitle_path(media_root)
                     .ok_or_else(|| anyhow!("WebM job missing subtitle path"))?;
                 if !vtt_path.exists() {
-                    return Err(anyhow!("Required subtitle file not found: {vtt_path:?}"));
+                    return Err(anyhow!(
+                        "Required subtitle file not found: {}",
+                        to_forward_slashes(&vtt_path)
+                    ));
                 }
                 Some(SubtitleSource::External(vtt_path))
             }
@@ -201,8 +212,9 @@ impl FFmpegProcessor {
                 Some(channels) => channels,
                 None => {
                     return Err(anyhow!(
-                        "FFprobe could not read the audio layout of {input_path:?}, and a track \
-                         cannot be made to fit a client without knowing what the source carries"
+                        "FFprobe could not read the audio layout of {}, and a track \
+                         cannot be made to fit a client without knowing what the source carries",
+                        to_forward_slashes(&input_path)
                     ))
                 }
             }
@@ -275,8 +287,9 @@ impl FFmpegProcessor {
         self.run(ffmpeg_builder.build(), "conversion").await?;
 
         info!(
-            "✅ Conversion successful: {:?} -> {:?}",
-            input_path, output_path
+            "✅ Conversion successful: {} -> {}",
+            to_forward_slashes(input_path),
+            to_forward_slashes(output_path)
         );
         Ok(())
     }
@@ -381,7 +394,10 @@ impl FFmpegProcessor {
             .ok()?;
 
         if !output.status.success() {
-            debug!("FFprobe could not read a duration from {input_path:?}");
+            debug!(
+                "FFprobe could not read a duration from {}",
+                to_forward_slashes(input_path)
+            );
             return None;
         }
 

@@ -140,19 +140,16 @@ impl<'a> JobProcessor<'a> {
                     Operation::Remux { .. } => "remux",
                     Operation::Reencode { .. } => "re-encode",
                 };
-                info!("➕ Queueing {work} job for: {path:?}");
+                info!("➕ Queueing {work} job for: {path}");
             }
             JobProcessResult::OutputExists => {
-                info!("⏭️ Not queued, because its output already exists: {path:?}");
+                info!("⏭️ Not queued, because its output already exists: {path}");
             }
             JobProcessResult::AlreadyQueued => {
-                info!("⏭️ Not queued, because it already has a job: {path:?}");
+                info!("⏭️ Not queued, because it already has a job: {path}");
             }
             JobProcessResult::MissingSubtitle => {
-                warn!(
-                    "⚠️ SKIPPING: Missing subtitle file for '{:?}'",
-                    relative_path
-                );
+                warn!("⚠️ SKIPPING: Missing subtitle file for {path}");
             }
         }
     }
@@ -165,13 +162,13 @@ impl<'a> JobProcessor<'a> {
                 "mkv" => Ok(MediaFileType::Mkv),
                 "avi" => Ok(MediaFileType::Avi),
                 _ => Err(format!(
-                    "Unsupported file type. Only .webm, .mkv and .avi files are supported. Got: {:?}",
-                    file_path
+                    "Unsupported file type. Only .webm, .mkv and .avi files are supported. Got: {}",
+                    to_forward_slashes(file_path)
                 )),
             },
             None => Err(format!(
-                "File has no extension. Only .webm, .mkv and .avi files are supported: {:?}",
-                file_path
+                "File has no extension. Only .webm, .mkv and .avi files are supported: {}",
+                to_forward_slashes(file_path)
             )),
         }
     }

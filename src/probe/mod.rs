@@ -9,6 +9,8 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::paths::to_forward_slashes;
+
 /// The streams and container properties of one media file.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MediaProbe {
@@ -104,16 +106,23 @@ pub fn probe(path: &Path) -> Result<MediaProbe> {
         ])
         .arg(path)
         .output()
-        .with_context(|| format!("could not run ffprobe on {}", path.display()))?;
+        .with_context(|| format!("could not run ffprobe on {}", to_forward_slashes(path)))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let detail = stderr.lines().last().unwrap_or("ffprobe failed").trim();
-        return Err(anyhow!("ffprobe rejected {}: {detail}", path.display()));
+        return Err(anyhow!(
+            "ffprobe rejected {}: {detail}",
+            to_forward_slashes(path)
+        ));
     }
 
-    parse(&String::from_utf8_lossy(&output.stdout))
-        .with_context(|| format!("could not read what ffprobe said about {}", path.display()))
+    parse(&String::from_utf8_lossy(&output.stdout)).with_context(|| {
+        format!(
+            "could not read what ffprobe said about {}",
+            to_forward_slashes(path)
+        )
+    })
 }
 
 /// Build a probe from FFprobe's JSON.

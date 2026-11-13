@@ -18,12 +18,17 @@ use crate::paths::to_forward_slashes;
 
 /// Read the record a fix run left behind.
 pub fn read_record(plan_file: &Path) -> Result<FixOutcome> {
-    let contents = fs::read_to_string(plan_file)
-        .with_context(|| format!("could not read the plan file {plan_file:?}"))?;
+    let contents = fs::read_to_string(plan_file).with_context(|| {
+        format!(
+            "could not read the plan file {}",
+            to_forward_slashes(plan_file)
+        )
+    })?;
 
     serde_json::from_str(&contents).with_context(|| {
         format!(
-            "could not read {plan_file:?} as a record of a completed run - it may be from an older version of plexify, or from a run that was interrupted before it finished"
+            "could not read {} as a record of a completed run - it may be from an older version of plexify, or from a run that was interrupted before it finished",
+            to_forward_slashes(plan_file)
         )
     })
 }

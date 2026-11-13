@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use super::{chunk_dir_for, FFmpegProcessor};
 use crate::job::Job;
+use crate::paths::to_forward_slashes;
 use crate::subtitles;
 
 /// Where a finished output is copied to before it is renamed onto its
@@ -46,7 +47,10 @@ fn disabled_path(path: &Path) -> PathBuf {
 async fn remove_leftover(path: &Path) {
     match tokio::fs::remove_file(path).await {
         Err(e) if e.kind() != ErrorKind::NotFound => {
-            warn!("Could not remove {path:?} after a failed move: {e}")
+            warn!(
+                "Could not remove {} after a failed move: {e}",
+                to_forward_slashes(path)
+            )
         }
         _ => {}
     }
@@ -74,8 +78,11 @@ impl FFmpegProcessor {
         let chunk_dir = chunk_dir_for(job_id, work_folder);
         if chunk_dir.exists() {
             match tokio::fs::remove_dir_all(&chunk_dir).await {
-                Ok(_) => info!("🗑️ Discarded the chunks of a parked job: {chunk_dir:?}"),
-                Err(e) => warn!("Could not remove {chunk_dir:?}: {e}"),
+                Ok(_) => info!(
+                    "🗑️ Discarded the chunks of a parked job: {}",
+                    to_forward_slashes(&chunk_dir)
+                ),
+                Err(e) => warn!("Could not remove {}: {e}", to_forward_slashes(&chunk_dir)),
             }
         }
 
@@ -84,7 +91,10 @@ impl FFmpegProcessor {
         // this job would have used is not needed to find it.
         let prefix = format!("{job_id}_");
         let unreadable = |e: std::io::Error| {
-            warn!("Could not read {work_folder:?} to discard what job {job_id} left there: {e}")
+            warn!(
+                "Could not read {} to discard what job {job_id} left there: {e}",
+                to_forward_slashes(work_folder)
+            )
         };
         let mut entries = match tokio::fs::read_dir(work_folder).await {
             Ok(entries) => entries,
@@ -98,7 +108,10 @@ impl FFmpegProcessor {
             };
             if entry.file_name().to_string_lossy().starts_with(&prefix) {
                 if let Err(e) = tokio::fs::remove_file(entry.path()).await {
-                    warn!("Could not remove {:?}: {e}", entry.path());
+                    warn!(
+                        "Could not remove {}: {e}",
+                        to_forward_slashes(&entry.path())
+                    );
                 }
             }
         }
@@ -130,7 +143,8 @@ impl FFmpegProcessor {
         // Ensure the work folder output file exists
         if !work_output_path.exists() {
             return Err(anyhow!(
-                "Work folder output file does not exist: {work_output_path:?}"
+                "Work folder output file does not exist: {}",
+                to_forward_slashes(&work_output_path)
             ));
         }
 
@@ -144,14 +158,18 @@ impl FFmpegProcessor {
 
         if let Err(e) = tokio::fs::copy(&work_output_path, &staging_path).await {
             remove_leftover(&staging_path).await;
-            return Err(anyhow!("Failed to copy output to {staging_path:?}: {e}"));
+            return Err(anyhow!(
+                "Failed to copy output to {}: {e}",
+                to_forward_slashes(&staging_path)
+            ));
         }
 
         // `fs::rename` replaces whatever is at the destination; this refuses it.
         if let Err(e) = crate::fix::rename(&staging_path, &final_output_path) {
             remove_leftover(&staging_path).await;
             return Err(anyhow!(
-                "Failed to move output into place at {final_output_path:?}: {e:#}"
+                "Failed to move output into place at {}: {e:#}",
+                to_forward_slashes(&final_output_path)
             ));
         }
 
@@ -167,12 +185,16 @@ impl FFmpegProcessor {
         // failure here would send the job round again to find its own finished
         // output at the destination.
         if let Err(e) = tokio::fs::remove_file(&work_output_path).await {
-            warn!("Could not remove {work_output_path:?} after moving it: {e}");
+            warn!(
+                "Could not remove {} after moving it: {e}",
+                to_forward_slashes(&work_output_path)
+            );
         }
 
         info!(
-            "📁 Moved completed file: {:?} -> {:?}",
-            work_output_path, final_output_path
+            "📁 Moved completed file: {} -> {}",
+            to_forward_slashes(&work_output_path),
+            to_forward_slashes(&final_output_path)
         );
 
         Ok(())
@@ -201,8 +223,9 @@ impl FFmpegProcessor {
             Ok(entries) => entries,
             Err(e) => {
                 warn!(
-                    "Could not read {directory:?} for the subtitles of {final_output:?}, so none \
-                     were moved beside it: {e}"
+                    "Could not read {} for the subtitles of {}, so none were moved beside it: {e}",
+                    to_forward_slashes(directory),
+                    to_forward_slashes(final_output)
                 );
                 return;
             }
@@ -232,19 +255,33 @@ impl FFmpegProcessor {
             let destination = final_output.with_file_name(name);
             // `copy` would replace a subtitle somebody already put there.
             if destination.exists() {
-                warn!("Kept {path:?}: {destination:?} already exists; it will not be overwritten");
+                warn!(
+                    "Kept {}: {} already exists; it will not be overwritten",
+                    to_forward_slashes(&path),
+                    to_forward_slashes(&destination)
+                );
                 continue;
             }
             if let Err(e) = tokio::fs::copy(&path, &destination).await {
-                warn!("Could not put the subtitle {destination:?} beside its file: {e}");
+                warn!(
+                    "Could not put the subtitle {} beside its file: {e}",
+                    to_forward_slashes(&destination)
+                );
                 continue;
             }
 
             if let Err(e) = tokio::fs::remove_file(&path).await {
-                warn!("Could not remove {path:?} after moving it: {e}");
+                warn!(
+                    "Could not remove {} after moving it: {e}",
+                    to_forward_slashes(&path)
+                );
             }
 
-            info!("Moved subtitle: {:?} -> {:?}", path, destination);
+            info!(
+                "Moved subtitle: {} -> {}",
+                to_forward_slashes(&path),
+                to_forward_slashes(&destination)
+            );
         }
     }
 
@@ -268,12 +305,17 @@ impl FFmpegProcessor {
         // again, since `fs::rename` would replace a `.disabled` file already there.
         if let Some((_, taken)) = moves.iter().find(|(_, disabled)| disabled.exists()) {
             return Err(anyhow!(
-                "{taken:?} already exists; it will not be overwritten"
+                "{} already exists; it will not be overwritten",
+                to_forward_slashes(taken)
             ));
         }
         for (path, disabled) in &moves {
             crate::fix::rename(path, disabled)?;
-            debug!("Disabled {path:?} -> {disabled:?}");
+            debug!(
+                "Disabled {} -> {}",
+                to_forward_slashes(path),
+                to_forward_slashes(disabled)
+            );
         }
 
         Ok(())
@@ -463,7 +505,7 @@ mod tests {
             .expect_err("a taken output name is refused");
 
         assert!(
-            format!("{error:#}").contains(&format!("{final_path:?}")),
+            format!("{error:#}").contains(&to_forward_slashes(&final_path)),
             "the refusal names the file it would have replaced: {error:#}"
         );
         assert_eq!(
@@ -530,7 +572,7 @@ mod tests {
             .await
             .expect_err("a taken .disabled name is refused");
         assert!(
-            format!("{error:#}").contains(&format!("{disabled_source:?}")),
+            format!("{error:#}").contains(&to_forward_slashes(&disabled_source)),
             "{error:#}"
         );
         assert_eq!(std::fs::read_to_string(&source).unwrap(), "source");
@@ -549,7 +591,7 @@ mod tests {
             .await
             .expect_err("a taken .vtt.disabled name is refused");
         assert!(
-            format!("{error:#}").contains(&format!("{disabled_subtitle:?}")),
+            format!("{error:#}").contains(&to_forward_slashes(&disabled_subtitle)),
             "{error:#}"
         );
         assert_eq!(std::fs::read_to_string(&source).unwrap(), "source");

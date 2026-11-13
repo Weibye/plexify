@@ -10,6 +10,8 @@ use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use crate::paths::to_forward_slashes;
+
 /// The envelopes that ship with plexify, by name.
 pub const BUILTIN_TARGETS: &[(&str, &str)] = &[
     (
@@ -244,9 +246,9 @@ impl PlaybackTarget {
 
     pub fn from_file(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
-            .with_context(|| format!("could not read target {}", path.display()))?;
+            .with_context(|| format!("could not read target {}", to_forward_slashes(path)))?;
 
-        Self::from_toml(&text).with_context(|| format!("target {}", path.display()))
+        Self::from_toml(&text).with_context(|| format!("target {}", to_forward_slashes(path)))
     }
 
     pub fn from_toml(text: &str) -> Result<Self> {

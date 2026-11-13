@@ -37,13 +37,16 @@ impl WorkCommand {
     pub async fn execute(&self) -> Result<()> {
         if !self.media_root.exists() {
             return Err(anyhow!(
-                "Media directory does not exist: {:?}",
-                self.media_root
+                "Media directory does not exist: {}",
+                to_forward_slashes(&self.media_root)
             ));
         }
 
         if !self.media_root.is_dir() {
-            return Err(anyhow!("Path is not a directory: {:?}", self.media_root));
+            return Err(anyhow!(
+                "Path is not a directory: {}",
+                to_forward_slashes(&self.media_root)
+            ));
         }
 
         let config = Config::from_env()?;
@@ -186,8 +189,8 @@ impl WorkCommand {
             // every retry instead.
             if job.output_exists(media_root) {
                 info!(
-                    "⏭️ Output already exists, nothing to do: {:?}",
-                    job.full_output_path(media_root)
+                    "⏭️ Output already exists, nothing to do: {}",
+                    to_forward_slashes(&job.full_output_path(media_root))
                 );
                 report_completion(&job_name, claimed_job.complete().await?);
                 return Ok(true);
