@@ -549,3 +549,39 @@ Recorded 2026-11-13.
 - Guarded by `a_file_with_no_video_stream_is_unassessable_rather_than_refused`,
   `a_file_with_no_picture_is_named_rather_than_counted_as_direct_play` and
   `a_file_with_no_picture_is_neither_queued_nor_said_to_play`.
+
+## 35. An observation is a Direct Play read off the device
+
+Recorded 2026-11-13.
+
+**Decision.**
+- An `observed` value is read off a live Plex playback decision on the device, with the
+  client's quality setting at Original.
+- An acceptance is a Direct Play.
+- A rejection says what rules out a client cap: the video stream was copied, or playback
+  stalled with no session in `/status/sessions`. It goes under `rejects`, not left out.
+- A limit records the highest value measured as `observed_up_to`.
+
+**Why.** Two LG values were promoted to `observed` from sessions under the app's
+"3 Mbps 720p" cap, and both were wrong. A cap can only cause a transcode, so it fakes
+rejections and never acceptances. A value left out cannot tell "measured failing" from
+"never tried".
+
+**Consequences.**
+- The TOMLs hold each device's evidence and point here.
+- Guarded by `the_lg_is_not_claimed_to_burn_any_subtitle_in` and
+  `the_measured_rejections_survive_a_round_trip_through_toml`.
+
+## 36. Direct Play is one predicate
+
+Recorded 2026-11-13.
+
+**Supersedes** the first consequence of 34.
+
+**Decision.** `Conformance::direct_plays()` is true only for `Conforms`. `cost()` returning
+`None` means no job and nothing more.
+
+**Why.** "No cost" covered both Direct Play and `NoPicture`, so every caller wanting Direct
+Play had to remember to exclude `NoPicture` by name.
+
+**Consequences.** Guarded by `a_file_with_no_picture_is_named_rather_than_counted_as_direct_play`.

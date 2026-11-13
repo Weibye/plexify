@@ -148,7 +148,7 @@ pub enum Conformance {
 
 impl Conformance {
     /// Whether the client plays the file as it is. A file with no picture
-    /// needs no job, and does not Direct Play either.
+    /// needs no job, and does not Direct Play either. See D36.
     pub fn direct_plays(&self) -> bool {
         matches!(self, Conformance::Conforms { .. })
     }
