@@ -24,9 +24,22 @@ use crate::target::{evaluate, Conformance, Cost, Finding, PlaybackTarget, Proven
 pub struct AuditEntry {
     /// The file relative to the scanned directory, with `/` separators.
     pub path: String,
-    /// Out of the file's `stat`. When that stat failed this is 0 and the
-    /// outcome is `ProbeFailed` with the OS's reason, which keeps the entry
-    /// out of every cost bucket and so out of every total.
+    pub outcome: Outcome,
+}
+
+impl AuditEntry {
+    /// What the file's `stat` said, or `None` when it could not be stat'd.
+    pub fn stat(&self) -> Option<&Stat> {
+        match &self.outcome {
+            Outcome::Assessed { stat, .. } => Some(stat),
+            Outcome::Unreadable { stat, .. } => stat.as_ref(),
+        }
+    }
+}
+
+/// What one `stat` of a file said.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Stat {
     pub size_bytes: u64,
     /// How much of `size_bytes` is actually backed by disk. See [`Allocation`].
     pub allocation: Allocation,
@@ -37,7 +50,6 @@ pub struct AuditEntry {
     /// file looks like. This is what lets the report attach that caveat to the
     /// individual line rather than only to the heading above the list.
     pub modified: Option<SystemTime>,
-    pub outcome: Outcome,
 }
 
 /// How much of a file's apparent length is really on the disk.
@@ -126,12 +138,14 @@ fn allocation_of(_metadata: &std::fs::Metadata) -> Allocation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Outcome {
-    Assessed(Conformance),
-    /// The file could not be stat'd or FFprobe could not read it, so nothing
-    /// is claimed about it.
-    ProbeFailed {
-        reason: String,
+    Assessed {
+        stat: Stat,
+        conformance: Conformance,
     },
+    /// No verdict is claimed: FFprobe could not read the file, or it could not
+    /// even be stat'd. In the second case `stat` is `None`, the file was never
+    /// probed, and its size is as unknown as its conformance.
+    Unreadable { stat: Option<Stat>, reason: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,32 +158,41 @@ pub struct AuditReport {
 
 impl AuditReport {
     /// The files in one cost bucket. `None` is the bucket that needs nothing.
-    pub fn bucket(&self, cost: Option<Cost>) -> impl Iterator<Item = &AuditEntry> {
+    pub fn bucket(
+        &self,
+        cost: Option<Cost>,
+    ) -> impl Iterator<Item = (&AuditEntry, &Stat, &Conformance)> {
         self.entries
             .iter()
-            .filter(move |entry| match &entry.outcome {
-                Outcome::Assessed(conformance) => conformance.cost() == cost,
-                Outcome::ProbeFailed { .. } => false,
+            .filter_map(move |entry| match &entry.outcome {
+                Outcome::Assessed { stat, conformance } if conformance.cost() == cost => {
+                    Some((entry, stat, conformance))
+                }
+                _ => None,
             })
     }
 
-    pub fn unreadable(&self) -> impl Iterator<Item = &AuditEntry> {
+    pub fn unreadable(&self) -> impl Iterator<Item = (&AuditEntry, &str)> {
         self.entries
             .iter()
-            .filter(|entry| matches!(entry.outcome, Outcome::ProbeFailed { .. }))
+            .filter_map(|entry| match &entry.outcome {
+                Outcome::Unreadable { reason, .. } => Some((entry, reason.as_str())),
+                Outcome::Assessed { .. } => None,
+            })
     }
 
     /// Files holding measurably less than they claim, with the missing bytes.
     ///
     /// This cuts across the cost buckets rather than joining them: an
     /// incomplete file still has whatever conformance its header describes, and
-    /// this says nothing about that.
-    pub fn incomplete(&self) -> impl Iterator<Item = (&AuditEntry, u64)> {
+    /// this says nothing about that. A file that could not be stat'd has no
+    /// sizes to compare, so it is never listed here.
+    pub fn incomplete(&self) -> impl Iterator<Item = (&AuditEntry, &Stat, u64)> {
         self.entries.iter().filter_map(|entry| {
-            entry
-                .allocation
-                .shortfall(entry.size_bytes)
-                .map(|missing| (entry, missing))
+            let stat = entry.stat()?;
+            stat.allocation
+                .shortfall(stat.size_bytes)
+                .map(|missing| (entry, stat, missing))
         })
     }
 }
@@ -257,36 +280,37 @@ impl AuditCommand {
 
         // Stat before probing: a file whose size is unknown is not judged, so
         // no verdict and no bucket total can rest on a size nobody read.
-        let metadata = match std::fs::metadata(path) {
-            Ok(metadata) => metadata,
+        let stat = match std::fs::metadata(path) {
+            // One stat, read twice: the length the file claims, and how much
+            // of it the filesystem is actually holding.
+            Ok(metadata) => Stat {
+                size_bytes: metadata.len(),
+                allocation: allocation_of(&metadata),
+                modified: metadata.modified().ok(),
+            },
             Err(error) => {
                 return AuditEntry {
                     path: path_in_report,
-                    size_bytes: 0,
-                    allocation: Allocation::Unmeasurable,
-                    modified: None,
-                    outcome: Outcome::ProbeFailed {
+                    outcome: Outcome::Unreadable {
+                        stat: None,
                         reason: format!("could not stat {}: {error}", path.display()),
                     },
                 }
             }
         };
 
-        let outcome = match probe(path) {
-            Ok(media) => Outcome::Assessed(evaluate(&media, &self.target)),
-            Err(error) => Outcome::ProbeFailed {
-                reason: format!("{error:#}"),
-            },
-        };
-
         AuditEntry {
             path: path_in_report,
-            // One stat, read twice: the length the file claims, and how much
-            // of it the filesystem is actually holding.
-            size_bytes: metadata.len(),
-            allocation: allocation_of(&metadata),
-            modified: metadata.modified().ok(),
-            outcome,
+            outcome: match probe(path) {
+                Ok(media) => Outcome::Assessed {
+                    stat,
+                    conformance: evaluate(&media, &self.target),
+                },
+                Err(error) => Outcome::Unreadable {
+                    stat: Some(stat),
+                    reason: format!("{error:#}"),
+                },
+            },
         }
     }
 
@@ -383,7 +407,7 @@ impl AuditCommand {
             (Some(Cost::Reencode), "🔥 Re-encode - the video itself"),
         ] {
             let files: Vec<_> = report.bucket(cost).collect();
-            let bytes: u64 = files.iter().map(|entry| entry.size_bytes).sum();
+            let bytes: u64 = files.iter().map(|(_, stat, _)| stat.size_bytes).sum();
             let _ = writeln!(
                 out,
                 "   {:5} ({:5.1}%)  {:8.1} GB  {label}",
@@ -417,13 +441,13 @@ impl AuditCommand {
         } else {
             let mut missing: Vec<_> = report.incomplete().collect();
             if !missing.is_empty() {
-                missing.sort_by(|(left, l), (right, r)| {
-                    (r * 100 / right.size_bytes.max(1))
-                        .cmp(&(l * 100 / left.size_bytes.max(1)))
+                missing.sort_by(|(left, left_stat, l), (right, right_stat, r)| {
+                    (r * 100 / right_stat.size_bytes.max(1))
+                        .cmp(&(l * 100 / left_stat.size_bytes.max(1)))
                         .then(left.path.cmp(&right.path))
                 });
 
-                let total: u64 = missing.iter().map(|(_, bytes)| bytes).sum();
+                let total: u64 = missing.iter().map(|(_, _, bytes)| bytes).sum();
                 let _ = writeln!(out, "\n🕳️  Content that is not on the disk:");
                 let _ = writeln!(out, "────────────────────────────────────");
                 let _ = writeln!(
@@ -432,15 +456,15 @@ impl AuditCommand {
                     missing.len(),
                     in_scale(total),
                 );
-                for (entry, bytes) in missing {
+                for (entry, stat, bytes) in missing {
                     let _ = writeln!(
                         out,
                         "   {:3.0}% of this file is not on disk  ({:>9} of {:>9})  {}{}",
-                        percent(bytes as usize, entry.size_bytes.max(1) as usize),
+                        percent(bytes as usize, stat.size_bytes.max(1) as usize),
                         in_scale(bytes),
-                        in_scale(entry.size_bytes),
+                        in_scale(stat.size_bytes),
                         entry.path,
-                        in_flight_caveat(entry.modified),
+                        in_flight_caveat(stat.modified),
                     );
                 }
             }
@@ -453,7 +477,7 @@ impl AuditCommand {
             let tally = tally(
                 report
                     .bucket(Some(cost))
-                    .flat_map(|entry| entry_findings(entry, Conformance::reasons)),
+                    .flat_map(|(_, _, conformance)| conformance.reasons()),
                 Finding::describe,
             );
             if tally.is_empty() {
@@ -493,11 +517,8 @@ impl AuditCommand {
             let _ = writeln!(out, "\n📄 Per file:");
             let _ = writeln!(out, "────────────");
             let mut listed: Vec<_> = needing_work;
-            listed.sort_by(|left, right| left.path.cmp(&right.path));
-            for entry in listed {
-                let Outcome::Assessed(conformance) = &entry.outcome else {
-                    continue;
-                };
+            listed.sort_by(|(left, ..), (right, ..)| left.path.cmp(&right.path));
+            for (entry, _, conformance) in listed {
                 let claims: Vec<String> = conformance
                     .reasons()
                     .iter()
@@ -519,10 +540,8 @@ impl AuditCommand {
         if unreadable > 0 {
             let _ = writeln!(out, "\n❓ Could not be probed:");
             let _ = writeln!(out, "───────────────────────");
-            for entry in report.unreadable() {
-                if let Outcome::ProbeFailed { reason } = &entry.outcome {
-                    let _ = writeln!(out, "   {}\n   {reason}", entry.path);
-                }
+            for (entry, reason) in report.unreadable() {
+                let _ = writeln!(out, "   {}\n   {reason}", entry.path);
             }
         }
 
@@ -613,8 +632,8 @@ fn entry_findings(
     which: fn(&Conformance) -> &[Finding],
 ) -> impl Iterator<Item = &Finding> {
     match &entry.outcome {
-        Outcome::Assessed(conformance) => which(conformance).iter(),
-        Outcome::ProbeFailed { .. } => [].iter(),
+        Outcome::Assessed { conformance, .. } => which(conformance).iter(),
+        Outcome::Unreadable { .. } => [].iter(),
     }
 }
 
@@ -752,7 +771,10 @@ mod tests {
         );
 
         // Every file has a size, and the buckets are reported in GB from it.
-        assert!(report.entries.iter().all(|entry| entry.size_bytes > 0));
+        assert!(report
+            .entries
+            .iter()
+            .all(|entry| entry.stat().is_some_and(|stat| stat.size_bytes > 0)));
     }
 
     /// The one playback failure this project has actually watched: an AVI the
@@ -828,6 +850,9 @@ mod tests {
 
     /// A file moved away mid-audit has no size to report. It is listed with
     /// the OS's reason, never judged, totalled or counted as 0 bytes.
+    ///
+    /// A vanished file rather than a permission denial: it fails the stat the
+    /// same way on every platform, where a denial binds differently on each.
     #[tokio::test]
     async fn a_file_that_cannot_be_stat_d_is_reported_with_the_os_reason() {
         let dir = TempDir::new().unwrap();
@@ -835,14 +860,21 @@ mod tests {
         let os_reason = std::fs::metadata(&vanished).unwrap_err().to_string();
 
         let command = AuditCommand::new(dir.path().to_path_buf(), "chromecast-gen2-3").unwrap();
+        let entry = command.audit_file(&vanished);
+        assert!(
+            matches!(entry.outcome, Outcome::Unreadable { stat: None, .. }),
+            "a file nobody could stat holds no size: {entry:?}"
+        );
+
         let report = AuditReport {
             target: "chromecast-gen2-3".into(),
             scan_path: dir.path().to_path_buf(),
             audit_time: Duration::from_secs(0),
-            entries: vec![command.audit_file(&vanished)],
+            entries: vec![entry],
         };
 
         assert_eq!(report.unreadable().count(), 1);
+        assert_eq!(report.incomplete().count(), 0);
         let rendered = command.render_report(&report);
         assert!(rendered.contains("vanished.mp4"), "{rendered}");
         assert!(rendered.contains(&os_reason), "{rendered}");
@@ -1049,7 +1081,7 @@ mod tests {
             "the conformance verdict is not touched: it still Direct Plays"
         );
 
-        let (entry, missing) = report.incomplete().next().expect("the hole is reported");
+        let (entry, _, missing) = report.incomplete().next().expect("the hole is reported");
         assert_eq!(entry.path, "half-there.mp4");
         assert!(missing > 31 << 20, "got {missing}");
 
@@ -1081,10 +1113,9 @@ mod tests {
         let command = AuditCommand::new(dir.path().to_path_buf(), "chromecast-gen2-3").unwrap();
         let report = command.execute().await.unwrap();
 
-        assert!(report
-            .entries
-            .iter()
-            .all(|entry| entry.allocation == Allocation::Unmeasurable));
+        assert!(report.entries.iter().all(|entry| entry
+            .stat()
+            .is_some_and(|stat| stat.allocation == Allocation::Unmeasurable)));
         assert_eq!(report.incomplete().count(), 0);
 
         let rendered = command.render_report(&report);
