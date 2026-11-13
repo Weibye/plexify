@@ -1,40 +1,18 @@
 //! Putting a library back the way a fix run found it.
 //!
-//! A fix writes down every move it made, which is enough to reverse it. What
-//! makes undo harder than running a fix backwards is *when* it happens: a fix
-//! acts on a report computed seconds earlier, while an undo acts on a record
-//! written however long ago somebody took to notice something was wrong. The
-//! library has had all that time to change underneath it.
-//!
-//! So every reversal is checked against the disk first, and each check refuses
-//! rather than guesses:
-//!
-//! - The file is no longer where the fix put it.
-//! - Something already occupies the path it came from - possibly a *different*
-//!   file that has since been canonicalised into that name.
-//! - The file is no longer the one that was moved, as far as its size can say.
-//! - The file cannot be read, or the record has no size for it, so none of the
-//!   above can be checked.
-//!
-//! Size is weak evidence and is treated as such: it catches a file having been
-//! replaced, not a re-encode that happens to be the same length. Hashing a media
-//! library is not free, and the failure it would prevent - restoring a file to a
-//! name it no longer suits - renames rather than destroys.
-//!
-//! An undo is itself a fix run in the other direction, so it writes its own
-//! record. That is what makes it reversible in turn.
+//! An undo acts on a record written however long ago, so every reversal is
+//! checked against the disk first and refused rather than guessed at. It writes
+//! a record of its own, which makes it reversible in turn. See D23.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
 
 use crate::fix::{
-    absolute, emptied, is_same_file, rename, size_of, write_new, FailedMove, FixOutcome,
-    PlannedMove, Refusal, RefusalReason,
+    absolute, carry_out, is_same_file, size_of, unix_seconds_now, FixOutcome, PlannedMove, Refusal,
+    RefusalReason,
 };
 use crate::paths::to_forward_slashes;
 
@@ -52,10 +30,8 @@ pub fn read_record(plan_file: &Path) -> Result<FixOutcome> {
 
 /// What reversing a fix run would do.
 ///
-/// Written to disk before any of it happens, and deliberately a different shape
-/// from the outcome that replaces it: `moves` is an intention, `applied` is a
-/// fact. An undo interrupted halfway therefore leaves a file that says what it
-/// meant to do, and cannot be mistaken for a record of what it did.
+/// Written to disk before any of it happens, in a different shape from the
+/// outcome that replaces it: `moves` is an intention, `applied` is a fact.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UndoPlan {
     pub media_root: PathBuf,
@@ -145,73 +121,18 @@ pub fn plan(record: &FixOutcome, reversing: &Path) -> UndoPlan {
 
 /// Put the files back, writing a record of this run before touching anything.
 pub fn apply(plan: &UndoPlan, record_file: &Path) -> Result<FixOutcome> {
-    // The intention first, in its own shape. Nothing here may be written into
-    // an `applied` list before it has actually happened: a run that dies halfway
-    // would then claim moves it never made, and undoing *that* record would try
-    // to reverse work that was never done.
-    write_plan(plan, record_file)?;
-
-    let mut applied = Vec::new();
-    let mut failed = Vec::new();
-    let mut source_directories = Vec::new();
-
-    for reversal in &plan.moves {
-        let source = absolute(&plan.media_root, &reversal.from);
-        let destination = absolute(&plan.media_root, &reversal.to);
-
-        match rename(&source, &destination) {
-            Ok(()) => {
-                debug!("Put back {:?} -> {:?}", source, destination);
-                if let Some(parent) = source.parent() {
-                    if destination.parent() != Some(parent) {
-                        source_directories.push(parent.to_path_buf());
-                    }
-                }
-                applied.push(reversal.clone());
-            }
-            Err(error) => {
-                warn!("Could not put back {:?}: {}", source, error);
-                failed.push(FailedMove {
-                    attempted: reversal.clone(),
-                    error: format!("{error:#}"),
-                });
-            }
-        }
-    }
-
-    let outcome = FixOutcome {
-        media_root: plan.media_root.clone(),
-        applied,
-        failed,
-        refusals: plan.refusals.clone(),
-        emptied_directories: emptied(&plan.media_root, source_directories),
-        plan_file: record_file.to_path_buf(),
-    };
-    write_record(&outcome, record_file)?;
-
-    Ok(outcome)
+    carry_out(
+        plan,
+        &plan.media_root,
+        &plan.moves,
+        &plan.refusals,
+        record_file,
+    )
 }
 
 /// Where an undo run should write its own record by default.
 pub fn default_record_file() -> PathBuf {
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|since| since.as_secs())
-        .unwrap_or_default();
-
-    PathBuf::from(format!("plexify-undo-{seconds}.json"))
-}
-
-fn write_plan(plan: &UndoPlan, record_file: &Path) -> Result<()> {
-    let contents = serde_json::to_string_pretty(plan)?;
-    write_new(record_file, &contents)
-        .with_context(|| format!("could not write the undo plan to {record_file:?}"))
-}
-
-fn write_record(outcome: &FixOutcome, record_file: &Path) -> Result<()> {
-    let contents = serde_json::to_string_pretty(outcome)?;
-    fs::write(record_file, contents)
-        .with_context(|| format!("could not write the undo record to {record_file:?}"))
+    PathBuf::from(format!("plexify-undo-{}.json", unix_seconds_now()))
 }
 
 /// Render what an undo would do, or did.
@@ -811,7 +732,7 @@ mod tests {
 
         // What is on disk between the first write and the last one: an undo
         // that died here must not look like an undo that finished.
-        write_plan(&undo_plan, &record_file).unwrap();
+        crate::fix::write_plan(&undo_plan, &record_file).unwrap();
 
         assert!(
             read_record(&record_file).is_err(),
@@ -891,6 +812,7 @@ mod tests {
             "this is no longer the file that was moved here: 5 bytes then, 43 now"
         );
     }
+
     #[test]
     fn reads_back_a_record_written_by_a_fix() {
         let temp = TempDir::new().unwrap();

@@ -1,25 +1,9 @@
-//! Applying the renames a validation report proposes.
+//! Applying the renames a validation report proposes, and the moves both fix
+//! and undo make.
 //!
-//! Validation says where each file belongs. This module moves it there, and its
-//! whole design is about the gap between those two sentences: the report was
-//! computed by reading paths, and by the time anything acts on it the library
-//! may have moved on. Every proposal is therefore rechecked against the disk
-//! immediately before it is applied.
-//!
-//! Three rules shape everything here, and all three exist because this runs
-//! against a library nobody can reconstruct:
-//!
-//! - **A destination is never overwritten.** If something is already there, the
-//!   move is refused and reported, never resolved by guessing.
-//! - **Two files never claim one destination.** Canonicalising can map distinct
-//!   sources onto the same name - two season directories that differ only by an
-//!   arc name, say - and the right answer is a person's to give.
-//! - **The plan is written before the first rename.** A run that dies halfway
-//!   leaves a file on disk saying what it intended and how far it got.
-//!
-//! Nothing here constructs a destination. It only ever moves a file to the path
-//! `naming::render` produced, which is what keeps the source string from
-//! leaking into the result.
+//! The report was computed from paths and the library may have moved on since,
+//! so every proposal is rechecked against the disk just before it is applied.
+//! Destinations come only from `naming::render`. See D23.
 
 use std::collections::HashMap;
 use std::fs;
@@ -31,7 +15,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::commands::validate::{IssueKind, ValidationReport};
+use crate::commands::validate::ValidationReport;
 use crate::ignore::is_media_extension;
 
 /// A rename that is going to be attempted, in library-relative form.
@@ -46,7 +30,8 @@ pub struct PlannedMove {
     /// The size of the file when it was moved, recorded so that an undo can
     /// notice it is no longer the same file. Weak evidence - a re-encode of the
     /// same length would pass - but free, and it catches the ordinary case of a
-    /// file having been replaced since.
+    /// file having been replaced since. What it misses is restored to a name it
+    /// no longer suits, which renames rather than destroys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
 }
@@ -157,19 +142,16 @@ pub fn plan(report: &ValidationReport) -> FixPlan {
     // that `work` relies on, and would do it silently.
     let groups: Vec<Vec<PlannedMove>> = report
         .renames()
-        .filter_map(|issue| match &issue.kind {
-            IssueKind::Rename { destination } => {
-                let media = PlannedMove {
-                    from: issue.path.clone(),
-                    to: destination.clone(),
-                    sidecar: false,
-                    size: None,
-                };
-                let mut group = vec![media];
-                group.extend(sidecars_of(media_root, &issue.path, destination));
-                Some(group)
-            }
-            IssueKind::NeedsDecision { .. } => None,
+        .map(|(from, to)| {
+            let media = PlannedMove {
+                from: from.to_string(),
+                to: to.to_string(),
+                sidecar: false,
+                size: None,
+            };
+            let mut group = vec![media];
+            group.extend(sidecars_of(media_root, from, to));
+            group
         })
         .collect();
 
@@ -228,10 +210,7 @@ pub fn plan(report: &ValidationReport) -> FixPlan {
 
     FixPlan {
         media_root: media_root.clone(),
-        created_unix_seconds: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|since| since.as_secs())
-            .unwrap_or_default(),
+        created_unix_seconds: unix_seconds_now(),
         moves,
         refusals,
     }
@@ -239,15 +218,37 @@ pub fn plan(report: &ValidationReport) -> FixPlan {
 
 /// Carry out a plan, writing it to `plan_file` before touching anything.
 pub fn apply(plan: &FixPlan, plan_file: &Path) -> Result<FixOutcome> {
-    write_plan(plan, plan_file)?;
+    carry_out(
+        plan,
+        &plan.media_root,
+        &plan.moves,
+        &plan.refusals,
+        plan_file,
+    )
+}
+
+/// Make the moves a fix or an undo planned, and keep the record of them.
+///
+/// `intent` is written to `record_file` before the first move and the outcome
+/// replaces it after the last. The two are different shapes, so a run that dies
+/// halfway leaves a file that says what it meant to do and cannot be read back
+/// as a record of moves it never made.
+pub(crate) fn carry_out(
+    intent: &impl Serialize,
+    media_root: &Path,
+    moves: &[PlannedMove],
+    refusals: &[Refusal],
+    record_file: &Path,
+) -> Result<FixOutcome> {
+    write_plan(intent, record_file)?;
 
     let mut applied = Vec::new();
     let mut failed = Vec::new();
     let mut source_directories = Vec::new();
 
-    for planned in &plan.moves {
-        let source = absolute(&plan.media_root, &planned.from);
-        let destination = absolute(&plan.media_root, &planned.to);
+    for planned in moves {
+        let source = absolute(media_root, &planned.from);
+        let destination = absolute(media_root, &planned.to);
 
         // The size is read before the move rather than after it: a file whose
         // size cannot be read stays where it is, while one already moved
@@ -279,20 +280,15 @@ pub fn apply(plan: &FixPlan, plan_file: &Path) -> Result<FixOutcome> {
         }
     }
 
-    let emptied_directories = emptied(&plan.media_root, source_directories);
-
     let outcome = FixOutcome {
-        media_root: plan.media_root.clone(),
+        media_root: media_root.to_path_buf(),
         applied,
         failed,
-        refusals: plan.refusals.clone(),
-        emptied_directories,
-        plan_file: plan_file.to_path_buf(),
+        refusals: refusals.to_vec(),
+        emptied_directories: emptied(media_root, source_directories),
+        plan_file: record_file.to_path_buf(),
     };
-
-    // Record what happened alongside what was intended, so an interrupted run
-    // and a completed one are told apart by reading one file.
-    write_outcome(&outcome, plan_file)?;
+    write_outcome(&outcome, record_file)?;
 
     Ok(outcome)
 }
@@ -303,6 +299,14 @@ pub fn apply(plan: &FixPlan, plan_file: &Path) -> Result<FixOutcome> {
 /// the library is not itself part of the library.
 pub fn default_plan_file(created_unix_seconds: u64) -> PathBuf {
     PathBuf::from(format!("plexify-fix-{created_unix_seconds}.json"))
+}
+
+/// The time a plan or record is named after.
+pub(crate) fn unix_seconds_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or_default()
 }
 
 pub(crate) fn rename(source: &Path, destination: &Path) -> Result<()> {
@@ -323,7 +327,7 @@ pub(crate) fn rename(source: &Path, destination: &Path) -> Result<()> {
         .with_context(|| format!("could not move {source:?} to {destination:?}"))
 }
 
-fn write_plan(plan: &FixPlan, plan_file: &Path) -> Result<()> {
+pub(crate) fn write_plan(plan: &impl Serialize, plan_file: &Path) -> Result<()> {
     let contents = serde_json::to_string_pretty(plan)?;
     write_new(plan_file, &contents)
         .with_context(|| format!("could not write the plan to {plan_file:?}"))
@@ -333,7 +337,7 @@ fn write_plan(plan: &FixPlan, plan_file: &Path) -> Result<()> {
 ///
 /// Plan files are named by the second, so two runs in the same second share a
 /// name, and overwriting would destroy the only record of the earlier run.
-pub(crate) fn write_new(path: &Path, contents: &str) -> std::io::Result<()> {
+fn write_new(path: &Path, contents: &str) -> std::io::Result<()> {
     fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -497,7 +501,7 @@ fn is_empty(directory: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::validate::ValidationIssue;
+    use crate::commands::validate::{IssueKind, ValidationIssue};
     use std::time::Duration;
     use tempfile::TempDir;
 

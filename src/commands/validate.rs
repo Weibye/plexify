@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,11 +10,12 @@ use crate::fix::FixOutcome;
 use crate::ignore::IgnoreFilter;
 use crate::naming::{
     assess, scope_for, series_directory_disagreement, Assessment, LibraryRoot, Scope,
+    SeriesDirectoryDisagreement, Unresolvable,
 };
 use crate::paths::to_forward_slashes;
 
 /// Something the library holds that is not in canonical form.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ValidationIssue {
     /// The file as it exists, relative to the media root, with `/` separators.
     pub path: String,
@@ -23,15 +23,15 @@ pub struct ValidationIssue {
 }
 
 /// What is wrong with a file, and what can be done about it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum IssueKind {
-    /// The canonical form of this file differs from where it is now.
+    /// The canonical form of this file differs from where it is.
     Rename {
         /// Where the file belongs, relative to the media root.
         destination: String,
     },
     /// The path could not be decomposed, so no destination can be proposed.
-    NeedsDecision { reason: String },
+    NeedsDecision(Unresolvable),
 }
 
 /// Something worth knowing about a file that is not a verdict on it.
@@ -44,7 +44,7 @@ pub enum IssueKind {
 /// rename for a reason that has nothing to do with the directory. A note must
 /// therefore never state what the report as a whole proposes for its path -
 /// only the report knows that, and only by reading its own [`ValidationReport::issues`].
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ValidationNote {
     /// The file as it exists, relative to the media root, with `/` separators.
     pub path: String,
@@ -52,12 +52,12 @@ pub struct ValidationNote {
 }
 
 /// What a note has to say.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum NoteKind {
     /// The series directory holding this file names a different series than
     /// the file does. Neither name is assumed correct, so the directory is
     /// left alone.
-    SeriesDirectoryDisagrees { directory: String, series: String },
+    SeriesDirectoryDisagrees(SeriesDirectoryDisagreement),
 }
 
 impl NoteKind {
@@ -68,7 +68,7 @@ impl NoteKind {
     /// question with a separate answer - see [`ValidationReport::proposal_for`].
     pub fn explain(&self) -> String {
         match self {
-            NoteKind::SeriesDirectoryDisagrees { directory, series } => format!(
+            NoteKind::SeriesDirectoryDisagrees(SeriesDirectoryDisagreement { directory, series }) => format!(
                 "the directory says '{directory}' and the file says '{series}'; the directory is left as it is, because the path does not say which is right"
             ),
         }
@@ -76,12 +76,11 @@ impl NoteKind {
 }
 
 /// Validation report containing all issues found
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ValidationReport {
     pub scanned_files: usize,
     pub issues: Vec<ValidationIssue>,
     /// Observations that are not proposals. Nothing in `fix` reads these.
-    #[serde(default)]
     pub notes: Vec<ValidationNote>,
     /// The directory every path in `issues` is relative to.
     pub library_root: PathBuf,
@@ -92,18 +91,21 @@ pub struct ValidationReport {
 }
 
 impl ValidationReport {
-    /// Files whose canonical destination differs from where they are.
-    pub fn renames(&self) -> impl Iterator<Item = &ValidationIssue> {
-        self.issues
-            .iter()
-            .filter(|issue| matches!(issue.kind, IssueKind::Rename { .. }))
+    /// Each file whose canonical destination differs from where it is, as
+    /// `(from, to)`.
+    pub fn renames(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.issues.iter().filter_map(|issue| match &issue.kind {
+            IssueKind::Rename { destination } => Some((issue.path.as_str(), destination.as_str())),
+            IssueKind::NeedsDecision(_) => None,
+        })
     }
 
-    /// Files a person has to resolve.
-    pub fn needing_decision(&self) -> impl Iterator<Item = &ValidationIssue> {
-        self.issues
-            .iter()
-            .filter(|issue| matches!(issue.kind, IssueKind::NeedsDecision { .. }))
+    /// Each file a person has to resolve, with why.
+    pub fn needing_decision(&self) -> impl Iterator<Item = (&str, &Unresolvable)> {
+        self.issues.iter().filter_map(|issue| match &issue.kind {
+            IssueKind::NeedsDecision(reason) => Some((issue.path.as_str(), reason)),
+            IssueKind::Rename { .. } => None,
+        })
     }
 
     /// What this report proposes for a path, if anything.
@@ -320,21 +322,16 @@ impl ValidateCommand {
 
     /// Assess a single file against the canonical naming form.
     fn assess_file(&self, relative_path: &std::path::Path) -> Option<ValidationIssue> {
-        let path = to_forward_slashes(relative_path);
+        let kind = match assess(relative_path) {
+            Assessment::Canonical => return None,
+            Assessment::Rename { destination } => IssueKind::Rename { destination },
+            Assessment::Unresolvable(reason) => IssueKind::NeedsDecision(reason),
+        };
 
-        match assess(relative_path) {
-            Assessment::Canonical => None,
-            Assessment::Rename { destination } => Some(ValidationIssue {
-                path,
-                kind: IssueKind::Rename { destination },
-            }),
-            Assessment::Unresolvable(reason) => Some(ValidationIssue {
-                path,
-                kind: IssueKind::NeedsDecision {
-                    reason: reason.reason(),
-                },
-            }),
-        }
+        Some(ValidationIssue {
+            path: to_forward_slashes(relative_path),
+            kind,
+        })
     }
 
     /// Note anything about a file that is worth reading but is not a verdict.
@@ -352,10 +349,7 @@ impl ValidateCommand {
 
         Some(ValidationNote {
             path: to_forward_slashes(relative_path),
-            kind: NoteKind::SeriesDirectoryDisagrees {
-                directory: disagreement.directory,
-                series: disagreement.series,
-            },
+            kind: NoteKind::SeriesDirectoryDisagrees(disagreement),
         })
     }
 
@@ -496,22 +490,18 @@ impl ValidateCommand {
         if !renames.is_empty() {
             let _ = writeln!(out, "\n✏️  Proposed renames:");
             let _ = writeln!(out, "─────────────────────");
-            for issue in &renames {
-                if let IssueKind::Rename { destination } = &issue.kind {
-                    let _ = writeln!(out, "\n  {}", issue.path);
-                    let _ = writeln!(out, "→ {destination}");
-                }
+            for (from, to) in &renames {
+                let _ = writeln!(out, "\n  {from}");
+                let _ = writeln!(out, "→ {to}");
             }
         }
 
         if !decisions.is_empty() {
             let _ = writeln!(out, "\n🤔 Needing a decision:");
             let _ = writeln!(out, "──────────────────────");
-            for issue in &decisions {
-                if let IssueKind::NeedsDecision { reason } = &issue.kind {
-                    let _ = writeln!(out, "\n  {}", issue.path);
-                    let _ = writeln!(out, "  {reason}");
-                }
+            for (path, reason) in &decisions {
+                let _ = writeln!(out, "\n  {path}");
+                let _ = writeln!(out, "  {}", reason.reason());
             }
         }
 
@@ -529,8 +519,12 @@ impl ValidateCommand {
                         let _ = writeln!(out, "  this file is still proposed for rename:");
                         let _ = writeln!(out, "→ {destination}");
                     }
-                    Some(IssueKind::NeedsDecision { reason }) => {
-                        let _ = writeln!(out, "  this file also needs a decision: {reason}");
+                    Some(IssueKind::NeedsDecision(reason)) => {
+                        let _ = writeln!(
+                            out,
+                            "  this file also needs a decision: {}",
+                            reason.reason()
+                        );
                     }
                     None => {
                         let _ = writeln!(out, "  nothing is proposed for this file.");
@@ -801,7 +795,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let media_root = temp_dir.path();
 
-        // Test the exact case from the issue with extended season name and brackets
+        // An arc name on the season directory, and a dash before the quality.
         let series_path =
             media_root.join("Series/Critical Role (2015) {tvdb-296861}/Season 01 - Vox Machina");
         fs::create_dir_all(&series_path).unwrap();
@@ -912,9 +906,10 @@ mod tests {
                 },
                 ValidationIssue {
                     path: "Series/Veronica Mars/Series/Veronica Mars S02E04.mp4".to_string(),
-                    kind: IssueKind::NeedsDecision {
-                        reason: "'Series' appears twice in this path".to_string(),
-                    },
+                    kind: IssueKind::NeedsDecision(Unresolvable::DuplicatedRoot {
+                        outer: LibraryRoot::Series,
+                        inner: LibraryRoot::Series,
+                    }),
                 },
             ],
             notes: Vec::new(),
@@ -989,10 +984,10 @@ mod tests {
             report.notes,
             vec![ValidationNote {
                 path: "Series/Super Best Friends Play - FFX/Season 01/Super Best Friends Play - Final Fantasy X - S01E13.webm".to_string(),
-                kind: NoteKind::SeriesDirectoryDisagrees {
+                kind: NoteKind::SeriesDirectoryDisagrees(SeriesDirectoryDisagreement {
                     directory: "Super Best Friends Play - FFX".to_string(),
                     series: "Super Best Friends Play - Final Fantasy X".to_string(),
-                },
+                }),
             }]
         );
 
@@ -1096,7 +1091,7 @@ mod tests {
             assert!(
                 !matches!(
                     report.proposal_for(&note.path),
-                    Some(IssueKind::NeedsDecision { .. })
+                    Some(IssueKind::NeedsDecision(_))
                 ),
                 "a path cannot be both noted and undecidable: {note:?}"
             );
@@ -1193,8 +1188,8 @@ mod tests {
         assert_eq!(report.needing_decision().count(), 1);
     }
 
-    /// Issue #137, end to end: a canonical library whose media root is named
-    /// after a library root was refused in its entirety, leaving `--fix` inert.
+    /// A canonical library whose media root is named after a library root is
+    /// judged as a library, not refused in its entirety.
     #[tokio::test]
     async fn a_media_root_named_after_a_library_root_does_not_refuse_the_library() {
         let temp_dir = TempDir::new().unwrap();
@@ -1265,7 +1260,7 @@ mod tests {
         assert!(
             report
                 .needing_decision()
-                .any(|issue| issue.path.ends_with("Elementary - S01E01 - Pilot.mkv")),
+                .any(|(path, _)| path.ends_with("Elementary - S01E01 - Pilot.mkv")),
             "the episode in the film directory is a duplicated root for a person to resolve"
         );
         assert!(
@@ -1277,8 +1272,8 @@ mod tests {
         );
     }
 
-    /// Issue #142: a media root named after a library root and holding exactly
-    /// one, which the probe cannot tell from a duplication and so refuses.
+    /// A media root named after a library root and holding exactly one, which
+    /// the probe cannot tell from a duplication and so refuses.
     ///
     /// Both halves are asserted here, because the flag is only worth anything if
     /// the inference really does refuse this tree - a test that only exercised
@@ -1314,11 +1309,8 @@ mod tests {
             "the root is stated, so nothing below it is a duplication"
         );
         assert_eq!(
-            stated
-                .renames()
-                .map(|issue| issue.path.clone())
-                .collect::<Vec<_>>(),
-            vec!["Movies/Batman Begins (2005)/Batman Begins 2005.mkv".to_string()],
+            stated.renames().map(|(from, _)| from).collect::<Vec<_>>(),
+            vec!["Movies/Batman Begins (2005)/Batman Begins 2005.mkv"],
             "and the film below it is judged against that root"
         );
     }
@@ -1386,11 +1378,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            report
-                .renames()
-                .map(|issue| issue.path.clone())
-                .collect::<Vec<_>>(),
-            vec!["Series/Elementary/Season 6/Elementary - S06E08 Sand Trap.mkv".to_string()],
+            report.renames().map(|(from, _)| from).collect::<Vec<_>>(),
+            vec!["Series/Elementary/Season 6/Elementary - S06E08 Sand Trap.mkv"],
             "a path starting at the season directory would name no series at all"
         );
     }
@@ -1418,15 +1407,13 @@ mod tests {
 
         assert_eq!(report.library_root, temp_dir.path().join("lib"));
         assert_eq!(
-            report.renames().next().map(|issue| issue.path.as_str()),
+            report.renames().next().map(|(from, _)| from),
             Some("Series/Elementary/Season 1/Elementary - S01E01 - Pilot.mkv"),
             "the real content beside the duplication is still padded"
         );
         assert!(
-            report.needing_decision().any(|issue| {
-                issue.path.contains("Series/Series/")
-                    && matches!(&issue.kind,
-                    IssueKind::NeedsDecision { reason } if reason.contains("appears twice"))
+            report.needing_decision().any(|(path, reason)| {
+                path.contains("Series/Series/") && reason.reason().contains("appears twice")
             }),
             "the self-nested copy is a duplication, not a canonical library"
         );

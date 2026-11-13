@@ -71,10 +71,10 @@ fn episode_marker() -> &'static Regex {
     //
     // `through_season`, `through_fraction` and `excess` are matched and then
     // refused by the caller, which is the point of matching them: a marker that
-    // stops in the middle of itself hands the rest to the title, and
-    // `S04E01-E02-E03` truncated to `S04E01-E02 - E03` is issue #198 one episode
-    // further along. None of the three occurs in the library, so none of them
-    // earns a rendering - but each has to be *seen* to be refused.
+    // stops in the middle of itself hands the rest to the title, as
+    // `S04E01-E02-E03` truncated to `S04E01-E02 - E03` would (D20). None of the
+    // three occurs in the library, so none of them earns a rendering - but each
+    // has to be *seen* to be refused.
     RE.get_or_init(|| {
         Regex::new(
             r"(?ix)
@@ -763,7 +763,7 @@ mod tests {
         assert_eq!(parsed.title.as_deref(), Some("Pilot"));
     }
 
-    /// Issue #198: `-E02` is the second half of the marker, not the first four
+    /// `-E02` is the second half of the marker, not the first four
     /// characters of a title.
     #[test]
     fn reads_both_episodes_of_a_double_marker() {
@@ -794,8 +794,7 @@ mod tests {
     }
 
     /// A range is its two ends, and anything past them is refused rather than
-    /// read down to the first two - which would be issue #198 one episode
-    /// further along.
+    /// read down to the first two. See D20.
     #[test]
     fn refuses_a_marker_that_names_more_than_two_episodes() {
         assert_eq!(
@@ -906,7 +905,7 @@ mod tests {
         }
     }
 
-    /// Issue #134: a marker glued onto a directory is noise, and taking it out
+    /// A marker glued onto a directory is noise, and taking it out
     /// leaves the name that was there all along.
     ///
     /// This runs only where the *file* names nothing, which is the shape that
@@ -931,14 +930,14 @@ mod tests {
         );
     }
 
-    /// Issue #198: a round trip through a **lossy** parse is still a round trip.
+    /// A round trip through a **lossy** parse is still a round trip.
     ///
-    /// `no_path_is_renamed_twice` asks whether a destination is stable, and
-    /// `Charmed - S04E01-E02 - Charmed Again.avi` satisfied it perfectly. The
-    /// marker stopped at `E01`, `-E02` fell into the title, and the destination
-    /// `Charmed - S04E01 - E02 - Charmed Again.avi` parsed back to those same
-    /// fields and rendered back to itself. Nothing downstream could see that the
-    /// name now says the file holds one episode when it holds two.
+    /// `no_path_is_renamed_twice` asks whether a destination is stable, and a
+    /// marker that stopped at `E01` in `Charmed - S04E01-E02 - Charmed Again.avi`
+    /// would satisfy it: `-E02` falls into the title, and the destination
+    /// `Charmed - S04E01 - E02 - Charmed Again.avi` parses back to those same
+    /// fields and renders back to itself, while saying the file holds one
+    /// episode when it holds two.
     ///
     /// No check on the *text* catches that: `E02` is in the destination either
     /// way, and only its position says whether it is an episode or four
