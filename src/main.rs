@@ -52,7 +52,7 @@ enum Commands {
         /// name, or the path to a TOML one. Repeat it to name more than one,
         /// and each file is queued with the most expensive work any of them
         /// needs - that is the only answer that satisfies all of them. Naming
-        /// none probes nothing and queues by extension, as before.
+        /// none probes nothing and queues by extension.
         #[arg(long, short = 't')]
         target: Vec<String>,
     },
