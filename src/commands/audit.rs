@@ -157,18 +157,29 @@ pub struct AuditReport {
 }
 
 impl AuditReport {
-    /// The files in one cost bucket. `None` is the bucket that needs nothing.
+    /// The files in one cost bucket. `None` is the bucket that needs nothing,
+    /// which a file with no picture is not in: see [`AuditReport::no_picture`].
     pub fn bucket(
         &self,
         cost: Option<Cost>,
     ) -> impl Iterator<Item = (&AuditEntry, &Stat, &Conformance)> {
+        self.assessed().filter(move |(_, _, conformance)| {
+            **conformance != Conformance::NoPicture && conformance.cost() == cost
+        })
+    }
+
+    /// Files with no picture, which no cost bucket holds.
+    pub fn no_picture(&self) -> impl Iterator<Item = (&AuditEntry, &Stat, &Conformance)> {
+        self.assessed()
+            .filter(|(_, _, conformance)| **conformance == Conformance::NoPicture)
+    }
+
+    fn assessed(&self) -> impl Iterator<Item = (&AuditEntry, &Stat, &Conformance)> {
         self.entries
             .iter()
-            .filter_map(move |entry| match &entry.outcome {
-                Outcome::Assessed { stat, conformance } if conformance.cost() == cost => {
-                    Some((entry, stat, conformance))
-                }
-                _ => None,
+            .filter_map(|entry| match &entry.outcome {
+                Outcome::Assessed { stat, conformance } => Some((entry, stat, conformance)),
+                Outcome::Unreadable { .. } => None,
             })
     }
 
@@ -398,15 +409,22 @@ impl AuditCommand {
 
         let _ = writeln!(out, "\n💰 By cost:");
         let _ = writeln!(out, "───────────");
-        for (cost, label) in [
-            (None, "✅ Direct Plays as it is"),
+        let no_picture: Vec<_> = report.no_picture().collect();
+        for (files, label) in [
+            (report.bucket(None).collect(), "✅ Direct Plays as it is"),
             (
-                Some(Cost::Remux),
+                report.bucket(Some(Cost::Remux)).collect(),
                 "🔁 Remux - audio or subtitles, video copied",
             ),
-            (Some(Cost::Reencode), "🔥 Re-encode - the video itself"),
+            (
+                report.bucket(Some(Cost::Reencode)).collect(),
+                "🔥 Re-encode - the video itself",
+            ),
+            (
+                no_picture.clone(),
+                "🔇 No picture - audio only or cover art, so not judged",
+            ),
         ] {
-            let files: Vec<_> = report.bucket(cost).collect();
             let bytes: u64 = files.iter().map(|(_, stat, _)| stat.size_bytes).sum();
             let _ = writeln!(
                 out,
@@ -534,6 +552,14 @@ impl AuditCommand {
                     entry.path,
                     claims.join("; ")
                 );
+            }
+        }
+
+        if !no_picture.is_empty() {
+            let _ = writeln!(out, "\n🔇 No picture, so not judged:");
+            let _ = writeln!(out, "─────────────────────────────");
+            for (entry, ..) in no_picture {
+                let _ = writeln!(out, "   {}", entry.path);
             }
         }
 
@@ -775,6 +801,71 @@ mod tests {
             .entries
             .iter()
             .all(|entry| entry.stat().is_some_and(|stat| stat.size_bytes > 0)));
+    }
+
+    /// A file with no picture is not a film, and nothing measured that it
+    /// plays, so it is not counted as Direct Play. It is named instead, for
+    /// whoever has to decide whether it belongs in the library.
+    #[tokio::test]
+    async fn a_file_with_no_picture_is_named_rather_than_counted_as_direct_play() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let dir = TempDir::new().unwrap();
+        build(
+            &dir.path().join("conforms.mp4"),
+            &[
+                "-c:v",
+                "libx264",
+                "-profile:v",
+                "high",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-ac",
+                "2",
+            ],
+        );
+        build(
+            &dir.path().join("audio-only.mkv"),
+            &["-map", "1:a", "-c:a", "aac"],
+        );
+        // MKV carries cover art as an attached JPEG, which FFprobe lists as
+        // a video stream marked `attached_pic`.
+        let cover = dir.path().join("cover.jpg");
+        build(&cover, &["-map", "0:v", "-frames:v", "1"]);
+        build(
+            &dir.path().join("cover-art.mkv"),
+            &[
+                "-map",
+                "1:a",
+                "-c:a",
+                "aac",
+                "-attach",
+                cover.to_str().unwrap(),
+                "-metadata:s:t",
+                "mimetype=image/jpeg",
+            ],
+        );
+
+        let command = AuditCommand::new(dir.path().to_path_buf(), "chromecast-gen2-3").unwrap();
+        let report = command.execute().await.unwrap();
+
+        assert_eq!(report.entries.len(), 3);
+        assert_eq!(
+            report
+                .bucket(None)
+                .map(|(entry, ..)| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            ["conforms.mp4"],
+            "a file with no picture is not Direct Play"
+        );
+
+        let rendered = command.render_report(&report);
+        assert!(rendered.contains("audio-only.mkv"), "{rendered}");
+        assert!(rendered.contains("cover-art.mkv"), "{rendered}");
     }
 
     /// The one playback failure this project has actually watched: an AVI the

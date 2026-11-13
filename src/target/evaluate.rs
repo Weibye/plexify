@@ -152,12 +152,16 @@ pub enum Conformance {
         reasons: Vec<Finding>,
         unverified: Vec<Finding>,
     },
+    /// Audio only, or only cover art: nothing to judge. No target says what a
+    /// client does with such a file and no job can give it a picture (D33), so
+    /// it is neither Direct Play nor work, and a report names it on its own.
+    NoPicture,
 }
 
 impl Conformance {
     pub fn reasons(&self) -> &[Finding] {
         match self {
-            Conformance::Conforms { .. } => &[],
+            Conformance::Conforms { .. } | Conformance::NoPicture => &[],
             Conformance::Remux { reasons, .. } | Conformance::Reencode { reasons, .. } => reasons,
         }
     }
@@ -169,12 +173,15 @@ impl Conformance {
             Conformance::Conforms { unverified }
             | Conformance::Remux { unverified, .. }
             | Conformance::Reencode { unverified, .. } => unverified,
+            Conformance::NoPicture => &[],
         }
     }
 
+    /// `None` is no job, which is not the same as Direct Play: see
+    /// [`Conformance::NoPicture`].
     pub fn cost(&self) -> Option<Cost> {
         match self {
-            Conformance::Conforms { .. } => None,
+            Conformance::Conforms { .. } | Conformance::NoPicture => None,
             Conformance::Remux { .. } => Some(Cost::Remux),
             Conformance::Reencode { .. } => Some(Cost::Reencode),
         }
@@ -256,19 +263,10 @@ impl Findings {
 
 /// What `target` needs done to the file `probe` describes.
 pub fn evaluate(probe: &MediaProbe, target: &PlaybackTarget) -> Conformance {
-    // No target says what a client does with a file that has no picture, and
-    // no job can give it one, so nothing about it is judged - its audio
-    // included, or a refusal there would queue a job with no picture to copy
-    // (D32). It passes as an assumption, in sight.
+    // Its audio is not judged either: a refusal there would queue a job with
+    // no picture to copy.
     let Some(video_stream) = &probe.video else {
-        return Conformance::Conforms {
-            unverified: vec![Finding {
-                field: Field::VideoCodec,
-                value: "no video stream".to_string(),
-                claim: None,
-                source: Provenance::Assumed,
-            }],
-        };
+        return Conformance::NoPicture;
     };
 
     let mut findings = Findings::default();
@@ -1153,21 +1151,14 @@ mod tests {
 
     /// A file with no picture has nothing a video check can judge, and no
     /// target says what a client does with one. A re-encode cannot add the
-    /// missing stream, so it is not a fix to prescribe; the gap is shown
-    /// instead, beside every other field nothing was read for.
+    /// missing stream, so it is not a fix to prescribe, and nothing measured
+    /// that it plays, so it does not conform either.
     #[test]
     fn a_file_with_no_video_stream_is_unassessable_rather_than_refused() {
         let mut probe = plexify_output();
         probe.video = None;
 
-        let verdict = evaluate(&probe, &chromecast());
-
-        assert_eq!(verdict.cost(), None, "{:?}", claims(&verdict));
-        assert!(
-            unverified_claims(&verdict).contains(&"video codec: no video stream".to_string()),
-            "{:?}",
-            unverified_claims(&verdict)
-        );
+        assert_eq!(evaluate(&probe, &chromecast()), Conformance::NoPicture);
     }
 
     /// Audio the client refuses is still no reason to queue a file with no
@@ -1187,13 +1178,7 @@ mod tests {
             ..Default::default()
         };
 
-        let verdict = evaluate(&probe, &lg());
-
-        assert_eq!(verdict.cost(), None, "{:?}", claims(&verdict));
-        assert_eq!(
-            unverified_claims(&verdict),
-            vec!["video codec: no video stream".to_string()]
-        );
+        assert_eq!(evaluate(&probe, &lg()), Conformance::NoPicture);
     }
 
     /// The LG's envelope bounds neither MPEG-4 Part 2 profiles nor HEVC
