@@ -1,70 +1,23 @@
-//! # Plexify - Media Transcoding CLI
-//!
-//! A simple, distributed media transcoding CLI tool that converts .webm and .mkv files
-//! to .mp4 format with subtitle support, optimized for Plex media servers.
-//!
-//! ## Features
-//!
-//! - **Distributed Processing**: Queue-based system allows multiple workers to process jobs concurrently
-//! - **Subtitle Support**: Handles external .vtt subtitles for .webm files and embedded subtitles for .mkv files
-//! - **Background Processing**: Run workers in low-priority background mode
-//! - **Configurable**: Customizable FFmpeg settings via environment variables
-//! - **Atomic Job Processing**: Race condition-free job claiming for multiple workers
-//! - **Signal Handling**: Graceful shutdown on SIGINT/SIGTERM
-//!
-//! ## Usage
-//!
-//! ```bash
-//! # Scan a directory for media files
-//! plexify scan /path/to/media
-//!
-//! # Process jobs from the queue
-//! plexify work /path/to/media
-//!
-//! # Ask the queue what state it is in
-//! plexify status
-//!
-//! # Report what emptying the queue would delete, then ask
-//! plexify clean
-//!
-//! # Report it and delete nothing
-//! plexify clean --dry-run
-//!
-//! # Empty one directory without being asked
-//! plexify clean --only completed --yes
-//!
-//! # Report what in the library is not in canonical form
-//! plexify validate /path/to/media
-//!
-//! # Carry out the renames it proposes
-//! plexify validate /path/to/media --fix
-//!
-//! # Report what each file needs before a client will Direct Play it
-//! plexify audit /path/to/media --target chromecast-gen2-3
-//!
-//! # Put a fix run back the way it found things
-//! plexify undo plexify-fix-1787309398.json --apply
-//! ```
-
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use plexify::commands::{
     add::AddCommand, audit::AuditCommand, clean::CleanCommand, job_processor::JobProcessorConfig,
-    scan::ScanCommand, status::StatusCommand, validate::ValidateCommand, work::WorkCommand,
+    scan::ScanCommand, status::StatusCommand, undo::UndoCommand, validate::ValidateCommand,
+    work::WorkCommand,
 };
+use plexify::job::QualityPreset;
 use plexify::queue::QueueDirectory;
 use plexify::JobPriority;
 
-/// Plexify - A simple, distributed media transcoding CLI
 #[derive(Parser)]
 #[command(
     name = "plexify",
-    about = "A simple, distributed media transcoding CLI tool",
-    long_about = "Converts .webm and .mkv files to .mp4 format with subtitle support, optimized for Plex media servers.",
+    about = "Names a Plex library's files the way Plex reads them, and converts what its clients cannot Direct Play",
     version
 )]
 struct Cli {
@@ -72,7 +25,6 @@ struct Cli {
     command: Commands,
 }
 
-/// Available commands
 #[derive(Subcommand)]
 enum Commands {
     /// Create a transcoding job for an individual media file
@@ -83,8 +35,14 @@ enum Commands {
         #[arg(long, short = 'w')]
         work_dir: Option<PathBuf>,
         /// Quality preset for encoding. Available: fast, balanced, quality, ultrafast, archive
-        #[arg(long, short = 'p')]
-        preset: Option<String>,
+        #[arg(
+            long,
+            short = 'p',
+            value_enum,
+            ignore_case = true,
+            hide_possible_values = true
+        )]
+        preset: Option<QualityPreset>,
     },
     /// Scan a directory for media files and create transcoding jobs
     Scan {
@@ -94,8 +52,14 @@ enum Commands {
         #[arg(long, short = 'w')]
         work_dir: Option<PathBuf>,
         /// Quality preset for encoding. Available: fast, balanced, quality, ultrafast, archive
-        #[arg(long, short = 'p')]
-        preset: Option<String>,
+        #[arg(
+            long,
+            short = 'p',
+            value_enum,
+            ignore_case = true,
+            hide_possible_values = true
+        )]
+        preset: Option<QualityPreset>,
         /// A client every queued file has to play on: a built-in envelope's
         /// name, or the path to a TOML one. Repeat it to name more than one,
         /// and each file is queued with the most expensive work any of them
@@ -191,7 +155,7 @@ fn resolve(path: &Path) -> Result<PathBuf> {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
     // Logs are diagnostics and go to stderr; stdout carries only what a command
     // deliberately prints, so a report can be piped or redirected on its own.
     // `fmt::layer()` defaults to stdout, so the writer has to be said out loud -
@@ -205,9 +169,20 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
 
-    let cli = Cli::parse();
+    match run(Cli::parse().command).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            // `{:#}` prints the whole context chain on one line, so code below
+            // may say what it was doing with `.context(...)` and trust that the
+            // cause still reaches the user. `{}` prints only the outermost layer.
+            error!("Command failed: {:#}", e);
+            ExitCode::FAILURE
+        }
+    }
+}
 
-    let result = match cli.command {
+async fn run(command: Commands) -> Result<()> {
+    match command {
         Commands::Add {
             file,
             work_dir,
@@ -219,10 +194,8 @@ async fn main() -> Result<()> {
                 "Starting add command for file: {:?}, work: {:?}, preset: {:?}",
                 file, work_root, preset
             );
-            match JobProcessorConfig::from_preset(preset.as_deref()) {
-                Ok(config) => AddCommand::new(file, work_root, config).execute().await,
-                Err(e) => Err(e),
-            }
+            let config = JobProcessorConfig::from_preset(preset);
+            AddCommand::new(file, work_root, config).execute().await
         }
         Commands::Scan {
             path,
@@ -236,14 +209,10 @@ async fn main() -> Result<()> {
                 "Starting scan command for path: {:?}, work: {:?}, preset: {:?}, targets: {:?}",
                 path, work_root, preset, target
             );
-            match JobProcessorConfig::from_preset(preset.as_deref()) {
-                Ok(config) => {
-                    ScanCommand::new(path, work_root, config, &target)?
-                        .execute()
-                        .await
-                }
-                Err(e) => Err(e),
-            }
+            let config = JobProcessorConfig::from_preset(preset);
+            ScanCommand::new(path, work_root, config, &target)?
+                .execute()
+                .await
         }
         Commands::Work {
             path,
@@ -269,13 +238,9 @@ async fn main() -> Result<()> {
             // resolved against the media root, and requiring a directory that
             // does not affect the answer would be a wart on the one command
             // whose whole purpose is to be easy to reach for.
-            match StatusCommand::new(work_root).execute().await {
-                Ok(status) => {
-                    print!("{}", plexify::commands::status::render(&status));
-                    Ok(())
-                }
-                Err(e) => Err(e),
-            }
+            let status = StatusCommand::new(work_root).execute().await?;
+            print!("{}", plexify::commands::status::render(&status));
+            Ok(())
         }
         Commands::Clean {
             work_dir,
@@ -296,41 +261,14 @@ async fn main() -> Result<()> {
         }
         Commands::Undo { plan, apply } => {
             info!("Starting undo for plan: {:?}, apply: {}", plan, apply);
-
-            match plexify::undo::read_record(&plan) {
-                Ok(record) => {
-                    let undo_plan = plexify::undo::plan(&record, &plan);
-
-                    if apply {
-                        let record_file = plexify::undo::default_record_file();
-                        match plexify::undo::apply(&undo_plan, &record_file) {
-                            Ok(outcome) => {
-                                print!("{}", plexify::undo::render(&undo_plan, Some(&outcome)));
-                                Ok(())
-                            }
-                            Err(e) => Err(e),
-                        }
-                    } else {
-                        print!("{}", plexify::undo::render(&undo_plan, None));
-                        Ok(())
-                    }
-                }
-                Err(e) => Err(e),
-            }
+            UndoCommand::new(plan, apply).execute().await
         }
         Commands::Audit { path, target } => {
             info!("Starting audit for path: {:?}, target: {}", path, target);
-
-            match AuditCommand::new(path, &target) {
-                Ok(audit_cmd) => match audit_cmd.execute().await {
-                    Ok(report) => {
-                        audit_cmd.print_report(&report);
-                        Ok(())
-                    }
-                    Err(e) => Err(e),
-                },
-                Err(e) => Err(e),
-            }
+            let audit = AuditCommand::new(path, &target)?;
+            let report = audit.execute().await?;
+            audit.print_report(&report);
+            Ok(())
         }
         Commands::Validate {
             path,
@@ -341,53 +279,12 @@ async fn main() -> Result<()> {
                 "Starting validate command for path: {:?}, fix: {}, library root: {:?}",
                 path, fix, library_root
             );
-            let validate_cmd = match library_root {
+            let validate = match library_root {
                 Some(root) => ValidateCommand::rooted_at(path, root)?,
                 None => ValidateCommand::new(path),
             };
-            let validate_cmd = if fix {
-                validate_cmd.fixing()
-            } else {
-                validate_cmd
-            };
-
-            match validate_cmd.execute().await {
-                Ok(report) => {
-                    validate_cmd.print_report(&report);
-
-                    // Everything above is a dry run. Only the flag turns the
-                    // proposals into moves, and the report the user just read is
-                    // exactly what is about to be attempted.
-                    if fix {
-                        let plan = plexify::fix::plan(&report);
-                        let plan_file = plexify::fix::default_plan_file(plan.created_unix_seconds);
-
-                        match plexify::fix::apply(&plan, &plan_file) {
-                            Ok(outcome) => {
-                                validate_cmd.print_fix_outcome(&outcome);
-                                Ok(())
-                            }
-                            Err(e) => Err(e),
-                        }
-                    } else {
-                        Ok(())
-                    }
-                }
-                Err(e) => Err(e),
-            }
+            let validate = if fix { validate.fixing() } else { validate };
+            validate.execute().await
         }
-    };
-
-    if let Err(e) = result {
-        // `{:#}` prints the whole context chain on one line. The `{}` form shows
-        // only the outermost layer, which threw away every `.with_context(...)`
-        // in the project at the one point a user reads: `fix` and `undo` attach
-        // the source and destination of a move to the operating system's reason,
-        // and only the summary arrived. Code below may therefore say what it was
-        // doing with `.context(...)` and leave the cause attached.
-        error!("Command failed: {:#}", e);
-        std::process::exit(1);
     }
-
-    Ok(())
 }

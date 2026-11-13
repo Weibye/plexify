@@ -386,7 +386,7 @@ pub struct QualitySettings {
 }
 
 /// Predefined quality presets for different use cases
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, clap::ValueEnum)]
 pub enum QualityPreset {
     /// Fast encoding with good quality (veryfast/23/128k)
     Fast,
@@ -395,6 +395,7 @@ pub enum QualityPreset {
     /// High quality, slower encoding (slow/18/256k)
     Quality,
     /// Ultra-fast encoding for quick previews (ultrafast/28/96k)
+    #[value(name = "ultrafast")]
     UltraFast,
     /// Archive quality for long-term storage (veryslow/15/320k)
     Archive,

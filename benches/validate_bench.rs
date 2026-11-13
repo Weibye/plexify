@@ -161,7 +161,7 @@ fn bench_validate_small(c: &mut Criterion) {
         b.iter(|| {
             let temp_dir = create_test_media_library(50);
             let validate_cmd = ValidateCommand::new(temp_dir.path().to_path_buf());
-            let report = rt.block_on(validate_cmd.execute()).unwrap();
+            let report = rt.block_on(validate_cmd.report()).unwrap();
             black_box(report);
         });
     });
@@ -174,7 +174,7 @@ fn bench_validate_medium(c: &mut Criterion) {
         b.iter(|| {
             let temp_dir = create_test_media_library(200);
             let validate_cmd = ValidateCommand::new(temp_dir.path().to_path_buf());
-            let report = rt.block_on(validate_cmd.execute()).unwrap();
+            let report = rt.block_on(validate_cmd.report()).unwrap();
             black_box(report);
         });
     });
@@ -187,7 +187,7 @@ fn bench_validate_large(c: &mut Criterion) {
         b.iter(|| {
             let temp_dir = create_test_media_library(500);
             let validate_cmd = ValidateCommand::new(temp_dir.path().to_path_buf());
-            let report = rt.block_on(validate_cmd.execute()).unwrap();
+            let report = rt.block_on(validate_cmd.report()).unwrap();
             black_box(report);
         });
     });
