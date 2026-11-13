@@ -821,6 +821,11 @@ impl FFmpegProcessor {
         // FFmpeg's build banner runs to a screenful and is reproduced in every
         // error a failed job records. Nothing reads it.
         command.arg("-hide_banner");
+        // The level mark on each line is what lets `run` tell the line that
+        // names a failure from the layers that repeat it on the way out. Below
+        // warnings are the stream dump and encoder statistics, which bury the
+        // cause in the part of the error a job file keeps.
+        command.args(["-loglevel", "level+warning"]);
         command
     }
 
@@ -1521,6 +1526,10 @@ impl FFmpegProcessor {
 
     /// Run one FFmpeg invocation, turning a non-zero exit into an error that
     /// names what was being attempted.
+    ///
+    /// The error ends with the line that names the cause, after what FFmpeg
+    /// said: a job file keeps the tail of an error, and a summary shows its
+    /// last line.
     async fn run(&self, args: Vec<String>, what: &str) -> Result<()> {
         let mut cmd = self.ffmpeg_command();
         cmd.args(&args);
@@ -1544,7 +1553,12 @@ impl FFmpegProcessor {
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             error!("FFmpeg failed during {what}: {stderr}");
-            return Err(anyhow!("FFmpeg {what} failed: {stderr}"));
+            let status = output.status.to_string();
+            let cause = failure_cause(&stderr).unwrap_or(&status);
+            return Err(anyhow!(
+                "{}\nFFmpeg {what} failed: {cause}",
+                stderr.trim_end()
+            ));
         }
 
         Ok(())
@@ -1762,6 +1776,34 @@ impl FFmpegProcessor {
 
         Ok(())
     }
+}
+
+/// The line of what FFmpeg said on failing that names the cause.
+///
+/// FFmpeg reports one failure as a cascade: the component that hit the problem
+/// logs it, then every layer the error passes back through logs again. With the
+/// level marks [`FFmpegProcessor::ffmpeg_command`] asks for, the cause is the
+/// first line marked `[error]` or worse, shown without the marker and the
+/// component address before it. Output without the marks says nothing about
+/// which line is the cause, so it gets the last one. `None` when FFmpeg said
+/// nothing.
+fn failure_cause(stderr: &str) -> Option<&str> {
+    const ERROR_OR_WORSE: [&str; 3] = ["[panic] ", "[fatal] ", "[error] "];
+
+    let lines = || {
+        stderr
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+    };
+    lines()
+        .find_map(|line| {
+            ERROR_OR_WORSE
+                .iter()
+                .find_map(|level| line.split_once(level))
+                .map(|(_, cause)| cause.trim())
+        })
+        .or_else(|| lines().next_back())
 }
 
 #[cfg(test)]
@@ -5679,5 +5721,65 @@ mod tests {
         assert_eq!(codec_of(output, "s"), "", "the track has to be gone");
         assert_eq!(codec_of(output, "v"), "h264", "and the picture untouched");
         assert_eq!(codec_of(output, "a"), "aac");
+    }
+
+    /// A failed run ends its error with the line that names the cause, which
+    /// is what a parked job's summary shows.
+    ///
+    /// Copying generated frames into an MP4 is refused by the muxer, and the
+    /// refusal is followed by the layers that repeat it, so the cause is
+    /// neither the first line of what FFmpeg said nor, without the level
+    /// marks `ffmpeg_command` asks for, the last.
+    #[tokio::test]
+    async fn a_failed_run_ends_its_error_with_the_cause() {
+        if !ffmpeg_present() {
+            return;
+        }
+
+        let temp = TempDir::new().unwrap();
+        let output = temp.path().join("out.mp4");
+        let args = ["-f", "lavfi", "-i", "testsrc=duration=1", "-c:v", "copy"]
+            .iter()
+            .map(|arg| arg.to_string())
+            .chain([output.to_string_lossy().into_owned()])
+            .collect();
+
+        let error = FFmpegProcessor::new(false)
+            .run(args, "conversion")
+            .await
+            .expect_err("an MP4 cannot hold uncoded frames");
+        let error = format!("{error:#}");
+        let last = error.lines().next_back().unwrap_or_default();
+
+        assert!(
+            last.starts_with("FFmpeg conversion failed: Could not find tag for codec")
+                && last.ends_with("codec not currently supported in container"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_cause_is_the_first_line_ffmpeg_marked_as_an_error() {
+        // What FFmpeg 9 printed for an option value it could not parse.
+        let stderr = "\
+[libx264 @ 000001f1ef706280] [Eval @ 00000030f3dfda60] [error] Undefined constant or missing '(' in 'banana'
+[libx264 @ 000001f1ef706280] [error] Unable to parse \"crf\" option value \"banana\"
+[vost#0:0/libx264 @ 000001f1ef702000] [error] Error applying encoder options: Invalid argument
+[error] Error opening output file c.mp4.
+[fatal] Error opening output files: Invalid argument
+";
+        assert_eq!(
+            failure_cause(&format!("[in#0 @ 0x1] [warning] Format detected\n{stderr}")),
+            Some("Undefined constant or missing '(' in 'banana'")
+        );
+    }
+
+    #[test]
+    fn output_without_level_marks_is_summarised_by_its_last_line() {
+        assert_eq!(
+            failure_cause("Could not write header\nConversion failed!\n\n"),
+            Some("Conversion failed!")
+        );
+        assert_eq!(failure_cause("\n"), None);
     }
 }

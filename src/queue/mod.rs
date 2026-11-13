@@ -620,6 +620,19 @@ async fn write_job_atomically(job_path: &std::path::Path, job: &Job) -> Result<(
     Ok(())
 }
 
+/// The line that sums up a failed job's error: its last.
+///
+/// A failed FFmpeg run ends its error with the line that names the cause, and
+/// plexify's own errors are one line. The last line is also the one the tail a
+/// job file keeps always holds.
+pub fn failure_summary(error: &str) -> &str {
+    error
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .unwrap_or_default()
+}
+
 /// The last `limit` characters of a message, marked as truncated if anything
 /// was dropped.
 fn tail(message: &str, limit: usize) -> String {
@@ -1119,9 +1132,9 @@ impl<'a> ClaimedJob<'a> {
         let _ = async_fs::remove_file(heartbeat_path_for(&self.in_progress_path)).await;
 
         if park {
-            // FFmpeg's complaint runs to a screenful. The job file keeps all of
-            // it; the log gets the first line of it.
-            let summary = error.lines().next().unwrap_or_default();
+            // FFmpeg's complaint runs to a screenful. The job file keeps the
+            // tail of it; the log gets the line that sums it up.
+            let summary = failure_summary(error);
             warn!(
                 "🚫 Parking job in _failed after {attempts} attempts: {} ({summary})",
                 self.job_name
