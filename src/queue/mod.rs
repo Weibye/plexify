@@ -128,7 +128,7 @@ impl JobQueue {
         }
     }
 
-    /// Claim the first available job (original behavior)
+    /// Claim the first job the queue directory lists.
     async fn claim_first_available_job(&self) -> Result<Option<ClaimedJob<'_>>> {
         let mut entries = async_fs::read_dir(&self.queue_dir).await?;
 
@@ -286,8 +286,9 @@ impl JobQueue {
     /// Several workers may share one work root, so the sweep must not take a job
     /// away from a worker that is still running it. Each running worker refreshes
     /// a heartbeat file beside its job (see [`ClaimedJob::heartbeat`]), and only
-    /// a job whose heartbeat - or, for a job claimed before this existed, whose
-    /// own file - has not been touched for `stale_after` is reclaimed.
+    /// a job whose heartbeat - or, for a worker that died before its first
+    /// heartbeat, whose own file - has not been touched for `stale_after` is
+    /// reclaimed. See D4.
     ///
     /// Whatever the interrupted encode left in the work folder is left where it
     /// is: the encoder decides on the next attempt what of it is still usable.
@@ -821,8 +822,7 @@ fn quiet_for(seen: Option<SystemTime>, stale_after: Duration) -> bool {
 /// all ask it for the same reason: losing a race to another worker is
 /// routine and is reported as a disposition, while a work root that has dropped
 /// out is an error, and answering the second with the first hides an outage
-/// behind a shrug. CLAUDE.md designs for many workers on one shared work root,
-/// so that is not a hypothetical.
+/// behind a shrug.
 ///
 /// It cannot rest on the error kind alone. Off Windows it can: a mount that has
 /// gone away reports a connection or IO failure, and never `NotFound`.
@@ -840,7 +840,7 @@ fn quiet_for(seen: Option<SystemTime>, stale_after: Duration) -> bool {
 /// therefore that other thing is what is missing".
 ///
 /// This is the same split as `FFmpegProcessor::ffmpeg_command`: both worker
-/// platforms matter, and neither branch is the general case.
+/// platforms matter, and neither branch is the general case. See D8.
 #[cfg(windows)]
 pub(crate) fn is_absent(error: &std::io::Error) -> bool {
     /// Windows errors that arrive as `NotFound` but mean the path could not be
@@ -1290,8 +1290,11 @@ mod tests {
 
         assert_eq!(swept.reclaimed, vec![job_name.clone()]);
         assert!(swept.parked.is_empty());
-        assert!(!in_progress_path.exists());
-        assert!(queue.queue_dir.join(&job_name).exists());
+        assert!(!in_progress_path.exists(), "{job_name} left _in_progress");
+        assert!(
+            queue.queue_dir.join(&job_name).exists(),
+            "{job_name} is back in _queue"
+        );
 
         // And a worker can pick it up again, which is the whole point.
         assert!(queue.claim_job(JobPriority::None).await.unwrap().is_some());
@@ -1519,8 +1522,14 @@ mod tests {
 
         assert_eq!(swept.recovered, vec![job_name.clone()]);
         assert_eq!(swept.reclaimed, vec![job_name.clone()]);
-        assert!(!taken_path.exists());
-        assert!(queue.queue_dir.join(&job_name).exists());
+        assert!(
+            !taken_path.exists(),
+            "{job_name} is no longer held as .taken"
+        );
+        assert!(
+            queue.queue_dir.join(&job_name).exists(),
+            "{job_name} is back in _queue"
+        );
     }
 
     /// While a job is held under a `.taken` name it is in none of the three
@@ -1583,7 +1592,10 @@ mod tests {
             "a job in flight is nobody else's to move: {swept:?}"
         );
         assert!(taken_path.exists(), "left for its mover to finish");
-        assert!(!queue.queue_dir.join(&job_name).exists());
+        assert!(
+            !queue.queue_dir.join(&job_name).exists(),
+            "{job_name} was not put in _queue"
+        );
         assert!(
             !in_progress_path.exists(),
             "and never put back under the name its mover took it from"
@@ -1609,7 +1621,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(swept.reclaimed, vec![job_name.clone()]);
-        assert!(queue.queue_dir.join(&job_name).exists());
+        assert!(
+            queue.queue_dir.join(&job_name).exists(),
+            "{job_name} is back in _queue"
+        );
     }
 
     #[test]
@@ -1623,7 +1638,10 @@ mod tests {
             .unwrap();
 
         assert!(swept.is_empty());
-        assert!(queue.in_progress_dir.join(&job_name).exists());
+        assert!(
+            queue.in_progress_dir.join(&job_name).exists(),
+            "{job_name} stays in _in_progress"
+        );
     }
 
     #[test]
@@ -1697,7 +1715,10 @@ mod tests {
             swept.is_empty(),
             "a job whose worker is still checking in must not be taken away"
         );
-        assert!(in_progress_path.exists());
+        assert!(
+            in_progress_path.exists(),
+            "{in_progress_path:?} stays in _in_progress"
+        );
 
         // Once the worker stops checking in, the job comes back.
         drop(claimed);
@@ -1758,7 +1779,10 @@ mod tests {
 
         assert!(swept.reclaimed.is_empty());
         assert_eq!(swept.parked, vec![job_name.clone()]);
-        assert!(queue.failed_dir.join(&job_name).exists());
+        assert!(
+            queue.failed_dir.join(&job_name).exists(),
+            "{job_name} is parked in _failed"
+        );
 
         let parked: Job = serde_json::from_str(
             &std::fs::read_to_string(queue.failed_dir.join(&job_name)).unwrap(),
@@ -1825,7 +1849,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!orphan.exists());
+        assert!(
+            !orphan.exists(),
+            "the heartbeat with no job, {orphan:?}, was removed"
+        );
     }
 
     #[test]
@@ -1882,9 +1909,18 @@ mod tests {
             }
         );
 
-        assert!(!queue.queue_dir.join(&job_name).exists());
-        assert!(!queue.in_progress_dir.join(&job_name).exists());
-        assert!(queue.failed_dir.join(&job_name).exists());
+        assert!(
+            !queue.queue_dir.join(&job_name).exists(),
+            "{job_name} is not in _queue"
+        );
+        assert!(
+            !queue.in_progress_dir.join(&job_name).exists(),
+            "{job_name} is not in _in_progress"
+        );
+        assert!(
+            queue.failed_dir.join(&job_name).exists(),
+            "{job_name} is parked in _failed"
+        );
 
         // The parked job says how often it failed, and why.
         let parked: Job = serde_json::from_str(
@@ -1998,8 +2034,11 @@ mod tests {
 
         assert_eq!(swept.unreadable, vec![job_name.clone()]);
         assert!(swept.reclaimed.is_empty() && swept.parked.is_empty());
-        assert!(!in_progress_path.exists());
-        assert!(queue.failed_dir.join(&job_name).exists());
+        assert!(!in_progress_path.exists(), "{job_name} left _in_progress");
+        assert!(
+            queue.failed_dir.join(&job_name).exists(),
+            "{job_name} was moved to _failed"
+        );
         assert!(
             !heartbeat_of(&in_progress_path).exists(),
             "the heartbeat goes with the job it belonged to"
@@ -2084,7 +2123,11 @@ mod tests {
 
         let claimed = queue.claim_job(JobPriority::None).await;
         assert!(claimed.is_err(), "{:?}", claimed.map(|c| c.is_some()));
-        assert!(queue.queue_dir.join(job.job_filename()).exists());
+        assert!(
+            queue.queue_dir.join(job.job_filename()).exists(),
+            "{} stays in _queue",
+            job.job_filename()
+        );
     }
 
     /// The same for the move a failure begins with.
@@ -2209,18 +2252,6 @@ mod tests {
     }
 
     #[test]
-    async fn test_queue_initialization() {
-        let temp_dir = TempDir::new().unwrap();
-        let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
-
-        queue.init().await.unwrap();
-
-        assert!(queue.queue_dir.exists());
-        assert!(queue.in_progress_dir.exists());
-        assert!(queue.completed_dir.exists());
-    }
-
-    #[test]
     async fn test_remote_queue_initialization() {
         let media_dir = TempDir::new().unwrap();
         let queue_dir = TempDir::new().unwrap();
@@ -2231,13 +2262,16 @@ mod tests {
 
         queue.init().await.unwrap();
 
-        // Queue directories should be in the separate queue directory
-        assert!(queue_dir.path().join("_queue").exists());
-        assert!(queue_dir.path().join("_in_progress").exists());
-        assert!(queue_dir.path().join("_completed").exists());
-
-        // Media directory should be clean
-        assert!(!media_dir.path().join("_queue").exists());
+        for name in ["_queue", "_in_progress", "_completed", "_failed"] {
+            assert!(
+                queue_dir.path().join(name).exists(),
+                "{name} is created under the work root"
+            );
+            assert!(
+                !media_dir.path().join(name).exists(),
+                "{name} is not created under the media root"
+            );
+        }
     }
 
     #[test]
@@ -2378,7 +2412,7 @@ mod tests {
         assert!(claimed_order[4].contains("The Matrix"));
     }
 
-    /// Issues #138 and #133, asserted where the order is actually produced.
+    /// Episode order, asserted where the order is produced.
     ///
     /// The queue is given four files that all carry the marker `S01E01` or
     /// `S01E02`, in two pairs that a sort key taken from the *rendered* series

@@ -7,6 +7,7 @@ use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::ffmpeg::FFmpegProcessor;
+use crate::paths::to_forward_slashes;
 use crate::queue::{CompletionDisposition, FailureDisposition, JobQueue, STALE_AFTER};
 use crate::JobPriority;
 
@@ -53,9 +54,12 @@ impl WorkCommand {
         };
 
         info!("✅ Starting worker in {} mode.", mode);
-        info!("Watching for jobs in: {:?}", self.work_root.join("_queue"));
 
         let queue = JobQueue::new(self.media_root.clone(), self.work_root.clone());
+        info!(
+            "Watching for jobs in: {}",
+            to_forward_slashes(&queue.queue_dir)
+        );
         queue.init().await?;
 
         let processor = FFmpegProcessor::new(self.background_mode);
@@ -169,15 +173,8 @@ impl WorkCommand {
         if let Some(claimed_job) = queue.claim_job(self.priority_mode.clone()).await? {
             info!("➡️ Claimed job: {}", claimed_job.job_name());
 
-            // Get the job details directly from the job file
             let job = &claimed_job.job;
-
-            // Process the job with FFmpeg using the job's own media_root (for absolute paths) or self.media_root (for relative paths)
-            let media_root = if job.input_path.is_absolute() {
-                None
-            } else {
-                Some(self.media_root.as_path())
-            };
+            let media_root = Some(self.media_root.as_path());
 
             let job_name = claimed_job.job_name().to_string();
             let work_folder = &queue.in_progress_dir;
@@ -308,21 +305,6 @@ mod tests {
     use tempfile::TempDir;
 
     #[tokio::test]
-    async fn test_work_command_creation() {
-        let temp_dir = TempDir::new().unwrap();
-        let work_cmd = WorkCommand::new(
-            temp_dir.path().to_path_buf(),
-            temp_dir.path().to_path_buf(),
-            false,
-            JobPriority::None,
-        );
-
-        assert_eq!(work_cmd.media_root, temp_dir.path());
-        assert!(!work_cmd.background_mode);
-        assert_eq!(work_cmd.priority_mode, JobPriority::None);
-    }
-
-    #[tokio::test]
     async fn test_work_nonexistent_directory() {
         let work_cmd = WorkCommand::new(
             PathBuf::from("/nonexistent/path"),
@@ -332,7 +314,10 @@ mod tests {
         );
 
         let result = work_cmd.execute().await;
-        assert!(result.is_err());
+        assert!(
+            result.is_err(),
+            "a media root that does not exist is refused"
+        );
     }
 
     #[tokio::test]

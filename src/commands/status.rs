@@ -1,16 +1,7 @@
 //! Report what is in the queue, and why anything in it is not moving.
 //!
-//! The queue is four directories and a job is a JSON file, so the state of the
-//! queue is already fully recorded on disk - it has simply never been readable
-//! without `ls` and a text editor. This command reads those directories and
-//! nothing else. There is no index to keep, and adding one would give the queue
-//! a second source of truth to disagree with itself about.
-//!
-//! **This command never moves, rewrites, or deletes anything.** It is the one
-//! place a user can look at a queue without changing it, which is what makes it
-//! safe to run against a work root a worker is busy with. It does not even call
-//! [`JobQueue::init`]: a work root that has never held a job must read as empty,
-//! not be created by the act of asking about it.
+//! It reads the four queue directories and changes nothing, not even by calling
+//! [`JobQueue::init`]. See D17.
 
 use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
@@ -20,8 +11,8 @@ use tokio::fs as async_fs;
 use crate::job::Job;
 use crate::paths::to_forward_slashes;
 use crate::queue::{
-    failure_summary, heartbeat_path_for, is_absent, last_activity, JobQueue, MAX_ATTEMPTS,
-    STALE_AFTER,
+    failure_summary, heartbeat_path_for, is_absent, last_activity, JobQueue, QueueDirectory,
+    MAX_ATTEMPTS, STALE_AFTER,
 };
 
 /// Report the state of a work root's queue.
@@ -31,9 +22,8 @@ pub struct StatusCommand {
 
 /// Everything the four queue directories say, as data.
 ///
-/// Returned rather than printed so that a caller other than the CLI - the TUI
-/// in #121 is the obvious one - reads the same state the text report is
-/// rendered from, instead of parsing the text back out again.
+/// Returned rather than printed, so another caller reads the state the report
+/// is rendered from instead of parsing the text back out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueStatus {
     /// The work root this describes. Printed first in the report, because
@@ -114,7 +104,7 @@ pub struct FailedJob {
 pub struct UnreadableJob {
     pub job_name: String,
     /// Which queue directory it sits in, named as it appears on disk.
-    pub directory: String,
+    pub directory: &'static str,
     pub reason: String,
 }
 
@@ -218,7 +208,7 @@ impl StatusCommand {
                 Ok(None) => {}
                 Err(reason) => unreadable.push(UnreadableJob {
                     job_name,
-                    directory: "_in_progress".to_string(),
+                    directory: QueueDirectory::InProgress.on_disk_name(),
                     reason,
                 }),
             }
@@ -237,7 +227,7 @@ impl StatusCommand {
                 Ok(None) => {}
                 Err(reason) => unreadable.push(UnreadableJob {
                     job_name,
-                    directory: "_failed".to_string(),
+                    directory: QueueDirectory::Failed.on_disk_name(),
                     reason,
                 }),
             }
@@ -273,9 +263,8 @@ impl StatusCommand {
 /// one of them is a `-w` problem: a directory that does not exist is a work root
 /// nothing has scanned into, while a directory that cannot be *reached* - a
 /// share that is down, a mount that went away - is a work root whose `-w` may be
-/// exactly right. CLAUDE.md designs for many workers on one shared work root, so
-/// the second is not a hypothetical, and answering it with "this work root has
-/// never held a job" sends a user to change the one thing that is not wrong.
+/// exactly right. Answering the second with "this work root has never held a
+/// job" sends a user to change the one thing that is not wrong. See D8.
 async fn job_files(directory: &Path) -> Result<Option<Vec<PathBuf>>> {
     let mut entries = match async_fs::read_dir(directory).await {
         Ok(entries) => entries,
