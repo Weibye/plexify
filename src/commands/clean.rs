@@ -1,34 +1,10 @@
 //! Empty a work root's queue directories, after saying what that costs.
 //!
-//! `clean` is the only command that deletes queue state, and the four
-//! directories it empties are not equally disposable:
-//!
-//! - `_queue` is a list of files to transcode. Running `scan` again rebuilds it.
-//! - `_completed` is the record that a file *was* transcoded. Nothing
-//!   reconstructs it, and #135 proposes reading it as the authoritative answer
-//!   to "did plexify finish this?".
-//! - `_failed` holds every parked job's attempt count and recorded error, and is
-//!   also what stops the next `scan` re-queueing a job that cannot succeed.
-//!   Emptying it silently re-arms every job that was deliberately parked.
-//! - `_in_progress` holds live claims. Deleting a claim whose worker is still
-//!   checking in is not a cleanup; the worker carries on encoding and nothing
-//!   will ever reconcile the result.
-//!
-//! So the command still empties all four by default - that is what its name has
-//! always promised, and narrowing the default silently would break anyone who
-//! scripted it - but nothing is removed until the user has been shown, per
-//! directory, what is in it and why it matters, and has said yes. `--only`
-//! narrows a run, `--dry-run` prints the same report and removes nothing, and
-//! `--yes` answers in advance for scripted use.
-//!
-//! **The report and the prompt go to stderr, not stdout.** A prompt is not a
-//! diagnostic, but it is also not this command's output: `clean` produces no
-//! machine-readable result, and the report exists to be read next to the
-//! question it is asking. Splitting them across two streams would mean
-//! `plexify clean > log` hides half of a question that is still waiting for an
-//! answer. They are printed rather than logged for the same reason - a
-//! confirmation prompt that `RUST_LOG` can filter out is a prompt that can go
-//! missing.
+//! The four are not equally disposable: `scan` rebuilds `_queue`, but nothing
+//! rebuilds `_completed` or `_failed`, and `_in_progress` holds live claims. So
+//! nothing is removed until the user has seen, per directory, what is in it and
+//! said yes. The report and the prompt go to stderr through `eprintln!`, so
+//! neither `> log` nor `RUST_LOG` can hide half of a question. See D18.
 
 use anyhow::{anyhow, Context, Result};
 use std::fmt;
@@ -77,14 +53,6 @@ pub enum CleanOutcome {
 /// consented to losing. It is not tolerable for a *live claim*, which is why
 /// that one case is re-read from the disk immediately before the deletion rather
 /// than trusted from here. See [`CleanCommand::run`].
-///
-/// **This overlaps with `QueueStatus` in #144 (`feat/queue-status`), which reads
-/// the same four directories and is explicitly structured for other callers.**
-/// It is duplicated here only because that branch is unmerged and this one is
-/// cut from `main`. When #144 lands, `CleanPlan` should be built from a
-/// `QueueStatus` rather than from its own walk - the counts, the claim liveness
-/// and the parked-job attempt counts all come from there - leaving only the
-/// target selection here.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CleanPlan {
     /// One entry per selected queue directory that exists on disk.
@@ -112,10 +80,9 @@ pub struct DirectoryPlan {
 /// and in `_in_progress` it is still a claim. Dropping it from the report would
 /// hide the one entry a person most needs to see before emptying the directory,
 /// so the fallback names it by its own filename - which is the v5 UUID of the
-/// input path (`Job::id_for_input`) and so is stable and worth printing. #129
-/// makes an unreadable job in `_failed` a documented state rather than an
-/// anomaly, by quarantining one there with an `.error` file beside it; this is
-/// what keeps such a job visible in the report once that lands.
+/// input path (`Job::id_for_input`) and so is stable and worth printing. The
+/// sweep quarantines an unreadable job in `_failed`, so the report meets one
+/// there routinely. See D6 and D18.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum JobIdentity {
     /// The input path the job transcodes, read out of the job file.
@@ -979,10 +946,22 @@ mod tests {
             outcome,
             CleanOutcome::Removed(vec![QueueDirectory::Completed])
         );
-        assert!(!temp.path().join("_completed").exists());
-        assert!(temp.path().join("_queue").exists());
-        assert!(temp.path().join("_in_progress").exists());
-        assert!(temp.path().join("_failed").exists());
+        assert!(
+            !temp.path().join("_completed").exists(),
+            "_completed was named, so it is removed"
+        );
+        assert!(
+            temp.path().join("_queue").exists(),
+            "_queue was not named, so it is kept"
+        );
+        assert!(
+            temp.path().join("_in_progress").exists(),
+            "_in_progress was not named, so it is kept"
+        );
+        assert!(
+            temp.path().join("_failed").exists(),
+            "_failed was not named, so it is kept"
+        );
     }
 
     /// An empty work root with one job waiting, so there is something to clean
@@ -1108,10 +1087,9 @@ mod tests {
         assert!(job_file.exists(), "a live claim was deleted");
     }
 
-    /// The other half of finding 2: a corrupt parked job is exactly the one
-    /// somebody needs to see before emptying `_failed`, and it was the one the
-    /// report dropped. #129's `quarantine_unreadable` makes this a documented
-    /// state rather than an anomaly.
+    /// A corrupt parked job is exactly the one somebody needs to see before
+    /// emptying `_failed`, and the sweep's `quarantine_unreadable` puts such
+    /// jobs there.
     #[tokio::test]
     async fn an_unreadable_parked_job_is_itemised_rather_than_dropped() {
         let temp = TempDir::new().unwrap();
@@ -1207,6 +1185,9 @@ mod tests {
         let outcome = command.run(&mut Accepts { asked: false }).await.unwrap();
 
         assert_eq!(outcome, CleanOutcome::Removed(vec![QueueDirectory::Queue]));
-        assert!(temp.path().join("_in_progress").exists());
+        assert!(
+            temp.path().join("_in_progress").exists(),
+            "_in_progress was not named, so its live claim is kept"
+        );
     }
 }
