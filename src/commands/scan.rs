@@ -6,6 +6,7 @@ use tracing::{debug, info, warn};
 use crate::ignore::IgnoreFilter;
 use crate::job::{MediaFileType, Operation};
 use crate::naming::scope_for;
+use crate::paths::to_forward_slashes;
 use crate::probe::{probe_all, MediaProbe};
 use crate::queue::JobQueue;
 use crate::target::{evaluate, Conformance, PlaybackTarget};
@@ -56,23 +57,30 @@ impl ScanCommand {
     pub async fn execute(&self) -> Result<()> {
         if !self.media_root.exists() {
             return Err(anyhow!(
-                "Media directory does not exist: {:?}",
-                self.media_root
+                "Media directory does not exist: {}",
+                to_forward_slashes(&self.media_root)
             ));
         }
 
         if !self.media_root.is_dir() {
-            return Err(anyhow!("Path is not a directory: {:?}", self.media_root));
+            return Err(anyhow!(
+                "Path is not a directory: {}",
+                to_forward_slashes(&self.media_root)
+            ));
         }
 
-        info!("🔎 Scanning directory: {:?}", self.media_root);
+        info!(
+            "🔎 Scanning directory: {}",
+            to_forward_slashes(&self.media_root)
+        );
         info!("📁 Recursively scanning all subdirectories...");
 
         // A rule at the library root governs every scan inside it, so the root is
         // found from an absolute path and the walk uses that same spelling for the
         // filter to match. Jobs still record paths against `media_root` as given.
-        let scan_root = std::path::absolute(&self.media_root)
-            .with_context(|| format!("could not resolve {}", self.media_root.display()))?;
+        let scan_root = std::path::absolute(&self.media_root).with_context(|| {
+            format!("could not resolve {}", to_forward_slashes(&self.media_root))
+        })?;
         let scope = scope_for(&scan_root);
         let ignore_filter = IgnoreFilter::for_scope(scope.library_root, &scope.scan_path)?;
 
@@ -146,8 +154,8 @@ impl ScanCommand {
         for ((path, file_type), resolution) in media_files.iter().zip(resolutions) {
             if let Some(ref pb) = job_pb {
                 pb.set_message(format!(
-                    "{file_type:?}: {:?}",
-                    path.file_name().unwrap_or_default()
+                    "{file_type:?}: {}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
                 ));
                 pb.inc(1);
             }
@@ -156,7 +164,7 @@ impl ScanCommand {
                 Resolution::Work(operation) => operation,
                 Resolution::Conforms => {
                     conforming += 1;
-                    debug!("Every target plays {path:?} as it is");
+                    debug!("Every target plays {} as it is", to_forward_slashes(path));
                     continue;
                 }
                 Resolution::NoPicture => {
@@ -192,7 +200,10 @@ impl ScanCommand {
         }
 
         for path in &no_picture {
-            warn!("⚠️ Not queued, because it has no picture - audio only, or only cover art: {path:?}");
+            warn!(
+                "⚠️ Not queued, because it has no picture - audio only, or only cover art: {}",
+                to_forward_slashes(path)
+            );
         }
         if !no_picture.is_empty() {
             warn!(
@@ -202,7 +213,10 @@ impl ScanCommand {
         }
 
         for (path, reason) in &unreadable {
-            warn!("⚠️ Not queued, because FFprobe could not read it: {path:?}: {reason}");
+            warn!(
+                "⚠️ Not queued, because FFprobe could not read it: {}: {reason}",
+                to_forward_slashes(path)
+            );
         }
         if !unreadable.is_empty() {
             warn!(
@@ -735,11 +749,11 @@ mod tests {
         );
 
         assert!(
-            logs.contains(r#"Queueing re-encode job for: "film.avi""#),
+            logs.contains("Queueing re-encode job for: film.avi"),
             "film.avi is a re-encode against the Chromecast: {logs}"
         );
         assert!(
-            logs.contains(r#"Queueing remux job for: "surround.mkv""#),
+            logs.contains("Queueing remux job for: surround.mkv"),
             "surround.mkv is a remux against the Chromecast: {logs}"
         );
     }

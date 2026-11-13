@@ -266,8 +266,9 @@ impl FFmpegProcessor {
         tokio::fs::remove_dir_all(&chunk_dir).await?;
 
         info!(
-            "✅ Conversion successful: {:?} -> {:?}",
-            input_path, output_path
+            "✅ Conversion successful: {} -> {}",
+            to_forward_slashes(input_path),
+            to_forward_slashes(output_path)
         );
         Ok(())
     }
@@ -346,7 +347,10 @@ impl FFmpegProcessor {
             .collect();
 
         if encoded.is_empty() {
-            return Err(anyhow!("FFmpeg produced no output for {input_path:?}"));
+            return Err(anyhow!(
+                "FFmpeg produced no output for {}",
+                to_forward_slashes(input_path)
+            ));
         }
 
         Ok(encoded)
@@ -369,7 +373,10 @@ impl FFmpegProcessor {
         if chunk_dir.exists() {
             let existing = tokio::fs::read_to_string(&stamp_path).await.ok();
             if existing.as_deref() != Some(stamp.as_str()) {
-                info!("🗑️ Discarding chunks encoded with different settings: {chunk_dir:?}");
+                info!(
+                    "🗑️ Discarding chunks encoded with different settings: {}",
+                    to_forward_slashes(chunk_dir)
+                );
                 tokio::fs::remove_dir_all(chunk_dir).await?;
             }
         }
@@ -490,8 +497,14 @@ mod tests {
             start: 0.0,
             duration: None,
         };
-        let entry = concat_list_entry(&last, Path::new(r"C:\work\abc.chunks"), None);
-        assert_eq!(entry, "file 'C:/work/abc.chunks/00000.ts'\n");
+        let native = concat_list_entry(&last, &Path::new("work").join("abc.chunks"), None);
+        assert_eq!(native, "file 'work/abc.chunks/00000.ts'\n");
+
+        #[cfg(windows)]
+        {
+            let entry = concat_list_entry(&last, Path::new(r"C:\work\abc.chunks"), None);
+            assert_eq!(entry, "file 'C:/work/abc.chunks/00000.ts'\n");
+        }
 
         let quoted = concat_list_entry(&last, Path::new("/work/it's here"), None);
         assert_eq!(quoted, "file '/work/it'\\''s here/00000.ts'\n");

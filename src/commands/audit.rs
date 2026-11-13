@@ -230,14 +230,15 @@ impl AuditCommand {
 
         if !self.scan_path.is_dir() {
             return Err(anyhow!(
-                "Media directory does not exist: {:?}",
-                self.scan_path
+                "Media directory does not exist: {}",
+                to_forward_slashes(&self.scan_path)
             ));
         }
 
         info!(
-            "🔍 Auditing {:?} against {}",
-            self.scan_path, self.target.name
+            "🔍 Auditing {} against {}",
+            to_forward_slashes(&self.scan_path),
+            self.target.name
         );
 
         let files = self.media_files()?;
@@ -511,7 +512,7 @@ fn audit_file(
                 path: path_in_report,
                 outcome: Outcome::Unreadable {
                     stat: None,
-                    reason: format!("could not stat {}: {error}", path.display()),
+                    reason: format!("could not stat {}: {error}", to_forward_slashes(path)),
                 },
             }
         }

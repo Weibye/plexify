@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 use super::FFmpegProcessor;
+use crate::paths::to_forward_slashes;
 use crate::subtitles::{self, Sidecar, SidecarFormat};
 
 /// Subtitle codecs that carry a picture rather than text.
@@ -162,15 +163,21 @@ fn dropped_stream_warning(stream: &SubtitleStream, input_path: &Path) -> String 
 
     if stream.forced {
         format!(
-            "⚠️ FORCED SUBTITLES LOST: leaving a forced {}{} subtitle stream out of {:?}: {} \
+            "⚠️ FORCED SUBTITLES LOST: leaving a forced {}{} subtitle stream out of {}: {} \
              A forced track carries the translated signs and foreign-language dialogue a scene \
              cannot be followed without, so those scenes will now play untranslated.",
-            stream.codec, language, input_path, cannot_be_converted
+            stream.codec,
+            language,
+            to_forward_slashes(input_path),
+            cannot_be_converted
         )
     } else {
         format!(
-            "⚠️ Leaving a {}{} subtitle stream out of {:?}: {}",
-            stream.codec, language, input_path, cannot_be_converted
+            "⚠️ Leaving a {}{} subtitle stream out of {}: {}",
+            stream.codec,
+            language,
+            to_forward_slashes(input_path),
+            cannot_be_converted
         )
     }
 }
@@ -201,7 +208,8 @@ impl FFmpegProcessor {
 
         for stream in &plan.unconvertible {
             warn!(
-                "{input_path:?} carries a {} subtitle track{}; it is pictures of text and cannot become a sidecar, so it is left behind rather than guessed at.",
+                "{} carries a {} subtitle track{}; it is pictures of text and cannot become a sidecar, so it is left behind rather than guessed at.",
+                to_forward_slashes(input_path),
                 stream.codec,
                 stream
                     .language
@@ -236,8 +244,8 @@ impl FFmpegProcessor {
             // that deletes: keep the file and let a person look at it.
             Err(e) => {
                 warn!(
-                    "Could not read {:?} to see whether it is styled, so it is kept: {e}",
-                    sidecar.path
+                    "Could not read {} to see whether it is styled, so it is kept: {e}",
+                    to_forward_slashes(&sidecar.path)
                 );
                 return;
             }
@@ -245,11 +253,14 @@ impl FFmpegProcessor {
 
         if styled {
             info!(
-                "Kept {:?} beside the SRT: its events are positioned or styled, which SRT cannot hold.",
-                sidecar.path
+                "Kept {} beside the SRT: its events are positioned or styled, which SRT cannot hold.",
+                to_forward_slashes(&sidecar.path)
             );
         } else if let Err(e) = tokio::fs::remove_file(&sidecar.path).await {
-            warn!("Could not remove the unstyled {:?}: {e}", sidecar.path);
+            warn!(
+                "Could not remove the unstyled {}: {e}",
+                to_forward_slashes(&sidecar.path)
+            );
         }
     }
 
@@ -291,13 +302,15 @@ impl FFmpegProcessor {
             .await
             .map_err(|e| {
                 anyhow!(
-                    "Failed to start FFprobe to read the subtitle streams of {input_path:?}: {e}"
+                    "Failed to start FFprobe to read the subtitle streams of {}: {e}",
+                    to_forward_slashes(input_path)
                 )
             })?;
 
         if !output.status.success() {
             return Err(anyhow!(
-                "FFprobe could not read the subtitle streams of {input_path:?}: {}",
+                "FFprobe could not read the subtitle streams of {}: {}",
+                to_forward_slashes(input_path),
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }

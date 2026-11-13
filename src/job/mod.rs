@@ -1564,11 +1564,14 @@ mod tests {
             .join("Elementary - S06E08 - Sand Trap.mkv");
         assert_eq!(sort_key_for(joined), Some(expected.clone()));
 
-        // Spelled out as well, so the normalisation is asserted on every
-        // platform rather than only on the one that produces backslashes.
-        let backslashes =
-            PathBuf::from(r"Series\Elementary\Season 06\Elementary - S06E08 - Sand Trap.mkv");
-        assert_eq!(sort_key_for(backslashes), Some(expected));
+        // Spelled out as well, where `\` is a separator. On Unix it is part of
+        // a file name, so this path is one component there.
+        #[cfg(windows)]
+        {
+            let backslashes =
+                PathBuf::from(r"Series\Elementary\Season 06\Elementary - S06E08 - Sand Trap.mkv");
+            assert_eq!(sort_key_for(backslashes), Some(expected));
+        }
     }
 
     #[test]

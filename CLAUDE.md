@@ -57,7 +57,7 @@ Break one of these only through a new decision.
 - **Only `fix.rs` and `undo.rs` give a library file another media name** (D23, D31).
 - **Logs go to stderr, and stdout carries only what a command means to print**
   (D24).
-- **Paths are compared library-relative with `/` separators** (`paths::to_forward_slashes`).
+- **Paths are compared library-relative, and printed, with `/` separators** (`paths::to_forward_slashes`).
 - **Directory walks prune with `IgnoreFilter::should_skip_dir`**, not file by file.
 - **A test that reads or sets an `FFMPEG_*` variable is `#[serial(env)]`** (D25). Other
   tests on process-wide state are `#[serial]`.

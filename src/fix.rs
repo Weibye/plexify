@@ -17,6 +17,7 @@ use tracing::{debug, warn};
 
 use crate::commands::validate::ValidationReport;
 use crate::ignore::is_media_extension;
+use crate::paths::to_forward_slashes;
 
 /// A rename that is going to be attempted, in library-relative form.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -254,12 +255,16 @@ pub(crate) fn carry_out(
         // size cannot be read stays where it is, while one already moved
         // without it could never be checked by an undo.
         let moved = fs::metadata(&source)
-            .with_context(|| format!("could not read the size of {source:?}"))
+            .with_context(|| format!("could not read the size of {}", to_forward_slashes(&source)))
             .and_then(|file| rename(&source, &destination).map(|()| file.len()));
 
         match moved {
             Ok(size) => {
-                debug!("Renamed {:?} -> {:?}", source, destination);
+                debug!(
+                    "Renamed {} -> {}",
+                    to_forward_slashes(&source),
+                    to_forward_slashes(&destination)
+                );
                 if let Some(parent) = source.parent() {
                     if destination.parent() != Some(parent) {
                         source_directories.push(parent.to_path_buf());
@@ -271,7 +276,11 @@ pub(crate) fn carry_out(
                 });
             }
             Err(error) => {
-                warn!("Failed to rename {:?}: {}", source, error);
+                warn!(
+                    "Failed to rename {}: {}",
+                    to_forward_slashes(&source),
+                    error
+                );
                 failed.push(FailedMove {
                     attempted: planned.clone(),
                     error: format!("{error:#}"),
@@ -315,22 +324,35 @@ pub(crate) fn rename(source: &Path, destination: &Path) -> Result<()> {
     // two destinations that differ only in case are one file. `fs::rename`
     // would replace it without a word.
     if destination.exists() && !is_same_file(source, destination) {
-        anyhow::bail!("{destination:?} already exists; it will not be overwritten");
+        anyhow::bail!(
+            "{} already exists; it will not be overwritten",
+            to_forward_slashes(destination)
+        );
     }
 
     if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("could not create directory {parent:?}"))?;
+        fs::create_dir_all(parent).with_context(|| {
+            format!("could not create directory {}", to_forward_slashes(parent))
+        })?;
     }
 
-    fs::rename(source, destination)
-        .with_context(|| format!("could not move {source:?} to {destination:?}"))
+    fs::rename(source, destination).with_context(|| {
+        format!(
+            "could not move {} to {}",
+            to_forward_slashes(source),
+            to_forward_slashes(destination)
+        )
+    })
 }
 
 pub(crate) fn write_plan(plan: &impl Serialize, plan_file: &Path) -> Result<()> {
     let contents = serde_json::to_string_pretty(plan)?;
-    write_new(plan_file, &contents)
-        .with_context(|| format!("could not write the plan to {plan_file:?}"))
+    write_new(plan_file, &contents).with_context(|| {
+        format!(
+            "could not write the plan to {}",
+            to_forward_slashes(plan_file)
+        )
+    })
 }
 
 /// Write a file that must not already exist.
@@ -347,8 +369,12 @@ fn write_new(path: &Path, contents: &str) -> std::io::Result<()> {
 
 fn write_outcome(outcome: &FixOutcome, plan_file: &Path) -> Result<()> {
     let contents = serde_json::to_string_pretty(outcome)?;
-    fs::write(plan_file, contents)
-        .with_context(|| format!("could not write the outcome to {plan_file:?}"))
+    fs::write(plan_file, contents).with_context(|| {
+        format!(
+            "could not write the outcome to {}",
+            to_forward_slashes(plan_file)
+        )
+    })
 }
 
 /// The files that belong to a media file, and where they go when it moves.
