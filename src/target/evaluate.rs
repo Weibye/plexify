@@ -1220,24 +1220,34 @@ mod tests {
         );
     }
 
-    /// Above the highest value seen playing, nothing was measured, so a
-    /// refusal there is an assumption whatever the cap's own `source` says.
+    /// Up to `observed_up_to` a level was seen playing, so a pass there is
+    /// measured; above it nothing was, so a pass or a refusal is an assumption.
     #[test]
-    fn a_refusal_above_what_was_observed_is_an_assumption() {
+    fn a_level_is_measured_only_up_to_what_was_observed() {
+        let limit = Limit {
+            value: 41,
+            source: Provenance::Assumed,
+            observed_up_to: Some(31),
+            note: None,
+        };
+        limit
+            .check("video.max_level.h264")
+            .expect("a limit the loader accepts");
         let mut target = lg();
-        target.video.max_level.insert(
-            "h264".to_string(),
-            Limit {
-                value: 41,
-                source: Provenance::Observed,
-                observed_up_to: Some(31),
-                note: None,
-            },
-        );
+        target.video.max_level.insert("h264".to_string(), limit);
+        let at = |level| evaluate(&with_video(|video| video.level = Some(level)), &target);
+        let level_is_unverified = |verdict: &Conformance| {
+            verdict
+                .unverified()
+                .iter()
+                .any(|finding| finding.field == Field::VideoLevel)
+        };
 
-        let verdict = evaluate(&with_video(|video| video.level = Some(50)), &target);
+        assert!(!level_is_unverified(&at(31)), "3.1 was seen playing");
+        assert!(level_is_unverified(&at(41)), "4.1 passes, unmeasured");
 
-        let level = verdict
+        let refused = at(50);
+        let level = refused
             .reasons()
             .iter()
             .find(|reason| reason.field == Field::VideoLevel)
