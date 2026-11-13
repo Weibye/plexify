@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::commands::validate::{IssueKind, ValidationReport};
+use crate::ignore::is_media_extension;
 
 /// A rename that is going to be attempted, in library-relative form.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -379,7 +380,10 @@ fn sidecars_of(media_root: &Path, from: &str, to: &str) -> Vec<PlannedMove> {
             }
 
             let suffix = name.strip_prefix(source_stem)?.strip_prefix('.')?;
-            if suffix.is_empty() || is_media_extension(suffix) {
+            // `en.srt` is a sidecar and `1080p.mkv` another version, so only the
+            // last extension decides.
+            let extension = suffix.rsplit('.').next().unwrap_or(suffix);
+            if suffix.is_empty() || is_media_extension(extension) {
                 return None;
             }
 
@@ -394,14 +398,6 @@ fn sidecars_of(media_root: &Path, from: &str, to: &str) -> Vec<PlannedMove> {
 
     sidecars.sort_by(|left, right| left.from.cmp(&right.from));
     sidecars
-}
-
-/// Whether a suffix ends in an extension that makes the file a media file.
-fn is_media_extension(suffix: &str) -> bool {
-    let extension = suffix.rsplit('.').next().unwrap_or(suffix);
-    crate::commands::validate::MEDIA_EXTENSIONS
-        .iter()
-        .any(|known| extension.eq_ignore_ascii_case(known))
 }
 
 fn parent_of(relative: &str) -> &str {

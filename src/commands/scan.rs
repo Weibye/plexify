@@ -3,7 +3,6 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
-use walkdir::WalkDir;
 
 use crate::ignore::IgnoreFilter;
 use crate::job::{MediaFileType, Operation};
@@ -79,9 +78,6 @@ impl ScanCommand {
         queue.init().await?;
 
         let mut media_files: Vec<(PathBuf, MediaFileType)> = Vec::new();
-        let mut directories_scanned = std::collections::HashSet::new();
-        let mut ignored_count = 0;
-        let mut files_processed = 0;
 
         // Create a progress bar for scanning
         let scan_pb = ProgressBar::new_spinner();
@@ -93,60 +89,14 @@ impl ScanCommand {
         scan_pb.set_message("Scanning directories...");
         scan_pb.enable_steady_tick(std::time::Duration::from_millis(120));
 
-        // Walk through the directory to find media files
-        for entry in WalkDir::new(&scan_root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|e| {
-                let path = e.path();
+        let mut walk = ignore_filter.media_files(&scan_root);
+        while let Some(path) = walk.next() {
+            scan_pb.set_message(format!("Processed {} files...", walk.files));
 
-                // Always allow the root directory
-                if path == scan_root {
-                    return true;
-                }
-
-                // Check if we should skip this directory and all its contents
-                if path.is_dir() && ignore_filter.should_skip_dir(path) {
-                    debug!("🚫 Skipping entire directory: {:?}", path);
-                    return false; // This will cause WalkDir to skip the directory
-                }
-
-                true // Allow files and non-ignored directories
-            })
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-
-            // Check if this individual path should be ignored
-            if ignore_filter.should_ignore(path) {
-                debug!("🚫 Ignoring path: {:?}", path);
-                ignored_count += 1;
-                // Skip this entry completely
-                continue;
-            }
-
-            // Track directories being scanned for better user feedback
-            if path.is_dir() && path != scan_root {
-                if let Ok(relative_dir) = path.strip_prefix(&scan_root) {
-                    if !directories_scanned.contains(relative_dir) {
-                        directories_scanned.insert(relative_dir.to_path_buf());
-                        scan_pb.set_message(format!("Scanning: {:?}", relative_dir));
-                    }
-                }
-            }
-
-            if path.is_file() {
-                files_processed += 1;
-
-                // Update progress bar message periodically
-                if files_processed % 100 == 0 {
-                    scan_pb.set_message(format!("Processed {} files...", files_processed));
-                }
-
-                if let Ok(file_type) = JobProcessor::determine_file_type(path) {
-                    if let Ok(relative_path) = path.strip_prefix(&scan_root) {
-                        media_files.push((relative_path.to_path_buf(), file_type));
-                    }
+            // The library holds more kinds of media than a scan converts.
+            if let Ok(file_type) = JobProcessor::determine_file_type(&path) {
+                if let Ok(relative_path) = path.strip_prefix(&scan_root) {
+                    media_files.push((relative_path.to_path_buf(), file_type));
                 }
             }
         }
@@ -155,22 +105,15 @@ impl ScanCommand {
 
         info!(
             "📊 Scanned {} directories, processed {} files, and found {} media files",
-            directories_scanned.len(),
-            files_processed,
+            walk.directories,
+            walk.files,
             media_files.len()
         );
 
-        if ignored_count > 0 {
+        if walk.ignored > 0 {
             info!(
                 "📋 Ignored {} paths due to .plexifyignore patterns",
-                ignored_count
-            );
-        }
-
-        if !directories_scanned.is_empty() {
-            debug!(
-                "📋 Scanned subdirectories: {:?}",
-                directories_scanned.iter().collect::<Vec<_>>()
+                walk.ignored
             );
         }
 
