@@ -104,7 +104,51 @@ jobs:
           
     - name: Run clippy
       run: cargo clippy --all-targets --all-features
-      
+
+  # Every other job builds on the newest stable, so nothing else would notice a
+  # dependency or a language feature that needs more than the `rust-version`
+  # Cargo.toml promises. The version is read from there so it is stated once.
+  oldest_rust:
+    name: Oldest supported Rust
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v7
+
+    - name: Read rust-version
+      id: rust_version
+      run: |
+        version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+        if [ -z "$version" ]; then
+          echo "::error::Cargo.toml has no rust-version"
+          exit 1
+        fi
+        echo "version=$version" >> "$GITHUB_OUTPUT"
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ steps.rust_version.outputs.version }}
+
+    - name: Cache cargo dependencies
+      uses: actions/cache@v6
+      with:
+        path: |
+          ~/.cargo/bin/
+          ~/.cargo/registry/index/
+          ~/.cargo/registry/cache/
+          ~/.cargo/git/db/
+          target/
+        key: ubuntu-latest-cargo-${{ steps.rust_version.outputs.version }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ubuntu-latest-cargo-${{ steps.rust_version.outputs.version }}-
+
+    # The claim is that the binary builds. The tests are left out because their
+    # dev-dependencies need a newer Rust, as README says.
+    - name: Check
+      run: cargo check --locked
+
   security_audit:
     name: Security Audit
     runs-on: ubuntu-latest
