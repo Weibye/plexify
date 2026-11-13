@@ -38,6 +38,10 @@ const ENGLISH_TAGS: [&str; 4] = ["en", "eng", "english", "en-us"];
 /// that happens again.
 const STYLED_CODECS: [&str; 2] = ["ass", "ssa"];
 
+/// What every text track is converted to: the FFmpeg codec, and the extension
+/// of the file it is written to.
+const CONVERTED_CODEC: &str = "srt";
+
 /// What a sidecar file holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidecarFormat {
@@ -53,18 +57,16 @@ pub enum SidecarFormat {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sidecar {
     /// Position among the source's subtitle streams: FFmpeg's `0:s:{n}`.
-    pub stream_index: usize,
+    stream_index: usize,
     pub path: PathBuf,
     pub format: SidecarFormat,
-    pub language: Option<String>,
-    pub forced: bool,
 }
 
 impl Sidecar {
     /// The FFmpeg arguments that write this one file from `input`.
     pub fn ffmpeg_args(&self, input: &Path) -> Vec<String> {
         let codec = match self.format {
-            SidecarFormat::Srt => "srt",
+            SidecarFormat::Srt => CONVERTED_CODEC,
             SidecarFormat::Original => "copy",
         };
 
@@ -94,19 +96,6 @@ pub struct SubtitlePlan {
     /// turning them into text is OCR, which is a guess, and this project does
     /// not guess at a library nobody can reconstruct.
     pub unconvertible: Vec<SubtitleStream>,
-}
-
-impl SubtitlePlan {
-    pub fn is_empty(&self) -> bool {
-        self.sidecars.is_empty() && self.unconvertible.is_empty()
-    }
-
-    /// The sidecars that are conversions, rather than preserved originals.
-    pub fn converted(&self) -> impl Iterator<Item = &Sidecar> {
-        self.sidecars
-            .iter()
-            .filter(|sidecar| sidecar.format == SidecarFormat::Srt)
-    }
 }
 
 /// Work out what to write beside `output` for a source carrying `streams`.
@@ -154,18 +143,17 @@ pub fn plan(streams: &[SubtitleStream], output: &Path) -> SubtitlePlan {
                 stream_index,
                 path,
                 format,
-                language: language.clone(),
-                forced: stream.forced,
             });
         };
 
-        push(SidecarFormat::Srt, "srt");
+        push(SidecarFormat::Srt, CONVERTED_CODEC);
 
         // Proposed, not promised: whether the track actually uses what SRT
         // cannot hold is a property of its events, which only reading them can
-        // settle. The extractor drops this file again where it does not.
+        // settle. The extractor drops this file again where it does not. Every
+        // codec in `STYLED_CODECS` is its own extension.
         if STYLED_CODECS.contains(&stream.codec.as_str()) {
-            push(SidecarFormat::Original, subtitle_extension(&stream.codec));
+            push(SidecarFormat::Original, &stream.codec);
         }
     }
 
@@ -190,9 +178,16 @@ pub fn carries_styling(subtitle: &str) -> bool {
         .any(|line| line.contains("{\\"))
 }
 
+/// Whether `extension` is one a sidecar is written with. Every sidecar is named
+/// for its codec, so these are the codecs [`plan`] writes.
+pub fn is_sidecar_extension(extension: &str) -> bool {
+    let extension = extension.to_ascii_lowercase();
+    extension == CONVERTED_CODEC || STYLED_CODECS.contains(&extension.as_str())
+}
+
 /// Whether a language tag names English, in any of the spellings this library
 /// uses for it.
-pub fn is_english(language: Option<&str>) -> bool {
+fn is_english(language: Option<&str>) -> bool {
     language
         .map(|tag| ENGLISH_TAGS.contains(&normalise_language(tag).as_str()))
         .unwrap_or(false)
@@ -203,15 +198,6 @@ pub fn is_english(language: Option<&str>) -> bool {
 /// this code inventing a value it was not given.
 fn normalise_language(tag: &str) -> String {
     tag.trim().to_ascii_lowercase()
-}
-
-/// Only ever called for a codec in [`STYLED_CODECS`], which is the only set an
-/// original is proposed for.
-fn subtitle_extension(codec: &str) -> &'static str {
-    match codec {
-        "ssa" => "ssa",
-        _ => "ass",
-    }
 }
 
 /// `Show - S01E01.en.srt`, and `.en.2.srt` for a second English track.
@@ -259,6 +245,14 @@ mod tests {
         PathBuf::from("/media/Series/Show/Season 01/Show - S01E01 - Pilot [1080p].mp4")
     }
 
+    /// The sidecars that are conversions, rather than preserved originals.
+    fn converted(plan: &SubtitlePlan) -> usize {
+        plan.sidecars
+            .iter()
+            .filter(|sidecar| sidecar.format == SidecarFormat::Srt)
+            .count()
+    }
+
     fn names(plan: &SubtitlePlan) -> Vec<String> {
         plan.sidecars
             .iter()
@@ -294,9 +288,9 @@ mod tests {
             &output(),
         );
 
-        assert_eq!(plan.converted().count(), 3);
+        assert_eq!(converted(&plan), 3, "one SRT per text track");
         // English first, so it takes the plain name and leads the report.
-        assert!(names(&plan)[0].ends_with(".eng.srt"));
+        assert!(names(&plan)[0].ends_with(".eng.srt"), "{:?}", names(&plan));
     }
 
     #[test]
@@ -352,8 +346,12 @@ mod tests {
             &output(),
         );
 
-        assert_eq!(plan.converted().count(), 1);
-        assert_eq!(plan.unconvertible.len(), 2);
+        assert_eq!(converted(&plan), 1, "only the subrip track converts");
+        assert_eq!(
+            plan.unconvertible.len(),
+            2,
+            "both bitmap tracks are reported"
+        );
     }
 
     /// An ASS track is proposed twice: the SRT that Direct Plays, and the
@@ -369,10 +367,9 @@ mod tests {
     }
 
     /// FFmpeg has no muxer that writes a bare `mov_text` track to a file, so
-    /// proposing one failed the job *after* the media file was written - and
-    /// with no work folder, after it was already at its destination. The 136
-    /// `mov_text` MP4s this project produced itself are exactly what a later
-    /// pass over the library hits.
+    /// proposing one would fail the job after the media file was written. Every
+    /// MP4 this project produced carries `mov_text`, so a later pass over the
+    /// library meets it.
     #[test]
     fn a_mov_text_track_proposes_only_a_file_that_can_be_written() {
         let plan = plan(&[stream("mov_text", Some("eng"), false)], &output());
@@ -468,7 +465,7 @@ mod tests {
             &output(),
         );
 
-        assert_eq!(plan.sidecars[0].language.as_deref(), Some("eng"));
-        assert_eq!(plan.sidecars[0].stream_index, 1);
+        assert!(names(&plan)[0].ends_with(".eng.srt"), "{:?}", names(&plan));
+        assert_eq!(plan.sidecars[0].stream_index, 1, "the eng track is 0:s:1");
     }
 }

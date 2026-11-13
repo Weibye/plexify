@@ -393,7 +393,7 @@ mod tests {
                 // Above the source length, so this one is encoded in one pass.
                 min_source_seconds: 60.0,
             })
-            .process_job(&job, None, Some(&one_pass_dir))
+            .process_job(&job, None, &one_pass_dir)
             .await
             .unwrap();
 
@@ -401,7 +401,7 @@ mod tests {
         std::fs::create_dir_all(&chunked_dir).unwrap();
         FFmpegProcessor::new(false)
             .with_chunking(TEST_CHUNKING)
-            .process_job(&job, None, Some(&chunked_dir))
+            .process_job(&job, None, &chunked_dir)
             .await
             .unwrap();
 
@@ -512,7 +512,7 @@ mod tests {
 
             FFmpegProcessor::new(false)
                 .with_chunking(chunking)
-                .process_job(&job, None, Some(&work_folder))
+                .process_job(&job, None, &work_folder)
                 .await
                 .unwrap();
 
@@ -701,7 +701,7 @@ mod tests {
 
             FFmpegProcessor::new(false)
                 .with_chunking(chunking)
-                .process_job(&job, None, Some(&work_folder))
+                .process_job(&job, None, &work_folder)
                 .await
                 .unwrap_or_else(|error| panic!("the {name} encode failed: {error:#}"));
 
@@ -792,7 +792,7 @@ mod tests {
 
             FFmpegProcessor::new(false)
                 .with_chunking(chunking)
-                .process_job(&job, None, Some(&work_folder))
+                .process_job(&job, None, &work_folder)
                 .await
                 .unwrap_or_else(|error| panic!("the {name} encode failed: {error:#}"));
 
@@ -915,7 +915,7 @@ mod tests {
                 chunk_seconds: 2.0,
                 min_source_seconds: 60.0,
             })
-            .process_job(&job, None, Some(&work_folder))
+            .process_job(&job, None, &work_folder)
             .await
             .expect("a forced bitmap track is still only a dropped track");
 
@@ -1144,8 +1144,23 @@ mod tests {
         names
     }
 
-    /// The whole point of #162: the tracks leave the container so nothing is
-    /// burned in, and they land beside it rather than being lost.
+    /// Convert `job` in a work folder under `temp`, then move it and its
+    /// sidecars beside the source the way `work` does.
+    fn deliver(job: &Job, temp: &Path) {
+        let work_folder = temp.join("work");
+        std::fs::create_dir_all(&work_folder).unwrap();
+        let processor = FFmpegProcessor::new(false);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime
+            .block_on(processor.process_job(job, None, &work_folder))
+            .expect("the remux should succeed");
+        runtime
+            .block_on(processor.move_to_destination(job, None, &work_folder))
+            .expect("the output should move beside its source");
+    }
+
+    /// The tracks leave the container so nothing is burned in, and they land
+    /// beside it rather than being lost.
     #[test]
     fn extracting_subtitles_empties_the_container_and_writes_them_beside_it() {
         if !ffmpeg_present() {
@@ -1169,10 +1184,7 @@ mod tests {
             temp_dir.path(),
         );
 
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(FFmpegProcessor::new(false).process_job(&job, None, None))
-            .expect("the remux should succeed");
+        deliver(&job, temp_dir.path());
 
         // Nothing left in the container to burn in.
         assert!(
@@ -1204,11 +1216,10 @@ mod tests {
         assert!(srt.contains("Hello there."), "{srt}");
     }
 
-    /// The population this whole issue is about: an MP4 this project produced
-    /// itself, carrying `mov_text`. Proposing an original for it asked FFmpeg
-    /// for a muxer that does not exist, and the job failed *after* the media
-    /// file had been written - at its destination, with no work folder to hold
-    /// it back, and an error naming no subtitle.
+    /// An MP4 this project produced itself carries `mov_text`. There is no
+    /// muxer to write that codec's original to, so only the SRT is proposed;
+    /// asking for the original would fail the job after the media file was
+    /// written, with an error naming no subtitle.
     #[test]
     fn a_mov_text_source_extracts_instead_of_failing_the_job() {
         if !ffmpeg_present() {
@@ -1291,7 +1302,7 @@ mod tests {
 
         tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(FFmpegProcessor::new(false).process_job(&job, None, Some(&work_folder)))
+            .block_on(FFmpegProcessor::new(false).process_job(&job, None, &work_folder))
             .expect("a mov_text source must not fail the job");
 
         let names = sidecar_names(&work_folder);
@@ -1374,10 +1385,7 @@ mod tests {
             temp_dir.path(),
         );
 
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(FFmpegProcessor::new(false).process_job(&job, None, None))
-            .expect("the remux should succeed");
+        deliver(&job, temp_dir.path());
 
         let names = sidecar_names(&source);
         assert!(names.contains(&"show.eng.srt".to_string()), "{names:?}");
@@ -1420,7 +1428,7 @@ mod tests {
             let result = tokio::runtime::Runtime::new().unwrap().block_on(
                 FFmpegProcessor::new(false)
                     .with_ffprobe("plexify-test-no-such-ffprobe")
-                    .process_job(&job, None, Some(&work_folder)),
+                    .process_job(&job, None, &work_folder),
             );
 
             let error = result.expect_err(&format!(

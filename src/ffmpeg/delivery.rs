@@ -2,12 +2,14 @@
 //! with its sidecars and its source disabled, or, for a parked job, discarded.
 
 use anyhow::{anyhow, Result};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use super::FFmpegProcessor;
+use super::{chunk_dir_for, FFmpegProcessor};
 use crate::job::Job;
+use crate::subtitles;
 
 /// Where a finished output is copied to before it is renamed onto its
 /// destination.
@@ -29,6 +31,27 @@ pub fn staging_path_for(final_output_path: &Path, worker_id: &Uuid) -> PathBuf {
     PathBuf::from(staging)
 }
 
+/// `film.mkv` becomes `film.mkv.disabled`: the whole name is kept, byte for
+/// byte, so a person can see what the file was and rename it back.
+fn disabled_path(path: &Path) -> PathBuf {
+    let mut disabled = path.as_os_str().to_os_string();
+    disabled.push(".disabled");
+    PathBuf::from(disabled)
+}
+
+/// Remove what a failed move left at `path`.
+///
+/// Nothing there is what a copy that never started leaves, so only another
+/// failure is worth a word.
+async fn remove_leftover(path: &Path) {
+    match tokio::fs::remove_file(path).await {
+        Err(e) if e.kind() != ErrorKind::NotFound => {
+            warn!("Could not remove {path:?} after a failed move: {e}")
+        }
+        _ => {}
+    }
+}
+
 impl FFmpegProcessor {
     /// Throw away everything a job left in the work folder.
     ///
@@ -48,7 +71,7 @@ impl FFmpegProcessor {
     /// has only the job filename to go on. Everything a job leaves in the work
     /// folder is named after its id, so that is enough.
     pub async fn discard_work_for_id(&self, job_id: &str, work_folder: &Path) {
-        let chunk_dir = work_folder.join(format!("{job_id}.chunks"));
+        let chunk_dir = chunk_dir_for(job_id, work_folder);
         if chunk_dir.exists() {
             match tokio::fs::remove_dir_all(&chunk_dir).await {
                 Ok(_) => info!("🗑️ Discarded the chunks of a parked job: {chunk_dir:?}"),
@@ -60,12 +83,23 @@ impl FFmpegProcessor {
         // join that was interrupted. Named `{id}_{filename}`, so the filename
         // this job would have used is not needed to find it.
         let prefix = format!("{job_id}_");
-        let Ok(mut entries) = tokio::fs::read_dir(work_folder).await else {
-            return;
+        let unreadable = |e: std::io::Error| {
+            warn!("Could not read {work_folder:?} to discard what job {job_id} left there: {e}")
         };
-        while let Ok(Some(entry)) = entries.next_entry().await {
+        let mut entries = match tokio::fs::read_dir(work_folder).await {
+            Ok(entries) => entries,
+            Err(e) => return unreadable(e),
+        };
+        loop {
+            let entry = match entries.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(e) => return unreadable(e),
+            };
             if entry.file_name().to_string_lossy().starts_with(&prefix) {
-                let _ = tokio::fs::remove_file(entry.path()).await;
+                if let Err(e) = tokio::fs::remove_file(entry.path()).await {
+                    warn!("Could not remove {:?}: {e}", entry.path());
+                }
             }
         }
     }
@@ -109,13 +143,13 @@ impl FFmpegProcessor {
         let staging_path = staging_path_for(&final_output_path, &self.worker_id);
 
         if let Err(e) = tokio::fs::copy(&work_output_path, &staging_path).await {
-            let _ = tokio::fs::remove_file(&staging_path).await;
+            remove_leftover(&staging_path).await;
             return Err(anyhow!("Failed to copy output to {staging_path:?}: {e}"));
         }
 
         // `fs::rename` replaces whatever is at the destination; this refuses it.
         if let Err(e) = crate::fix::rename(&staging_path, &final_output_path) {
-            let _ = tokio::fs::remove_file(&staging_path).await;
+            remove_leftover(&staging_path).await;
             return Err(anyhow!(
                 "Failed to move output into place at {final_output_path:?}: {e:#}"
             ));
@@ -155,18 +189,23 @@ impl FFmpegProcessor {
     /// file is already at its destination, and failing here would send the job
     /// round again to find its own finished output in place.
     async fn move_sidecars(&self, work_output: &Path, final_output: &Path) {
-        const SIDECAR_EXTENSIONS: [&str; 5] = ["srt", "ass", "ssa", "vtt", "ttxt"];
-
         let (Some(directory), Some(work_stem), Some(final_stem)) = (
             work_output.parent(),
             work_output.file_stem().map(|stem| stem.to_string_lossy()),
-            final_output.file_stem().map(|stem| stem.to_string_lossy()),
+            final_output.file_stem(),
         ) else {
             return;
         };
 
-        let Ok(entries) = std::fs::read_dir(directory) else {
-            return;
+        let entries = match std::fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(e) => {
+                warn!(
+                    "Could not read {directory:?} for the subtitles of {final_output:?}, so none \
+                     were moved beside it: {e}"
+                );
+                return;
+            }
         };
 
         for entry in entries.flatten() {
@@ -184,11 +223,13 @@ impl FFmpegProcessor {
             };
 
             let extension = suffix.rsplit('.').next().unwrap_or_default();
-            if !SIDECAR_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()) {
+            if !subtitles::is_sidecar_extension(extension) {
                 continue;
             }
 
-            let destination = final_output.with_file_name(format!("{final_stem}.{suffix}"));
+            let mut name = final_stem.to_os_string();
+            name.push(format!(".{suffix}"));
+            let destination = final_output.with_file_name(name);
             // `copy` would replace a subtitle somebody already put there.
             if destination.exists() {
                 warn!("Kept {path:?}: {destination:?} already exists; it will not be overwritten");
@@ -208,24 +249,19 @@ impl FFmpegProcessor {
     }
 
     pub async fn disable_source_files(&self, job: &Job, media_root: Option<&Path>) -> Result<()> {
-        let input_path = job.full_input_path(media_root);
-        let disabled_input = input_path.with_extension(format!(
-            "{}.disabled",
-            input_path
-                .extension()
-                .unwrap_or_default()
-                .to_str()
-                .unwrap_or("")
-        ));
-
-        let mut moves = vec![(input_path, disabled_input)];
+        let mut sources = vec![job.full_input_path(media_root)];
         // A WebM's subtitle lives beside it as a `.vtt`.
-        if let Some(vtt_path) = job.full_subtitle_path(media_root) {
-            if vtt_path.exists() {
-                let disabled_vtt = vtt_path.with_extension("vtt.disabled");
-                moves.push((vtt_path, disabled_vtt));
-            }
-        }
+        sources.extend(
+            job.full_subtitle_path(media_root)
+                .filter(|vtt| vtt.exists()),
+        );
+        let moves: Vec<(PathBuf, PathBuf)> = sources
+            .into_iter()
+            .map(|path| {
+                let disabled = disabled_path(&path);
+                (path, disabled)
+            })
+            .collect();
 
         // Every name is checked before anything moves: a source disabled without
         // its subtitle leaves Plex a subtitle beside nothing. `fix::rename` checks
@@ -320,7 +356,7 @@ mod tests {
 
         let processor = FFmpegProcessor::new(false);
 
-        // Move the file - since job now has absolute paths, pass None for media_root
+        // The job holds absolute paths, so there is no media root to join.
         processor
             .move_to_destination(&job, None, &work_folder)
             .await
@@ -522,6 +558,33 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&disabled_subtitle).unwrap(),
             "an older subtitle"
+        );
+    }
+
+    /// A name that is not UTF-8 is still a name somebody has to recognise and
+    /// rename back. A lossy conversion would disable `film.m\u{FFFD}v` or, by
+    /// dropping the extension, `film..disabled`.
+    #[test]
+    fn a_name_that_is_not_utf8_is_disabled_whole() {
+        #[cfg(unix)]
+        let name = {
+            use std::os::unix::ffi::OsStrExt;
+            std::ffi::OsStr::from_bytes(b"film.m\xffv").to_os_string()
+        };
+        #[cfg(windows)]
+        let name = {
+            use std::os::windows::ffi::OsStringExt;
+            // `film.m`, an unpaired surrogate, `v`.
+            std::ffi::OsString::from_wide(&[0x66, 0x69, 0x6C, 0x6D, 0x2E, 0x6D, 0xD800, 0x76])
+        };
+        assert!(name.to_str().is_none(), "the fixture must not be UTF-8");
+
+        let mut expected = name.clone();
+        expected.push(".disabled");
+        assert_eq!(
+            disabled_path(&Path::new("media").join(&name)),
+            Path::new("media").join(&expected),
+            "{name:?} should keep every byte of its name"
         );
     }
 
