@@ -31,7 +31,7 @@ Canonical content that must report clean:
 - `Movies/The Dark Knight (2008)/The Dark Knight (2008).mkv`
 - `Movies/Marvel Cinematic Universe Collection/Iron Man (2008).mkv`
 
-Malformed content, one directory per defect, drawn from the cases in issue #51:
+Malformed content, one directory per defect:
 
 | Directory | Defect |
 |---|---|
@@ -68,6 +68,7 @@ Do not run `work` against the fixture expecting success: the files are empty, so
 fails on every job. To exercise the transcoding path, generate a real (tiny) source first:
 
 ```bash
+mkdir -p /tmp/plexify-fixture/Movies/Test
 ffmpeg -f lavfi -i testsrc=duration=2:size=320x240:rate=10 \
        -f lavfi -i sine=duration=2 \
        -c:v libx264 -c:a aac -y /tmp/plexify-fixture/Movies/Test/Test.mkv
