@@ -497,8 +497,14 @@ mod tests {
             start: 0.0,
             duration: None,
         };
-        let entry = concat_list_entry(&last, Path::new(r"C:\work\abc.chunks"), None);
-        assert_eq!(entry, "file 'C:/work/abc.chunks/00000.ts'\n");
+        let native = concat_list_entry(&last, &Path::new("work").join("abc.chunks"), None);
+        assert_eq!(native, "file 'work/abc.chunks/00000.ts'\n");
+
+        #[cfg(windows)]
+        {
+            let entry = concat_list_entry(&last, Path::new(r"C:\work\abc.chunks"), None);
+            assert_eq!(entry, "file 'C:/work/abc.chunks/00000.ts'\n");
+        }
 
         let quoted = concat_list_entry(&last, Path::new("/work/it's here"), None);
         assert_eq!(quoted, "file '/work/it'\\''s here/00000.ts'\n");
