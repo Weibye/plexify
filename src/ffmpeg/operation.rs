@@ -1,10 +1,14 @@
 //! The codec options and stream mappings a job's operation asks for.
 
+use super::subtitle_streams::SubtitleSource;
 use super::FFmpegCommandBuilder;
 use crate::job::{AudioAction, Job, Operation};
 
 /// Every stream an output takes: the picture from input 0, every audio track
 /// from `source`, the one an added track is derived from, and `subtitles`.
+/// Every one of them, not the first of each: a second audio track is usually a
+/// commentary or another language, and dropping it while the source is
+/// disabled loses it for good.
 ///
 /// Input 0 is the source for a one-pass encode and the list of chunks for the
 /// join that follows a chunked one, and in both it is where the picture comes
@@ -30,6 +34,38 @@ pub(super) fn mappings(source: usize, adds_a_track: bool, subtitles: &[String]) 
     }
     mappings.extend_from_slice(subtitles);
     mappings
+}
+
+/// Map every stream an output takes, and encode the subtitles it carries.
+///
+/// An external WebVTT is declared as the input after `source`, so `source` has
+/// to be the last input declared before this call.
+pub(super) fn with_streams(
+    builder: FFmpegCommandBuilder,
+    source: usize,
+    adds_a_track: bool,
+    subtitles: Option<&SubtitleSource>,
+) -> FFmpegCommandBuilder {
+    let (builder, subtitle_mappings) = match subtitles {
+        // A track the target burns into the picture is left out of the codecs
+        // and the mappings both. Half of that is not enough: a mapped subtitle
+        // stream with no subtitle codec fails the mux.
+        None => (builder, Vec::new()),
+        // The subtitle is the whole reason this input is here, so it is not
+        // optional.
+        Some(SubtitleSource::External(vtt_path)) => (
+            builder
+                .with_subtitle_encoding()
+                .with_input(vtt_path.as_path()),
+            vec![format!("{}:s", source + 1)],
+        ),
+        // Named one by one because the source may carry a track MP4 cannot
+        // hold, and `{source}:s?` would take that one too.
+        Some(SubtitleSource::Embedded(selection)) => {
+            (builder.with_subtitle_encoding(), selection.mappings(source))
+        }
+    };
+    builder.with_stream_mapping(&mappings(source, adds_a_track, &subtitle_mappings))
 }
 
 /// The codec options a job's operation asks for.
@@ -120,7 +156,7 @@ mod tests {
     use std::process::Stdio;
     use tempfile::TempDir;
 
-    /// The operation an `.avi` is queued with today.
+    /// The operation an `.avi` is queued with.
     fn avi_remux() -> Operation {
         Operation::Remux {
             audio: AudioAction::Copy,
@@ -193,10 +229,10 @@ mod tests {
     /// `-ac` sets a channel count rather than limiting one, so a cap applied
     /// to a source already inside it invents channels nothing recorded.
     ///
-    /// Measured on the shape this used to build: a stereo Opus source folded
-    /// to a cap of six came out `opus,2` plus `aac,6`. Every Opus file in this
-    /// library is stereo or mono, and the LG's cap is six, so that was the
-    /// whole population.
+    /// Measured: a stereo Opus source folded to a cap of six by a bare `-ac`
+    /// came out `opus,2` plus `aac,6`. Every Opus file in this library is
+    /// stereo or mono, and the LG's cap is six, so that is the whole
+    /// population.
     #[test]
     fn a_cap_the_source_is_already_inside_changes_nothing() {
         let transcode = job_for(
@@ -413,10 +449,10 @@ mod tests {
 
         tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(FFmpegProcessor::new(false).process_job(&job, None, None))
+            .block_on(FFmpegProcessor::new(false).process_job(&job, None, temp_dir.path()))
             .expect("remux should succeed");
 
-        let output = &job.output_path;
+        let output = &job.work_folder_output_path(temp_dir.path());
         assert_eq!(output.extension().unwrap(), "mp4");
 
         // The bitstream came through as it was. Anything else here means the
@@ -438,7 +474,7 @@ mod tests {
         assert!(position(b"moov") < position(b"mdat"));
     }
 
-    /// The whole of #161, end to end: the original survives with its layout
+    /// Adding a track, end to end: the original survives with its layout
     /// and its default flag, and the added track is stereo AAC, not default,
     /// and carries the language it inherited rather than one we chose.
     #[test]
@@ -493,10 +529,10 @@ mod tests {
 
         tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(FFmpegProcessor::new(false).process_job(&job, None, None))
+            .block_on(FFmpegProcessor::new(false).process_job(&job, None, temp_dir.path()))
             .expect("adding a track should succeed");
 
-        let tracks = audio_tracks_of(&job.output_path);
+        let tracks = audio_tracks_of(&job.work_folder_output_path(temp_dir.path()));
         assert_eq!(
             tracks,
             vec![
@@ -511,7 +547,10 @@ mod tests {
 
         // The picture was never touched, which is the point of doing this as a
         // remux rather than a re-encode.
-        assert_eq!(codec_of(&job.output_path, "v"), "h264");
+        assert_eq!(
+            codec_of(&job.work_folder_output_path(temp_dir.path()), "v"),
+            "h264"
+        );
     }
 
     /// The reported case, through the real pipeline: every Opus file in this
@@ -569,10 +608,10 @@ mod tests {
 
         tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(FFmpegProcessor::new(false).process_job(&job, None, None))
+            .block_on(FFmpegProcessor::new(false).process_job(&job, None, temp_dir.path()))
             .expect("adding a track should succeed");
 
-        let tracks = audio_tracks_of(&job.output_path);
+        let tracks = audio_tracks_of(&job.work_folder_output_path(temp_dir.path()));
         assert_eq!(
             tracks.len(),
             2,
@@ -614,11 +653,11 @@ mod tests {
 
         tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(FFmpegProcessor::new(false).process_job(&job, None, None))
+            .block_on(FFmpegProcessor::new(false).process_job(&job, None, temp_dir.path()))
             .expect("adding a track should succeed");
 
         assert_eq!(
-            stream_codecs(&job.output_path),
+            stream_codecs(&job.work_folder_output_path(temp_dir.path())),
             vec!["vp9", "opus", "aac", "mov_text"]
         );
     }
@@ -674,10 +713,10 @@ mod tests {
 
         tokio::runtime::Runtime::new()
             .unwrap()
-            .block_on(FFmpegProcessor::new(false).process_job(&job, None, None))
+            .block_on(FFmpegProcessor::new(false).process_job(&job, None, temp_dir.path()))
             .expect("remux should succeed");
 
-        let output = &job.output_path;
+        let output = &job.work_folder_output_path(temp_dir.path());
         assert_eq!(codec_of(output, "s"), "", "the track has to be gone");
         assert_eq!(codec_of(output, "v"), "h264", "and the picture untouched");
         assert_eq!(codec_of(output, "a"), "aac");

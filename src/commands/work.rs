@@ -206,10 +206,7 @@ impl WorkCommand {
             job_pb.set_message(format!("Processing: {}", job_name));
             job_pb.enable_steady_tick(Duration::from_millis(120));
 
-            match processor
-                .process_job(job, media_root, Some(work_folder))
-                .await
-            {
+            match processor.process_job(job, media_root, work_folder).await {
                 Ok(_) => {
                     job_pb.set_message("Moving output file...");
 

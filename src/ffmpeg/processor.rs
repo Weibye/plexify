@@ -8,7 +8,7 @@ use tokio::process::Command;
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
-use super::operation::{mappings, with_operation};
+use super::operation::{with_operation, with_streams};
 use super::subtitle_streams::SubtitleSource;
 use super::{Chunking, FFmpegCommandBuilder};
 use crate::job::{Job, MediaFileType, Operation};
@@ -130,18 +130,16 @@ impl FFmpegProcessor {
         }
     }
 
+    /// Convert a job's source into `work_folder`, from where
+    /// [`Self::move_to_destination`] delivers it whole. See D10.
     pub async fn process_job(
         &self,
         job: &Job,
         media_root: Option<&Path>,
-        work_folder: Option<&Path>,
+        work_folder: &Path,
     ) -> Result<()> {
         let input_path = job.full_input_path(media_root);
-        let output_path = if let Some(work_folder) = work_folder {
-            job.work_folder_output_path(work_folder)
-        } else {
-            job.full_output_path(media_root)
-        };
+        let output_path = job.work_folder_output_path(work_folder);
 
         info!("🚀 Starting conversion for: {:?}", input_path);
 
@@ -220,30 +218,23 @@ impl FFmpegProcessor {
 
         // A long source is encoded a piece at a time, so that a worker which is
         // interrupted part-way leaves something the next one can carry on from
-        // rather than hours of work that has to be done again. That needs
-        // somewhere to keep the pieces, and a duration to divide up: without
-        // either, fall back to encoding the file in one pass.
+        // rather than hours of work that has to be done again. That needs a
+        // duration to divide up: without one, the file is encoded in one pass.
         //
         // Only a re-encode is chunked. A remux copies the bitstream and runs at
         // disk speed, so there is no work worth protecting - and the chunk path
         // re-encodes the video, which would throw away the copy that is the
         // whole point of the operation.
-        let chunked = match (work_folder, job.operation) {
-            (Some(work_folder), Operation::Reencode { .. }) => {
-                match self.probe_duration(&input_path).await {
-                    Some(duration) if duration >= self.chunking.min_source_seconds => {
-                        self.process_in_chunks(job, &source, &output_path, work_folder, duration)
-                            .await?;
-                        true
-                    }
-                    _ => false,
-                }
-            }
-            _ => false,
+        let duration = match job.operation {
+            Operation::Reencode { .. } => self.probe_duration(&input_path).await,
+            Operation::Remux { .. } => None,
         };
-
-        if !chunked {
-            self.process_in_one_pass(job, &source, &output_path).await?;
+        match duration {
+            Some(duration) if duration >= self.chunking.min_source_seconds => {
+                self.process_in_chunks(job, &source, &output_path, work_folder, duration)
+                    .await?
+            }
+            _ => self.process_in_one_pass(job, &source, &output_path).await?,
         }
 
         // Only once the media file itself is written. A sidecar beside an
@@ -279,32 +270,7 @@ impl FFmpegProcessor {
         .with_output(output_path);
 
         let adds_a_track = job.operation.adds_an_audio_track() && !source_channels.is_empty();
-
-        let (ffmpeg_builder, subtitle_mappings) = match subtitles {
-            // A track the target burns into the picture is left out of the
-            // codecs and the mappings both. Half of that is not enough: a
-            // mapped subtitle stream with no subtitle codec fails the mux.
-            None => (ffmpeg_builder, Vec::new()),
-            // The subtitle is the whole reason the second input is here, so it
-            // is not optional.
-            Some(SubtitleSource::External(vtt_path)) => (
-                ffmpeg_builder
-                    .with_subtitle_encoding()
-                    .with_input(vtt_path.as_path()),
-                vec!["1:s".to_string()],
-            ),
-            // Every stream, not the first of each: a second audio track is
-            // usually a commentary or another language, and dropping it while
-            // renaming the source to `.disabled` loses it for good. The
-            // subtitle streams are named one by one because the source may
-            // carry one MP4 cannot hold, and `0:s?` would take that one too.
-            Some(SubtitleSource::Embedded(selection)) => (
-                ffmpeg_builder.with_subtitle_encoding(),
-                selection.mappings(0),
-            ),
-        };
-        let ffmpeg_builder =
-            ffmpeg_builder.with_stream_mapping(&mappings(0, adds_a_track, &subtitle_mappings));
+        let ffmpeg_builder = with_streams(ffmpeg_builder, 0, adds_a_track, subtitles);
 
         self.run(ffmpeg_builder.build(), "conversion").await?;
 
@@ -503,18 +469,6 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
-    #[tokio::test]
-    async fn test_ffmpeg_processor_creation() {
-        let processor = FFmpegProcessor::new(false);
-        assert!(!processor.background_mode);
-    }
-
-    #[tokio::test]
-    async fn test_background_mode() {
-        let processor = FFmpegProcessor::new(true);
-        assert!(processor.background_mode);
-    }
-
     /// Where the container says the file begins.
     fn probed_start_time(path: &Path) -> f64 {
         let output = std::process::Command::new("ffprobe")
@@ -583,8 +537,8 @@ mod tests {
     /// audio is AAC either way, so the muxer still has a priming frame's
     /// negative timestamp in front of it, and `-avoid_negative_ts make_zero`
     /// still moves the picture to 23ms and still splits the first subtitle
-    /// event around the seam. Both assertions below fail against pre-fix code
-    /// on FFmpeg 6.1.1 and on 9.0 alike.
+    /// event around the seam. With that option back in the encode, both
+    /// assertions below fail on FFmpeg 6.1.1 and on 9.0 alike.
     #[tokio::test]
     async fn the_one_pass_encode_starts_the_output_where_the_source_starts() {
         if !ffmpeg_present() {
@@ -626,7 +580,7 @@ mod tests {
                 // Above the source length, so this is the one-pass path.
                 min_source_seconds: 60.0,
             })
-            .process_job(&job, None, Some(&work_folder))
+            .process_job(&job, None, &work_folder)
             .await
             .unwrap();
 
@@ -731,7 +685,7 @@ mod tests {
             let job = reordering_job(&input);
             FFmpegProcessor::new(false)
                 .with_chunking(chunking)
-                .process_job(&job, None, Some(&work_folder))
+                .process_job(&job, None, &work_folder)
                 .await
                 .unwrap();
 
@@ -797,7 +751,7 @@ mod tests {
             };
 
             let error = FFmpegProcessor::new(false)
-                .process_job(&job, None, Some(&work_folder))
+                .process_job(&job, None, &work_folder)
                 .await
                 .expect_err("a source with no picture was converted");
 
@@ -872,7 +826,7 @@ mod tests {
 
             FFmpegProcessor::new(false)
                 .with_chunking(chunking)
-                .process_job(&job, None, Some(work_folder.path()))
+                .process_job(&job, None, work_folder.path())
                 .await
                 .unwrap_or_else(|error| panic!("{operation:?}, {chunking:?}: {error:#}"));
 
@@ -897,7 +851,7 @@ mod tests {
         build_with_cover_art(temp.path(), &["sine=duration=2"], &input);
 
         let error = FFmpegProcessor::new(false)
-            .process_job(&chunking_job(&input), None, Some(temp.path()))
+            .process_job(&chunking_job(&input), None, temp.path())
             .await
             .expect_err("a source with only cover art was converted");
 
@@ -916,13 +870,14 @@ mod tests {
             PostProcessingSettings::default(),
             input.parent().expect("input has a parent"),
         );
+        let work_folder = input.parent().expect("input has a parent");
 
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime
-            .block_on(FFmpegProcessor::new(false).process_job(&job, None, None))
+            .block_on(FFmpegProcessor::new(false).process_job(&job, None, work_folder))
             .expect("transcode should succeed");
 
-        job.output_path
+        job.work_folder_output_path(work_folder)
     }
 
     #[test]
@@ -976,7 +931,7 @@ mod tests {
         assert_eq!(
             streams_of(&output),
             vec!["video,und", "audio,eng", "audio,fra"],
-            "a second audio track is usually another language, and the source is              disabled straight afterwards - losing it here loses it for good"
+            "a second audio track is usually another language, and the source is disabled straight afterwards - losing it here loses it for good"
         );
     }
 

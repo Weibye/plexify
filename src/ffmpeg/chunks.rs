@@ -6,9 +6,8 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
 use super::builder::format_seconds;
-use super::operation::{mappings, with_encoded_audio};
+use super::operation::{with_encoded_audio, with_streams};
 use super::processor::SourceFacts;
-use super::subtitle_streams::SubtitleSource;
 use super::{FFmpegCommandBuilder, FFmpegProcessor};
 use crate::job::{Job, Operation, QualitySettings};
 use crate::paths::to_forward_slashes;
@@ -31,8 +30,8 @@ pub const MIN_CHUNKED_SECONDS: f64 = 900.0;
 /// Named after the job id, which is the v5 UUID of the input path, so the
 /// worker that reclaims an abandoned job finds the same directory the last one
 /// was filling.
-pub fn chunk_dir_for(job: &Job, work_folder: &Path) -> PathBuf {
-    work_folder.join(format!("{}.chunks", job.id))
+pub fn chunk_dir_for(job_id: &str, work_folder: &Path) -> PathBuf {
+    work_folder.join(format!("{job_id}.chunks"))
 }
 
 /// Records the settings a chunk directory's contents were encoded with.
@@ -159,9 +158,11 @@ fn chunk_args(
 /// `output_path`.
 ///
 /// The picture is copied out of the chunks; the sound and the subtitles are
-/// read from the source, which is input 1, and encoded here. The cap rides on
-/// the audio for the same reason it does everywhere else - a client that
-/// refuses 5.1 refuses it however the file was assembled.
+/// read from the source, which is input 1, and encoded here. The chunks hold
+/// no subtitles, because a subtitle event straddling a boundary would have
+/// been cut in half by it. The cap rides on the audio for the same reason it
+/// does everywhere else - a client that refuses 5.1 refuses it however the
+/// file was assembled.
 fn join_args(
     job: &Job,
     source: &SourceFacts<'_>,
@@ -181,28 +182,8 @@ fn join_args(
     .with_negative_composition_offsets()
     .with_output(output_path);
 
-    let (mux_builder, subtitle_mappings) = match source.subtitles {
-        None => (mux_builder, Vec::new()),
-        // The sidecar is a third input of its own: the source is already
-        // input 1, and a WebM's subtitle is not in it.
-        Some(SubtitleSource::External(vtt_path)) => (
-            mux_builder
-                .with_subtitle_encoding()
-                .with_input(vtt_path.as_path()),
-            vec!["2:s".to_string()],
-        ),
-        // The same selection the one-pass encode was handed, read from the
-        // source rather than from the chunks - which hold no subtitles,
-        // because a subtitle event straddling a boundary would have been
-        // cut in half by it.
-        Some(SubtitleSource::Embedded(selection)) => {
-            (mux_builder.with_subtitle_encoding(), selection.mappings(1))
-        }
-    };
     // Only a re-encode is chunked, and a re-encode adds no track.
-    mux_builder
-        .with_stream_mapping(&mappings(1, false, &subtitle_mappings))
-        .build()
+    with_streams(mux_builder, 1, false, source.subtitles).build()
 }
 
 /// How a source is divided up for a resumable encode.
@@ -263,7 +244,7 @@ impl FFmpegProcessor {
             "only a re-encode is chunked"
         );
 
-        let chunk_dir = chunk_dir_for(job, work_folder);
+        let chunk_dir = chunk_dir_for(&job.id, work_folder);
         self.prepare_chunk_dir(job, &chunk_dir).await?;
 
         let planned = plan_chunks(duration, self.chunking.chunk_seconds);
@@ -402,6 +383,7 @@ impl FFmpegProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ffmpeg::subtitle_streams::SubtitleSource;
     use crate::ffmpeg::test_support::*;
     use crate::ffmpeg::{select_subtitle_streams, SubtitleStream};
     use crate::job::{MediaFileType, PostProcessingSettings, QualitySettings};
@@ -613,7 +595,7 @@ mod tests {
         assert!(joined.contains("-c:v copy"), "{joined}");
         assert!(!joined.contains("-c:a copy"), "{joined}");
         assert!(joined.contains("-c:a aac"), "{joined}");
-        // And the cap comes with it, because this is now the only place the
+        // And the cap comes with it, because this is the only place the
         // output's audio is written.
         assert!(joined.contains("-ac:a:0 2"), "{joined}");
         assert!(joined.contains("-c:s mov_text"), "{joined}");
@@ -757,7 +739,7 @@ mod tests {
         let processor = FFmpegProcessor::new(false).with_chunking(TEST_CHUNKING);
 
         processor
-            .process_job(&job, None, Some(&work_folder))
+            .process_job(&job, None, &work_folder)
             .await
             .unwrap();
 
@@ -779,7 +761,7 @@ mod tests {
         assert_eq!(stream_codecs(&output), vec!["h264", "aac", "mov_text"]);
 
         // Nothing is left behind to be mistaken for progress on a later run.
-        assert!(!work_folder.join(format!("{}.chunks", job.id)).exists());
+        assert!(!chunk_dir_for(&job.id, &work_folder).exists());
     }
 
     /// The sound of a joined file has to sit where the source's does at every
@@ -818,7 +800,7 @@ mod tests {
         let job = chunking_job(&input);
         FFmpegProcessor::new(false)
             .with_chunking(TEST_CHUNKING)
-            .process_job(&job, None, Some(&work_folder))
+            .process_job(&job, None, &work_folder)
             .await
             .unwrap();
 
@@ -877,7 +859,7 @@ mod tests {
         );
 
         processor
-            .process_job(&job, None, Some(&work_folder))
+            .process_job(&job, None, &work_folder)
             .await
             .unwrap();
 
@@ -998,13 +980,13 @@ mod tests {
         let processor = FFmpegProcessor::new(false).with_chunking(TEST_CHUNKING);
 
         processor
-            .process_job(&job, None, Some(&work_folder))
+            .process_job(&job, None, &work_folder)
             .await
             .unwrap();
 
         assert!(job.work_folder_output_path(&work_folder).exists());
         assert!(
-            !work_folder.join(format!("{}.chunks", job.id)).exists(),
+            !chunk_dir_for(&job.id, &work_folder).exists(),
             "a source below the threshold should never be divided up"
         );
     }
@@ -1024,7 +1006,7 @@ mod tests {
 
         let job = chunking_job(&input);
         let processor = FFmpegProcessor::new(false).with_chunking(TEST_CHUNKING);
-        let chunk_dir = chunk_dir_for(&job, &work_folder);
+        let chunk_dir = chunk_dir_for(&job.id, &work_folder);
 
         let chunks = plan_chunks(probed_duration(&input), TEST_CHUNKING.chunk_seconds);
         processor.prepare_chunk_dir(&job, &chunk_dir).await.unwrap();
@@ -1066,7 +1048,7 @@ mod tests {
 
         let job = chunking_job(&input);
         let processor = FFmpegProcessor::new(false).with_chunking(TEST_CHUNKING);
-        let chunk_dir = chunk_dir_for(&job, &work_folder);
+        let chunk_dir = chunk_dir_for(&job.id, &work_folder);
 
         let chunks = plan_chunks(probed_duration(&input), TEST_CHUNKING.chunk_seconds);
         processor.prepare_chunk_dir(&job, &chunk_dir).await.unwrap();
@@ -1098,7 +1080,7 @@ mod tests {
 
         let job = chunking_job(&input);
         let processor = FFmpegProcessor::new(false).with_chunking(TEST_CHUNKING);
-        let chunk_dir = chunk_dir_for(&job, &work_folder);
+        let chunk_dir = chunk_dir_for(&job.id, &work_folder);
 
         let chunks = plan_chunks(probed_duration(&input), TEST_CHUNKING.chunk_seconds);
         processor.prepare_chunk_dir(&job, &chunk_dir).await.unwrap();
@@ -1139,15 +1121,11 @@ mod tests {
         )
     }
 
-    /// Issue #111: the join treats a WebM differently from an MKV, and only the
-    /// MKV arm had ever been run.
-    ///
-    /// A WebM's subtitle is a separate file and is the reason the job exists, so
-    /// the join maps it without a `?`. If it produced no stream there the job
-    /// would fail outright rather than degrade - three attempts and then
-    /// `_failed`, for every WebM in the library over the chunking threshold.
-    /// Nothing had ever established that it does produce one: every round-trip
-    /// test built an MKV, and so did the manual verification.
+    /// The join treats a WebM differently from an MKV: its subtitle is a
+    /// separate file and is the reason the job exists, so the join maps it
+    /// without a `?`. If it produced no stream there the job would fail
+    /// outright rather than degrade - three attempts and then `_failed`, for
+    /// every WebM in the library over the chunking threshold.
     ///
     /// The source is VP8 and Opus rather than H.264 and AAC for the same reason.
     /// The chunks are cut by seeking into it, and what a seek lands on is a
@@ -1184,7 +1162,7 @@ mod tests {
 
         FFmpegProcessor::new(false)
             .with_chunking(TEST_CHUNKING)
-            .process_job(&job, None, Some(&work_folder))
+            .process_job(&job, None, &work_folder)
             .await
             .unwrap();
 
@@ -1223,6 +1201,6 @@ mod tests {
         );
 
         // Nothing is left behind to be mistaken for progress on a later run.
-        assert!(!work_folder.join(format!("{}.chunks", job.id)).exists());
+        assert!(!chunk_dir_for(&job.id, &work_folder).exists());
     }
 }

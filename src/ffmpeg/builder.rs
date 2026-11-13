@@ -1,7 +1,6 @@
 //! FFmpeg's command line, assembled in the order FFmpeg reads it.
 
 use std::path::Path;
-use tokio::process::Command;
 
 use crate::job::QualitySettings;
 
@@ -21,9 +20,8 @@ use crate::job::QualitySettings;
 /// Output options can be chained in whatever order reads best. Input options
 /// attach to the **next input declared**, which is what lets a command carry a
 /// different option for each of its inputs - `-f concat` on the list of chunks
-/// a join reads, but not on the source it takes subtitles from. An earlier
-/// version kept every input option in one bucket ahead of every input, which
-/// silently put them all on input 0.
+/// a join reads, but not on the source it takes subtitles from. One bucket
+/// ahead of every input would silently put them all on input 0.
 #[derive(Debug, Default)]
 pub struct FFmpegCommandBuilder {
     global: Vec<String>,
@@ -322,11 +320,6 @@ impl FFmpegCommandBuilder {
         args.extend(self.output);
         args
     }
-
-    /// Build the command arguments and apply them to a tokio Command
-    pub fn build_command(self, base_command: &mut Command) {
-        base_command.args(self.build());
-    }
 }
 
 /// Render a number of seconds for an FFmpeg time argument.
@@ -441,11 +434,10 @@ mod tests {
 
     /// The bug this design exists to prevent.
     ///
-    /// `process_job` used to call `with_output` before the input and the stream
-    /// mappings, and FFmpeg applies options to the file that follows them - so
-    /// every `-map` landed after the output and was silently discarded. The unit
-    /// tests above did not catch it because they happened to call the builder in
-    /// a different order than the code did.
+    /// FFmpeg applies options to the file that follows them, so a `-map`
+    /// emitted after the output is silently discarded. A caller that chains
+    /// `with_output` before its input and mappings must still get them in
+    /// front of it.
     #[test]
     fn the_output_comes_last_whatever_order_the_caller_used() {
         let quality = QualitySettings::default();
@@ -494,7 +486,7 @@ mod tests {
 
         // `-f concat -safe 0` describes the list; `-fflags +genpts` describes
         // the source the subtitles come from. Held in one bucket ahead of every
-        // input, as an earlier version did, both would apply to the list.
+        // input, both would apply to the list.
         assert_eq!(
             args.join(" "),
             "-f concat -safe 0 -i /work/chunks.txt -fflags +genpts -i /media/film.mkv \
@@ -512,39 +504,6 @@ mod tests {
             .build();
 
         assert_eq!(args, vec!["-y", "-fflags", "+genpts"]);
-    }
-
-    #[test]
-    fn test_ffmpeg_command_builder_build_command() {
-        let quality = QualitySettings::default();
-        let builder = FFmpegCommandBuilder::new()
-            .with_generated_pts()
-            .with_video_encoding(&quality);
-
-        let mut cmd = Command::new("ffmpeg");
-        builder.build_command(&mut cmd);
-
-        // We can't easily test the internal state of Command, but we can verify
-        // the builder doesn't panic when applied to a command
-        assert_eq!(cmd.as_std().get_program(), "ffmpeg");
-    }
-
-    #[test]
-    fn test_builder_method_chaining() {
-        // Test that all methods return Self for fluent chaining
-        let quality = QualitySettings::default();
-
-        let _builder = FFmpegCommandBuilder::new()
-            .with_generated_pts()
-            .with_input("test.mkv")
-            .with_stream_mapping(&["0:v:0", "0:a:0", "0:s:0"])
-            .with_video_encoding(&quality)
-            .with_audio_encoding(&quality)
-            .with_subtitle_encoding()
-            .with_overwrite()
-            .with_output("test.mp4");
-
-        // If we get here without compile errors, method chaining works
     }
 
     #[test]
