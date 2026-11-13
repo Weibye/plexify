@@ -264,8 +264,8 @@ impl StatusCommand {
 /// The `.job` files in a queue directory, or `None` if the directory is not
 /// there at all.
 ///
-/// Only `.job` files count. `_queue` also holds the `.lock` directories enqueue
-/// uses, and `_in_progress` holds `.heartbeat` files and `.chunks` directories;
+/// Only `.job` files count. `_queue` may hold `.lock` directories an older
+/// version left, and `_in_progress` holds `.heartbeat` files and `.chunks` directories;
 /// none of those is a job and counting one would inflate the answer.
 ///
 /// "Not there" is the only absence that reads as an empty directory. Every other
@@ -629,8 +629,8 @@ mod tests {
                 .unwrap();
         }
 
-        // An interrupted enqueue leaves a `.lock` directory behind. It is not a
-        // job and must not be counted as one.
+        // An older version's interrupted enqueue left a `.lock` directory
+        // behind. It is not a job and must not be counted as one.
         std::fs::create_dir(queue.queue_dir.join("abandoned.job.lock")).unwrap();
 
         let status = StatusCommand::new(temp_dir.path().to_path_buf())

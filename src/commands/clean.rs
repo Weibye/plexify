@@ -95,8 +95,8 @@ pub struct CleanPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectoryPlan {
     pub directory: QueueDirectory,
-    /// `.job` files. The `.lock` directories, `.heartbeat` files and `.chunks`
-    /// directories that live alongside them are not jobs and are not counted.
+    /// `.job` files. The `.heartbeat` files and `.chunks` directories beside
+    /// them, and `.lock` directories an older version left, are not counted.
     pub jobs: usize,
     /// Claims in `_in_progress`, each with whether its worker is still alive.
     /// Empty for the other three.
@@ -535,8 +535,8 @@ fn plural(count: usize, one: &'static str, many: &'static str) -> &'static str {
 
 /// The `.job` files in a queue directory, or `None` if it is not there at all.
 ///
-/// Only `.job` files count. `_queue` also holds the `.lock` directories enqueue
-/// uses and `_in_progress` holds `.heartbeat` files and `.chunks` directories;
+/// Only `.job` files count. `_queue` may hold `.lock` directories an older
+/// version left, and `_in_progress` holds `.heartbeat` files and `.chunks` directories;
 /// none of those is a job, and counting one would overstate the report.
 async fn job_files(directory: &Path) -> Result<Option<Vec<PathBuf>>> {
     let mut entries = match async_fs::read_dir(directory).await {
