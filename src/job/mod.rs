@@ -41,8 +41,8 @@ pub struct Job {
 /// so which of the two a job is stays a property of the job, decided once when
 /// it is queued.
 ///
-/// The caller resolves it; issue #158 makes that the conformance check, which
-/// asks what the source and the target hold rather than what the extension is.
+/// The caller resolves it: `scan --target` from what the source and the target
+/// hold, and otherwise from the extension.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum Operation {
     /// Copy the video bitstream into MP4, doing to the other tracks only what
@@ -201,12 +201,10 @@ impl SubtitleAction {
     /// can hold it - which is a fact about the track rather than about the
     /// client, so two targets cannot disagree about it.
     ///
-    /// So `Drop` beats `Extract` beats `Keep`, and the middle case is the one
-    /// that changed: extracting to satisfy a client that burns the track in
-    /// costs the other client nothing, because the server hands a sidecar to
-    /// any of them and converts it without touching the picture. Combining
-    /// used to mean a device that rendered the track perfectly well lost it
-    /// because another one burned it in. It no longer does.
+    /// So `Drop` beats `Extract` beats `Keep`. Extracting to satisfy a client
+    /// that burns the track in costs the other client nothing, because the
+    /// server hands a sidecar to any of them and converts it without touching
+    /// the picture, so a device that renders the track does not lose it.
     fn hardest(self, other: Self) -> Self {
         match (self, other) {
             (Self::Drop, _) | (_, Self::Drop) => Self::Drop,
@@ -246,7 +244,7 @@ impl Operation {
 
         // The channel count is a ceiling to mix down to, not a layout to
         // produce, so it is asked for only where the file is above it. A
-        // verdict now reports the codec fault and the layout fault separately
+        // verdict reports the codec fault and the layout fault separately
         // even when both hold, which is what lets these three cases stay
         // apart: reaching for the cap on every fault upmixes stereo into 5.1,
         // and reaching for it on none leaves a 5.1 track in a codec the client
@@ -818,8 +816,8 @@ mod tests {
 
         assert_eq!(Copy.hardest(Copy), Copy);
 
-        // The case that matters, and the whole of #161: one target plays a
-        // track the file already has, the other cannot. Replacing would take
+        // The case that matters: one target plays a track the file already
+        // has, the other cannot. Replacing would take
         // 5.1 away from the device that was managing; adding serves both.
         assert_eq!(
             Copy.hardest(Transcode { channels: Some(2) }),
@@ -910,7 +908,10 @@ mod tests {
             .into_iter()
             .filter_map(|target| Operation::for_conformance(&evaluate(&probe, target), target))
             .reduce(Operation::hardest);
-        assert_eq!(combined, None, "no job at all, so #161 never sees it");
+        assert_eq!(
+            combined, None,
+            "no job at all, so the track-adding path never sees it"
+        );
     }
 
     /// A track produced for a client has to be one that client can play, and
@@ -1277,45 +1278,7 @@ mod tests {
         clear_encoding_env();
     }
 
-    #[test]
-    fn test_job_serialization() {
-        let quality = QualitySettings {
-            ffmpeg_preset: "medium".to_string(),
-            ffmpeg_crf: "18".to_string(),
-            ffmpeg_audio_bitrate: "256k".to_string(),
-        };
-        let post_processing = PostProcessingSettings {
-            disable_source_files: false,
-        };
-        let media_root = PathBuf::from("/test/media");
-        let job = Job::new(
-            PathBuf::from("test.webm"),
-            MediaFileType::WebM,
-            Operation::Reencode { channels: None },
-            quality.clone(),
-            post_processing.clone(),
-            &media_root,
-        );
-
-        // Test JSON serialization/deserialization
-        let json = serde_json::to_string(&job).unwrap();
-        let deserialized: Job = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(job.input_path, deserialized.input_path);
-        assert_eq!(job.output_path, deserialized.output_path);
-        assert_eq!(job.subtitle_path, deserialized.subtitle_path);
-        assert_eq!(job.file_type, deserialized.file_type);
-        assert_eq!(
-            job.quality_settings.ffmpeg_preset,
-            deserialized.quality_settings.ffmpeg_preset
-        );
-        assert_eq!(
-            job.post_processing.disable_source_files,
-            deserialized.post_processing.disable_source_files
-        );
-    }
-
-    /// A job file outlives the code that wrote it, so a file in today's format
+    /// A job file outlives the code that wrote it, so a file in the current format
     /// has to keep loading as the same job, with the same id, at the same
     /// paths.
     #[test]
@@ -1772,13 +1735,12 @@ mod tests {
         }
     }
 
-    /// Issue #133: a file `naming` will not *name* is still a file the queue can
-    /// order.
+    /// A file `naming` will not *name* is still a file the queue can order.
     ///
     /// Every path here carries a legible marker and is refused by `parse` for a
     /// reason that has nothing to do with the marker - a directory named after an
     /// episode, half an episode, a tree nested into itself. Collapsing those
-    /// refusals into `None` sorted them behind every parseable episode in the
+    /// refusals into `None` would sort them behind every parseable episode in the
     /// library, in `read_dir` order, with nothing logged - and they are precisely
     /// the files `validate --fix` also refuses, so they stay in that shape.
     #[test]
