@@ -5,6 +5,7 @@ use tokio::fs as async_fs;
 use tracing::{debug, info, warn};
 
 use crate::job::Job;
+use crate::paths::to_forward_slashes;
 use crate::JobPriority;
 
 /// How many times a job may fail before it is parked in `_failed` instead of
@@ -174,7 +175,11 @@ impl JobQueue {
             let content = match async_fs::read_to_string(&job_path).await {
                 Ok(content) => content,
                 Err(e) if is_absent(&e) => continue,
-                Err(e) => return Err(e).with_context(|| format!("Could not read {job_path:?}")),
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("Could not read {}", to_forward_slashes(&job_path))
+                    })
+                }
             };
             let sort_key = serde_json::from_str::<Job>(&content)
                 .ok()
@@ -233,9 +238,15 @@ impl JobQueue {
 
                 let content = async_fs::read_to_string(&in_progress_path)
                     .await
-                    .with_context(|| format!("Could not read {in_progress_path:?}"))?;
-                let job: Job = serde_json::from_str(&content)
-                    .with_context(|| format!("{in_progress_path:?} is not a job file"))?;
+                    .with_context(|| {
+                        format!("Could not read {}", to_forward_slashes(&in_progress_path))
+                    })?;
+                let job: Job = serde_json::from_str(&content).with_context(|| {
+                    format!(
+                        "{} is not a job file",
+                        to_forward_slashes(&in_progress_path)
+                    )
+                })?;
 
                 Ok(Some(ClaimedJob {
                     queue: self,
@@ -246,7 +257,9 @@ impl JobQueue {
                 }))
             }
             Err(e) if is_absent(&e) => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("Could not claim {job_path:?}")),
+            Err(e) => {
+                Err(e).with_context(|| format!("Could not claim {}", to_forward_slashes(job_path)))
+            }
         }
     }
 
@@ -305,7 +318,12 @@ impl JobQueue {
             Ok(entries) => entries,
             Err(e) if is_absent(&e) => return Ok(outcome),
             Err(e) => {
-                return Err(e).with_context(|| format!("Could not read {:?}", self.in_progress_dir))
+                return Err(e).with_context(|| {
+                    format!(
+                        "Could not read {}",
+                        to_forward_slashes(&self.in_progress_dir)
+                    )
+                })
             }
         };
         while let Some(entry) = entries.next_entry().await? {
@@ -342,11 +360,13 @@ impl JobQueue {
                 }
                 // Another sweeper recovered it first, which is the same
                 // rename and so the same single winner.
-                Err(e) if is_absent(&e) => debug!("Another sweeper recovered {path:?}"),
+                Err(e) if is_absent(&e) => {
+                    debug!("Another sweeper recovered {}", to_forward_slashes(&path))
+                }
                 // Warned rather than returned, like a job that cannot be
                 // reclaimed below: one stuck file must not stop every worker
                 // from starting.
-                Err(e) => warn!("Could not recover {path:?}: {e}"),
+                Err(e) => warn!("Could not recover {}: {e}", to_forward_slashes(&path)),
             }
         }
 
@@ -401,7 +421,10 @@ impl JobQueue {
             let job_path = heartbeat.with_extension("");
             if !stranded_jobs.contains(&job_path) {
                 let _ = async_fs::remove_file(&heartbeat).await;
-                debug!("Removed heartbeat with no job: {heartbeat:?}");
+                debug!(
+                    "Removed heartbeat with no job: {}",
+                    to_forward_slashes(&heartbeat)
+                );
             }
         }
 
@@ -473,7 +496,7 @@ impl JobQueue {
 
         let content = async_fs::read_to_string(taken_path)
             .await
-            .with_context(|| format!("Could not read {taken_path:?}"))?;
+            .with_context(|| format!("Could not read {}", to_forward_slashes(taken_path)))?;
 
         // A read that failed is worth another sweep - a network work root drops
         // out from under a worker now and then - but contents that are not a job
@@ -599,7 +622,10 @@ impl JobQueue {
             match async_fs::remove_dir_all(path).await {
                 Ok(()) => {}
                 Err(e) if is_absent(&e) => {}
-                Err(e) => return Err(e).with_context(|| format!("Could not remove {path:?}")),
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("Could not remove {}", to_forward_slashes(path)))
+                }
             }
         }
         Ok(())
@@ -622,12 +648,18 @@ async fn write_job_atomically(job_path: &std::path::Path, job: &Job) -> Result<(
 
     if let Err(e) = async_fs::write(&staging, content.as_bytes()).await {
         let _ = async_fs::remove_file(&staging).await;
-        return Err(anyhow!("could not write {staging:?}: {e}"));
+        return Err(anyhow!(
+            "could not write {}: {e}",
+            to_forward_slashes(&staging)
+        ));
     }
 
     if let Err(e) = async_fs::rename(&staging, job_path).await {
         let _ = async_fs::remove_file(&staging).await;
-        return Err(anyhow!("could not move {staging:?} into place: {e}"));
+        return Err(anyhow!(
+            "could not move {} into place: {e}",
+            to_forward_slashes(&staging)
+        ));
     }
 
     Ok(())
@@ -874,7 +906,7 @@ async fn is_present(path: &std::path::Path) -> Result<bool> {
     match async_fs::metadata(path).await {
         Ok(_) => Ok(true),
         Err(e) if is_absent(&e) => Ok(false),
-        Err(e) => Err(e).with_context(|| format!("Could not check {path:?}")),
+        Err(e) => Err(e).with_context(|| format!("Could not check {}", to_forward_slashes(path))),
     }
 }
 
@@ -935,7 +967,8 @@ async fn take_for_move(in_progress_path: &std::path::Path) -> Result<Option<Path
         Ok(_) => Ok(Some(taken_path)),
         // Somebody else took it between the mark and the rename.
         Err(e) if is_absent(&e) => Ok(None),
-        Err(e) => Err(e).with_context(|| format!("Could not take {in_progress_path:?}")),
+        Err(e) => Err(e)
+            .with_context(|| format!("Could not take {}", to_forward_slashes(in_progress_path))),
     }
 }
 

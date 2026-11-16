@@ -75,7 +75,7 @@ impl Scope {
         if !library_root.is_dir() {
             return Err(anyhow::anyhow!(
                 "library root {} is not a readable directory",
-                library_root.display()
+                to_forward_slashes(&library_root)
             ));
         }
 
@@ -83,8 +83,8 @@ impl Scope {
             return Err(anyhow::anyhow!(
                 "{} is not inside the library root {}; both are read as spelled, so a '..' or a \
                  differing drive letter has to be retyped rather than resolved",
-                scan_path.display(),
-                library_root.display()
+                to_forward_slashes(&scan_path),
+                to_forward_slashes(&library_root)
             ));
         }
 
