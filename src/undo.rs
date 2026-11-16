@@ -208,6 +208,7 @@ pub fn render(plan: &UndoPlan, outcome: Option<&FixOutcome>) -> String {
 mod tests {
     use super::*;
     use crate::commands::validate::{IssueKind, ValidationIssue, ValidationReport};
+    use crate::test_support::touch;
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -234,12 +235,6 @@ mod tests {
         let plan_file = root.join("fix-plan.json");
         let outcome = crate::fix::apply(&crate::fix::plan(&report), &plan_file).unwrap();
         (outcome, plan_file)
-    }
-
-    fn touch(root: &Path, relative: &str, contents: &str) {
-        let path = absolute(root, relative);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, contents).unwrap();
     }
 
     #[test]

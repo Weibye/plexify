@@ -10,6 +10,8 @@ pub mod probe;
 pub mod queue;
 pub mod subtitles;
 pub mod target;
+#[cfg(test)]
+mod test_support;
 pub mod undo;
 
 use clap::ValueEnum;

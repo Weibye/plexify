@@ -180,18 +180,10 @@ impl<'a> JobProcessor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::clear_encoding_env;
     use serial_test::serial;
     use std::fs;
     use tempfile::TempDir;
-
-    /// Clear the encoding environment variables so a test observes documented
-    /// defaults rather than whatever the developer's shell happens to export.
-    /// Only safe inside `#[serial(env)]` tests.
-    fn clear_encoding_env() {
-        std::env::remove_var("FFMPEG_PRESET");
-        std::env::remove_var("FFMPEG_CRF");
-        std::env::remove_var("FFMPEG_AUDIO_BITRATE");
-    }
 
     #[tokio::test]
     #[serial(env)]

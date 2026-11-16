@@ -1135,6 +1135,7 @@ impl<'a> ClaimedJob<'a> {
 mod tests {
     use super::*;
     use crate::job::{Job, MediaFileType, Operation, PostProcessingSettings, QualitySettings};
+    use crate::test_support::{age, mkv_reencode};
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -1155,14 +1156,7 @@ mod tests {
     /// Dropping the claim is what an interrupted worker does: the job file
     /// stays in `_in_progress` and the heartbeat stops being refreshed.
     async fn queue_with_one_claimed_job(temp_dir: &TempDir) -> (JobQueue, String) {
-        let job = Job::new(
-            PathBuf::from("show.mkv"),
-            MediaFileType::Mkv,
-            Operation::Reencode { channels: None },
-            QualitySettings::default(),
-            PostProcessingSettings::default(),
-            temp_dir.path(),
-        );
+        let job = mkv_reencode("show.mkv", temp_dir.path());
         queue_with_one_claimed_job_for(temp_dir, &job).await
     }
 
@@ -1185,12 +1179,8 @@ mod tests {
     /// running alongside a writer lands inside the write rather than between
     /// two of them. Only the length of the path matters; nothing opens it.
     fn a_job_whose_file_takes_a_while_to_write(media_root: &Path) -> Job {
-        Job::new(
+        mkv_reencode(
             PathBuf::from(format!("{}.mkv", "l".repeat(64 * 1024))),
-            MediaFileType::Mkv,
-            Operation::Reencode { channels: None },
-            QualitySettings::default(),
-            PostProcessingSettings::default(),
             media_root,
         )
     }
@@ -1250,26 +1240,6 @@ mod tests {
         }
     }
 
-    /// The heartbeat file that belongs to a claimed job.
-    fn heartbeat_of(in_progress_path: &Path) -> PathBuf {
-        let mut name = in_progress_path.as_os_str().to_os_string();
-        name.push(".heartbeat");
-        PathBuf::from(name)
-    }
-
-    /// Backdate a file's modification time, so the sweep sees it as old.
-    ///
-    /// Every failure here is unwrapped. A helper that quietly does nothing
-    /// would leave the tests below asserting that a *fresh* job is not
-    /// reclaimed, which they would pass without testing anything.
-    fn age(paths: &[&Path], by: Duration) {
-        let when = std::fs::FileTimes::new().set_modified(SystemTime::now() - by);
-        for path in paths {
-            let file = std::fs::File::options().write(true).open(path).unwrap();
-            file.set_times(when).unwrap();
-        }
-    }
-
     #[test]
     async fn an_abandoned_job_is_returned_to_the_queue() {
         let temp_dir = TempDir::new().unwrap();
@@ -1279,14 +1249,11 @@ mod tests {
         assert!(in_progress_path.exists(), "the job starts out claimed");
 
         age(
-            &[&in_progress_path, &heartbeat_of(&in_progress_path)],
+            &[&in_progress_path, &heartbeat_path_for(&in_progress_path)],
             Duration::from_secs(600),
         );
 
-        let swept = queue
-            .reclaim_stranded_jobs(Duration::from_secs(300))
-            .await
-            .unwrap();
+        let swept = queue.reclaim_stranded_jobs(STALE_AFTER).await.unwrap();
 
         assert_eq!(swept.reclaimed, vec![job_name.clone()]);
         assert!(swept.parked.is_empty());
@@ -1320,7 +1287,7 @@ mod tests {
         age(&[&in_progress_path], Duration::from_secs(600));
 
         let reclaimed = queue
-            .reclaim_one(&in_progress_path, &job_name, Duration::from_secs(300))
+            .reclaim_one(&in_progress_path, &job_name, STALE_AFTER)
             .await
             .unwrap();
 
@@ -1333,7 +1300,7 @@ mod tests {
             "the claim is put back under the name its worker holds"
         );
         assert!(
-            heartbeat_of(&in_progress_path).exists(),
+            heartbeat_path_for(&in_progress_path).exists(),
             "and its heartbeat is left alone, or the next sweep takes it"
         );
         assert!(
@@ -1357,14 +1324,7 @@ mod tests {
         let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
         queue.init().await.unwrap();
 
-        let job = Job::new(
-            PathBuf::from("show.mkv"),
-            MediaFileType::Mkv,
-            Operation::Reencode { channels: None },
-            QualitySettings::default(),
-            PostProcessingSettings::default(),
-            temp_dir.path(),
-        );
+        let job = mkv_reencode("show.mkv", temp_dir.path());
         queue.enqueue_job(&job).await.unwrap();
         let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
         let job_name = claimed.job_name().to_string();
@@ -1407,14 +1367,7 @@ mod tests {
         let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
         queue.init().await.unwrap();
 
-        let job = Job::new(
-            PathBuf::from("show.mkv"),
-            MediaFileType::Mkv,
-            Operation::Reencode { channels: None },
-            QualitySettings::default(),
-            PostProcessingSettings::default(),
-            temp_dir.path(),
-        );
+        let job = mkv_reencode("show.mkv", temp_dir.path());
         queue.enqueue_job(&job).await.unwrap();
         let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
         let job_name = claimed.job_name().to_string();
@@ -1437,7 +1390,7 @@ mod tests {
         );
         assert!(queued_path.exists(), "the sweep's copy is the only one");
         assert!(
-            heartbeat_of(&in_progress_path).exists(),
+            heartbeat_path_for(&in_progress_path).exists(),
             "the heartbeat belongs to whoever claims the job next, not to this worker"
         );
     }
@@ -1467,14 +1420,7 @@ mod tests {
         // here rather than claimed, because nothing can be claimed on a share
         // that is not there - which is the point.
         let held_on_a_share_that_is_down = || {
-            let job = Job::new(
-                PathBuf::from("show.mkv"),
-                MediaFileType::Mkv,
-                Operation::Reencode { channels: None },
-                QualitySettings::default(),
-                PostProcessingSettings::default(),
-                temp_dir.path(),
-            );
+            let job = mkv_reencode("show.mkv", temp_dir.path());
             let job_name = job.job_filename();
             ClaimedJob {
                 queue: &queue,
@@ -1512,13 +1458,10 @@ mod tests {
         let in_progress_path = queue.in_progress_dir.join(&job_name);
         let taken_path = taken_path_for(&in_progress_path);
         std::fs::rename(&in_progress_path, &taken_path).unwrap();
-        std::fs::remove_file(heartbeat_of(&in_progress_path)).unwrap();
+        std::fs::remove_file(heartbeat_path_for(&in_progress_path)).unwrap();
         age(&[&taken_path], Duration::from_secs(600));
 
-        let swept = queue
-            .reclaim_stranded_jobs(Duration::from_secs(300))
-            .await
-            .unwrap();
+        let swept = queue.reclaim_stranded_jobs(STALE_AFTER).await.unwrap();
 
         assert_eq!(swept.recovered, vec![job_name.clone()]);
         assert_eq!(swept.reclaimed, vec![job_name.clone()]);
@@ -1539,14 +1482,7 @@ mod tests {
     #[test]
     async fn a_job_held_mid_move_still_counts_as_queued() {
         let temp_dir = TempDir::new().unwrap();
-        let job = Job::new(
-            PathBuf::from("show.mkv"),
-            MediaFileType::Mkv,
-            Operation::Reencode { channels: None },
-            QualitySettings::default(),
-            PostProcessingSettings::default(),
-            temp_dir.path(),
-        );
+        let job = mkv_reencode("show.mkv", temp_dir.path());
         let (queue, job_name) = queue_with_one_claimed_job_for(&temp_dir, &job).await;
 
         let in_progress_path = queue.in_progress_dir.join(&job_name);
@@ -1576,16 +1512,13 @@ mod tests {
 
         let in_progress_path = queue.in_progress_dir.join(&job_name);
         age(
-            &[&in_progress_path, &heartbeat_of(&in_progress_path)],
+            &[&in_progress_path, &heartbeat_path_for(&in_progress_path)],
             Duration::from_secs(600),
         );
 
         let taken_path = take_for_move(&in_progress_path).await.unwrap().unwrap();
 
-        let swept = queue
-            .reclaim_stranded_jobs(Duration::from_secs(300))
-            .await
-            .unwrap();
+        let swept = queue.reclaim_stranded_jobs(STALE_AFTER).await.unwrap();
 
         assert!(
             swept.is_empty(),
@@ -1612,13 +1545,10 @@ mod tests {
         let (queue, job_name) = queue_with_one_claimed_job(&temp_dir).await;
 
         let in_progress_path = queue.in_progress_dir.join(&job_name);
-        std::fs::remove_file(heartbeat_of(&in_progress_path)).unwrap();
+        std::fs::remove_file(heartbeat_path_for(&in_progress_path)).unwrap();
         age(&[&in_progress_path], Duration::from_secs(600));
 
-        let swept = queue
-            .reclaim_stranded_jobs(Duration::from_secs(300))
-            .await
-            .unwrap();
+        let swept = queue.reclaim_stranded_jobs(STALE_AFTER).await.unwrap();
 
         assert_eq!(swept.reclaimed, vec![job_name.clone()]);
         assert!(
@@ -1632,10 +1562,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let (queue, job_name) = queue_with_one_claimed_job(&temp_dir).await;
 
-        let swept = queue
-            .reclaim_stranded_jobs(Duration::from_secs(300))
-            .await
-            .unwrap();
+        let swept = queue.reclaim_stranded_jobs(STALE_AFTER).await.unwrap();
 
         assert!(swept.is_empty());
         assert!(
@@ -1650,14 +1577,7 @@ mod tests {
         let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
         queue.init().await.unwrap();
 
-        let job = Job::new(
-            PathBuf::from("waited.mkv"),
-            MediaFileType::Mkv,
-            Operation::Reencode { channels: None },
-            QualitySettings::default(),
-            PostProcessingSettings::default(),
-            temp_dir.path(),
-        );
+        let job = mkv_reencode("waited.mkv", temp_dir.path());
         queue.enqueue_job(&job).await.unwrap();
 
         // The job sat in the queue behind a backlog for an hour. Claiming is a
@@ -1670,10 +1590,7 @@ mod tests {
 
         let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
 
-        let swept = queue
-            .reclaim_stranded_jobs(Duration::from_secs(300))
-            .await
-            .unwrap();
+        let swept = queue.reclaim_stranded_jobs(STALE_AFTER).await.unwrap();
 
         assert!(
             swept.is_empty(),
@@ -1688,14 +1605,7 @@ mod tests {
         let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
         queue.init().await.unwrap();
 
-        let job = Job::new(
-            PathBuf::from("long-film.mkv"),
-            MediaFileType::Mkv,
-            Operation::Reencode { channels: None },
-            QualitySettings::default(),
-            PostProcessingSettings::default(),
-            temp_dir.path(),
-        );
+        let job = mkv_reencode("long-film.mkv", temp_dir.path());
         queue.enqueue_job(&job).await.unwrap();
 
         let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
@@ -1706,10 +1616,7 @@ mod tests {
         // file itself is stale and only the heartbeat says the worker is alive.
         age(&[&in_progress_path], Duration::from_secs(6000));
 
-        let swept = queue
-            .reclaim_stranded_jobs(Duration::from_secs(300))
-            .await
-            .unwrap();
+        let swept = queue.reclaim_stranded_jobs(STALE_AFTER).await.unwrap();
 
         assert!(
             swept.is_empty(),
@@ -1723,16 +1630,13 @@ mod tests {
         // Once the worker stops checking in, the job comes back.
         drop(claimed);
         age(
-            &[&in_progress_path, &heartbeat_of(&in_progress_path)],
+            &[&in_progress_path, &heartbeat_path_for(&in_progress_path)],
             Duration::from_secs(6000),
         );
-        let swept = queue
-            .reclaim_stranded_jobs(Duration::from_secs(300))
-            .await
-            .unwrap();
+        let swept = queue.reclaim_stranded_jobs(STALE_AFTER).await.unwrap();
         assert_eq!(swept.reclaimed, vec![job_name.clone()]);
         assert!(
-            !heartbeat_of(&in_progress_path).exists(),
+            !heartbeat_path_for(&in_progress_path).exists(),
             "the stale heartbeat is cleared away with the job"
         );
     }
@@ -1748,14 +1652,11 @@ mod tests {
         for attempt in 1..MAX_ATTEMPTS {
             let in_progress_path = queue.in_progress_dir.join(&job_name);
             age(
-                &[&in_progress_path, &heartbeat_of(&in_progress_path)],
+                &[&in_progress_path, &heartbeat_path_for(&in_progress_path)],
                 Duration::from_secs(600),
             );
 
-            let swept = queue
-                .reclaim_stranded_jobs(Duration::from_secs(300))
-                .await
-                .unwrap();
+            let swept = queue.reclaim_stranded_jobs(STALE_AFTER).await.unwrap();
             assert_eq!(swept.reclaimed, vec![job_name.clone()]);
 
             let requeued: Job = serde_json::from_str(
@@ -1769,13 +1670,10 @@ mod tests {
 
         let in_progress_path = queue.in_progress_dir.join(&job_name);
         age(
-            &[&in_progress_path, &heartbeat_of(&in_progress_path)],
+            &[&in_progress_path, &heartbeat_path_for(&in_progress_path)],
             Duration::from_secs(600),
         );
-        let swept = queue
-            .reclaim_stranded_jobs(Duration::from_secs(300))
-            .await
-            .unwrap();
+        let swept = queue.reclaim_stranded_jobs(STALE_AFTER).await.unwrap();
 
         assert!(swept.reclaimed.is_empty());
         assert_eq!(swept.parked, vec![job_name.clone()]);
@@ -1844,10 +1742,7 @@ mod tests {
             .join("00000000-dead-beef.job.heartbeat");
         std::fs::write(&orphan, b"").unwrap();
 
-        queue
-            .reclaim_stranded_jobs(Duration::from_secs(300))
-            .await
-            .unwrap();
+        queue.reclaim_stranded_jobs(STALE_AFTER).await.unwrap();
 
         assert!(
             !orphan.exists(),
@@ -1860,12 +1755,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let (queue, job_name) = queue_with_one_claimed_job(&temp_dir).await;
 
-        queue
-            .reclaim_stranded_jobs(Duration::from_secs(300))
-            .await
-            .unwrap();
+        queue.reclaim_stranded_jobs(STALE_AFTER).await.unwrap();
 
-        let heartbeat = heartbeat_of(&queue.in_progress_dir.join(&job_name));
+        let heartbeat = heartbeat_path_for(&queue.in_progress_dir.join(&job_name));
         assert!(
             heartbeat.exists(),
             "collecting orphans must not take a live worker's heartbeat"
@@ -1878,14 +1770,7 @@ mod tests {
         let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
         queue.init().await.unwrap();
 
-        let job = Job::new(
-            PathBuf::from("corrupt.mkv"),
-            MediaFileType::Mkv,
-            Operation::Reencode { channels: None },
-            QualitySettings::default(),
-            PostProcessingSettings::default(),
-            temp_dir.path(),
-        );
+        let job = mkv_reencode("corrupt.mkv", temp_dir.path());
         queue.enqueue_job(&job).await.unwrap();
         let job_name = job.job_filename();
 
@@ -2023,14 +1908,11 @@ mod tests {
         // every startup and never resolved.
         std::fs::write(&in_progress_path, b"{\"id\": \"half a job").unwrap();
         age(
-            &[&in_progress_path, &heartbeat_of(&in_progress_path)],
+            &[&in_progress_path, &heartbeat_path_for(&in_progress_path)],
             Duration::from_secs(600),
         );
 
-        let swept = queue
-            .reclaim_stranded_jobs(Duration::from_secs(300))
-            .await
-            .unwrap();
+        let swept = queue.reclaim_stranded_jobs(STALE_AFTER).await.unwrap();
 
         assert_eq!(swept.unreadable, vec![job_name.clone()]);
         assert!(swept.reclaimed.is_empty() && swept.parked.is_empty());
@@ -2040,7 +1922,7 @@ mod tests {
             "{job_name} was moved to _failed"
         );
         assert!(
-            !heartbeat_of(&in_progress_path).exists(),
+            !heartbeat_path_for(&in_progress_path).exists(),
             "the heartbeat goes with the job it belonged to"
         );
 
@@ -2050,10 +1932,7 @@ mod tests {
         assert!(!note.is_empty());
 
         // And the next worker has nothing left to warn about.
-        let swept = queue
-            .reclaim_stranded_jobs(Duration::from_secs(300))
-            .await
-            .unwrap();
+        let swept = queue.reclaim_stranded_jobs(STALE_AFTER).await.unwrap();
         assert!(swept.is_empty());
     }
 
@@ -2082,19 +1961,12 @@ mod tests {
             temp_dir.path().to_path_buf(),
             unreachable_work_root(&temp_dir),
         );
-        let job = Job::new(
-            PathBuf::from("show.mkv"),
-            MediaFileType::Mkv,
-            Operation::Reencode { channels: None },
-            QualitySettings::default(),
-            PostProcessingSettings::default(),
-            temp_dir.path(),
-        );
+        let job = mkv_reencode("show.mkv", temp_dir.path());
 
         let exists = queue.job_exists(&job).await;
         assert!(exists.is_err(), "job_exists: {exists:?}");
 
-        let swept = queue.reclaim_stranded_jobs(Duration::from_secs(300)).await;
+        let swept = queue.reclaim_stranded_jobs(STALE_AFTER).await;
         assert!(swept.is_err(), "reclaim_stranded_jobs: {swept:?}");
 
         let cleaned = queue.clean(&QueueDirectory::ALL).await;
@@ -2110,14 +1982,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
         queue.init().await.unwrap();
-        let job = Job::new(
-            PathBuf::from("show.mkv"),
-            MediaFileType::Mkv,
-            Operation::Reencode { channels: None },
-            QualitySettings::default(),
-            PostProcessingSettings::default(),
-            temp_dir.path(),
-        );
+        let job = mkv_reencode("show.mkv", temp_dir.path());
         queue.enqueue_job(&job).await.unwrap();
         std::fs::create_dir(queue.in_progress_dir.join(job.job_filename())).unwrap();
 
@@ -2136,14 +2001,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
         queue.init().await.unwrap();
-        let job = Job::new(
-            PathBuf::from("show.mkv"),
-            MediaFileType::Mkv,
-            Operation::Reencode { channels: None },
-            QualitySettings::default(),
-            PostProcessingSettings::default(),
-            temp_dir.path(),
-        );
+        let job = mkv_reencode("show.mkv", temp_dir.path());
         queue.enqueue_job(&job).await.unwrap();
         let claimed = queue.claim_job(JobPriority::None).await.unwrap().unwrap();
         let in_progress_path = queue.in_progress_dir.join(claimed.job_name());
@@ -2207,14 +2065,11 @@ mod tests {
         // the job back as it was and abandons it again.
         for _ in 0..40 {
             age(
-                &[&in_progress_path, &heartbeat_of(&in_progress_path)],
+                &[&in_progress_path, &heartbeat_path_for(&in_progress_path)],
                 Duration::from_secs(600),
             );
 
-            let swept = queue
-                .reclaim_stranded_jobs(Duration::from_secs(300))
-                .await
-                .unwrap();
+            let swept = queue.reclaim_stranded_jobs(STALE_AFTER).await.unwrap();
 
             assert_eq!(
                 swept.reclaimed,
@@ -2437,12 +2292,8 @@ mod tests {
 
         for (series, file) in files {
             queue
-                .enqueue_job(&Job::new(
+                .enqueue_job(&mkv_reencode(
                     episode_path("Series", series, "Season 01", file),
-                    MediaFileType::Mkv,
-                    Operation::Reencode { channels: None },
-                    QualitySettings::default(),
-                    PostProcessingSettings::default(),
                     media_root,
                 ))
                 .await
@@ -2553,14 +2404,7 @@ mod tests {
         let queue = JobQueue::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
         queue.init().await.unwrap();
 
-        let job = Job::new(
-            PathBuf::from("show.mkv"),
-            MediaFileType::Mkv,
-            Operation::Reencode { channels: None },
-            QualitySettings::default(),
-            PostProcessingSettings::default(),
-            temp_dir.path(),
-        );
+        let job = mkv_reencode("show.mkv", temp_dir.path());
 
         assert!(!queue.job_exists(&job).await.unwrap());
 

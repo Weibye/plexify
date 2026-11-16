@@ -1,4 +1,4 @@
-//! Fixtures and FFprobe readings the tests of more than one module share.
+//! Fixtures and FFprobe readings the transcoding tests share.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -265,34 +265,6 @@ pub(super) fn subtitle_events(timings: &[(f64, f64)]) -> Vec<(i64, i64)> {
             )
         })
         .collect()
-}
-
-/// Whether a real FFmpeg is available to exercise the transcoding path.
-///
-/// The tests that call this are the only ones that prove what FFmpeg does
-/// with the arguments we build, so a developer without FFmpeg installed
-/// skips them rather than failing - but **CI must actually run them**. A
-/// skipped test and a passing one are indistinguishable in the log, so if
-/// these quietly stopped running nobody would find out until a library
-/// lost a track.
-pub(super) fn ffmpeg_present() -> bool {
-    let available = std::process::Command::new("ffmpeg")
-        .arg("-version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
-
-    if !available {
-        assert!(
-                std::env::var("CI").is_err(),
-                "FFmpeg must be installed in CI: these tests are the only check that every stream survives a transcode, and skipping them silently would leave that unverified"
-            );
-        eprintln!("skipping: ffmpeg is not on PATH");
-    }
-
-    available
 }
 
 /// Codec type and language of every stream in a file, via ffprobe.

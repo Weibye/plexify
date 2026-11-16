@@ -696,17 +696,9 @@ impl Default for PostProcessingSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{clear_encoding_env, group};
     use serial_test::serial;
     use std::path::PathBuf;
-
-    /// Clear the encoding environment variables so a test observes documented
-    /// defaults rather than whatever the developer's shell happens to export.
-    /// Only safe inside `#[serial(env)]` tests.
-    fn clear_encoding_env() {
-        std::env::remove_var("FFMPEG_PRESET");
-        std::env::remove_var("FFMPEG_CRF");
-        std::env::remove_var("FFMPEG_AUDIO_BITRATE");
-    }
 
     #[test]
     fn test_webm_job_creation() {
@@ -1518,11 +1510,6 @@ mod tests {
         );
 
         assert!(job.episode_sort_key(&media_root).is_none());
-    }
-
-    /// A group written the way a path reads, for an assertion to state.
-    fn group(directories: &str) -> Vec<String> {
-        directories.split('/').map(str::to_string).collect()
     }
 
     /// The sort key for a library-relative path, as a scan would queue it.

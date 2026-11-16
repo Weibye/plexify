@@ -82,18 +82,9 @@ impl AddCommand {
 mod tests {
     use super::*;
     use crate::job::QualityPreset;
+    use crate::test_support::queued_jobs;
     use std::fs;
     use tempfile::TempDir;
-
-    /// Every job `add` left in the queue under `work_root`.
-    fn queued_jobs(work_root: &std::path::Path) -> Vec<crate::job::Job> {
-        fs::read_dir(work_root.join("_queue"))
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .filter(|path| path.extension() == Some("job".as_ref()))
-            .map(|path| serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap())
-            .collect()
-    }
 
     #[tokio::test]
     async fn test_add_webm_file_with_subtitle() {

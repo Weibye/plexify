@@ -152,6 +152,7 @@ mod tests {
     use crate::ffmpeg::test_support::*;
     use crate::ffmpeg::{FFmpegProcessor, SubtitleSelection};
     use crate::job::{MediaFileType, PostProcessingSettings, QualitySettings, SubtitleAction};
+    use crate::test_support::ffmpeg_present;
     use std::path::Path;
     use std::process::Stdio;
     use tempfile::TempDir;

@@ -421,6 +421,7 @@ fn convert_gitignore_to_glob(pattern: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::logs_of;
     use std::fs;
     use tempfile::TempDir;
 
@@ -731,33 +732,6 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "icacls {args:?} failed on {dir:?}");
-    }
-
-    /// Run `f` and return what it logged, as `main`'s subscriber would print it.
-    fn logs_of<T>(f: impl FnOnce() -> T) -> (T, String) {
-        use std::sync::{Arc, Mutex};
-
-        #[derive(Clone, Default)]
-        struct Sink(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Sink {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let sink = Sink::default();
-        let writer = sink.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .finish();
-        let result = tracing::subscriber::with_default(subscriber, f);
-        let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
-        (result, logs)
     }
 
     #[test]
