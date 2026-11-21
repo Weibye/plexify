@@ -341,7 +341,8 @@ mod tests {
     }
 
     /// VP9 and yuvj420p on the Chromecast, and FLAC on the LG, are unverified.
-    /// If any of them ever reads as observed, someone has promoted a spec sheet.
+    /// If any of them ever reads as observed, someone has promoted a spec sheet
+    /// or a reading D35 does not accept.
     #[test]
     fn what_is_unverified_says_so() {
         let chromecast = PlaybackTarget::builtin("chromecast-gen2-3")
@@ -349,7 +350,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             chromecast.video.codecs.verdict("vp9"),
-            (true, Provenance::Assumed)
+            (false, Provenance::Assumed)
         );
         assert_eq!(
             chromecast.video.pixel_formats.verdict("yuvj420p"),

@@ -909,10 +909,11 @@ mod tests {
         assert_eq!(verdict.reasons()[0].source, Provenance::Assumed);
     }
 
-    /// A codec nobody has watched play is not a conformance the tool should
-    /// state flatly.
+    /// The Pi transcoded a 1080p VP9 WebM for the Chromecast and could not
+    /// keep up, so VP9 costs a re-encode. `targets/chromecast-gen2-3.toml` has
+    /// the evidence, and why it is not yet `observed`.
     #[test]
-    fn vp9_passes_the_chromecast_only_on_an_assumption() {
+    fn vp9_costs_a_reencode_on_the_chromecast() {
         let mut probe = plexify_output();
         probe.video = Some(VideoStream {
             codec: Some("vp9".to_string()),
@@ -922,11 +923,14 @@ mod tests {
 
         let verdict = evaluate(&probe, &chromecast());
 
-        assert!(verdict.direct_plays(), "{:?}", claims(&verdict));
-        assert!(verdict
-            .unverified()
-            .iter()
-            .any(|f| f.field == Field::VideoCodec && f.value == "vp9"));
+        assert_eq!(
+            verdict.cost(),
+            Some(Cost::Reencode),
+            "{:?}",
+            claims(&verdict)
+        );
+        assert_eq!(verdict.reasons()[0].field, Field::VideoCodec);
+        assert_eq!(verdict.reasons()[0].source, Provenance::Assumed);
     }
 
     /// Profile and level are not reported for a codec the client cannot decode
