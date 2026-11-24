@@ -67,6 +67,7 @@ Break one of these only through a new decision.
 - **Transcoding:** `scan`/`add` → `work` → `clean`, `status`. Code is in `queue/`, `job/`
   and `ffmpeg/`.
 - **Naming:** `validate [--fix]`, `undo`. Code is in `naming/`, `fix.rs` and `undo.rs`.
+- **Completeness:** `episodes`. Code is in `commands/episodes.rs`.
 - **Conformance:** `audit`. `probe/` reports what a file contains; `target/` and
   `targets/*.toml` say what each client accepts.
 

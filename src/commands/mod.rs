@@ -1,6 +1,7 @@
 pub mod add;
 pub mod audit;
 pub mod clean;
+pub mod episodes;
 pub mod job_processor;
 pub mod scan;
 pub mod status;

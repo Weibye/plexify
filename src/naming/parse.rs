@@ -228,7 +228,7 @@ fn split_extension(filename: &str) -> Result<(&str, &str), Unresolvable> {
 /// a destination this function then refuses - a file moved once and reported the
 /// next run. Refusing it at the source instead means `render` can emit nothing
 /// `parse` will not take back.
-fn download_marker(filename: &str) -> Option<String> {
+pub(super) fn download_marker(filename: &str) -> Option<String> {
     let (stem, extension) = filename.rsplit_once('.')?;
 
     if extension == "part" || extension == "ytdl" || is_fragment_index(extension) {

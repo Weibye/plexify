@@ -11,6 +11,7 @@ rather than guessing, and never changes the library without being asked to.
 plexify validate /media                       # what is not named the way Plex reads it
 plexify validate /media --fix                 # carry out the renames it proposed
 plexify undo plexify-fix-1787309398.json      # say what reversing a fix would do; --apply does it
+plexify episodes /media                       # missing episodes, and files that will not play whole
 plexify audit /media --target lg-cx-webos     # what each file needs to Direct Play there
 plexify scan /media --target lg-cx-webos      # queue that work
 plexify add /media/Movies/Film/Film.mkv       # queue one file, by its extension
@@ -21,8 +22,8 @@ plexify clean                                 # empty the queue, after asking
 
 ## Requirements
 
-- **FFmpeg and FFprobe** on `PATH`. `audit` and `scan --target` need FFprobe; `work` needs
-  both. `apt install ffmpeg`, `brew install ffmpeg` or `winget install ffmpeg`.
+- **FFmpeg and FFprobe** on `PATH`. `episodes`, `audit` and `scan --target` need FFprobe;
+  `work` needs both. `apt install ffmpeg`, `brew install ffmpeg` or `winget install ffmpeg`.
 - **Rust 1.85** or newer to build it (`rust-version` in `Cargo.toml`). The test suite needs
   1.93.1, because `serial_test` does.
 
@@ -43,13 +44,13 @@ scp plexify pi@your-pi:/home/pi/plexify
 ssh pi@your-pi 'chmod +x /home/pi/plexify && /home/pi/plexify audit /path/to/media --target lg-cx-webos'
 ```
 
-`audit` only reads. `validate --fix`, `undo --apply` and `work` change a library, so point
-them at a copy before one that matters.
+`episodes` and `audit` only read. `validate --fix`, `undo --apply` and `work` change a library,
+so point them at a copy before one that matters.
 
 ## Output and logs
 
 Logs go to stderr. Stdout carries only what a command means to print: the reports of
-`validate`, `audit`, `status` and `undo`. A report can be piped or saved on its own, and
+`validate`, `episodes`, `audit`, `status` and `undo`. A report can be piped or saved on its own, and
 turning up the log level does not corrupt it.
 
 ```bash
@@ -93,6 +94,20 @@ Each run writes `plexify-fix-<timestamp>.json` in the current directory before t
 rename, and rewrites it with what happened. `undo` reverses only what that record says was
 applied, and refuses a file that has moved, whose original path is taken, or whose size has
 changed. It writes its own record, so an undo can be undone.
+
+## Missing episodes
+
+`episodes` lists every show and season, with what is missing between a season's first and
+last file, any episode Plex lists more than one file for, and any file with no picture, no
+sound or no duration, or a downloader's marker such as `.f247` or `.temp`. It changes nothing.
+
+```bash
+plexify episodes "/media/Series/Critical Role (2015)"
+```
+
+It reads only the files, so it cannot see episodes before a season's first file or after its
+last, and every season says so. Why is in
+[D37](docs/decisions.md#37-completeness-is-judged-from-the-files-alone).
 
 ## Direct Play
 

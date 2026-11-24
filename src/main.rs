@@ -6,9 +6,9 @@ use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use plexify::commands::{
-    add::AddCommand, audit::AuditCommand, clean::CleanCommand, job_processor::JobProcessorConfig,
-    scan::ScanCommand, status::StatusCommand, undo::UndoCommand, validate::ValidateCommand,
-    work::WorkCommand,
+    add::AddCommand, audit::AuditCommand, clean::CleanCommand, episodes::EpisodesCommand,
+    job_processor::JobProcessorConfig, scan::ScanCommand, status::StatusCommand, undo::UndoCommand,
+    validate::ValidateCommand, work::WorkCommand,
 };
 use plexify::job::QualityPreset;
 use plexify::paths::to_forward_slashes;
@@ -115,6 +115,12 @@ enum Commands {
         /// reader would be a claim about their living room.
         #[arg(long, short = 't')]
         target: String,
+    },
+    /// Report each season's missing episodes, and the files that will not
+    /// play whole. Episodes after a season's last file cannot be seen.
+    Episodes {
+        /// Path to the media directory to check
+        path: PathBuf,
     },
     /// Report what in the library is not in canonical form
     Validate {
@@ -280,6 +286,15 @@ async fn run(command: Commands) -> Result<()> {
             let audit = AuditCommand::new(path, &target)?;
             let report = audit.execute().await?;
             audit.print_report(&report);
+            Ok(())
+        }
+        Commands::Episodes { path } => {
+            info!(
+                "Starting episodes check for path: {}",
+                to_forward_slashes(&path)
+            );
+            let report = EpisodesCommand::new(path).execute().await?;
+            print!("{}", plexify::commands::episodes::render(&report));
             Ok(())
         }
         Commands::Validate {

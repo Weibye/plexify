@@ -585,3 +585,35 @@ Recorded 2026-11-13.
 Play had to remember to exclude `NoPicture` by name.
 
 **Consequences.** Guarded by `a_file_with_no_picture_is_named_rather_than_counted_as_direct_play`.
+
+## 37. Completeness is judged from the files alone
+
+Recorded 2026-11-24.
+
+**Decision.** `episodes` reports per show and season, and reads nothing but the library:
+- An episode is missing when Plex lists no file for it **between the season's first and last
+  file**. Nothing is claimed before the first or after the last, and every season says so.
+- Whole missing seasons are not reported.
+- A download fragment (`naming::download_marker`) is placed under the episode it names. Any
+  other name `parse` refuses is counted and left to `validate`.
+- Every file Plex lists is probed. No picture, no sound, no duration and an unreadable file are
+  each named.
+
+**Why.** A season's real length lives in TVDB or the source playlist, and asking either is a
+new dependency and a network call. Measured on the Pi library's 2,724 episode names:
+- Counting from E01 would report dozens of false gaps in 16 of 136 seasons, because One Piece
+  and Shingeki no Kyojin number across seasons.
+- Critical Role is split across two drives, so a run on one would call whole seasons missing.
+- Read through `sort_key`, the half episode `S01E13.5` would be a second E13.
+
+The FFX show looked complete to E44 when its playlist ran on, so the unseen tail has to be said
+on every season, not only on one with gaps.
+
+**Consequences.**
+- A season missing its first or last episodes reports clean except for that line.
+- A `.part` or `.ytdl` is named but not probed and does not hold its episode, because Plex does
+  not list it.
+- Guarded by `a_season_numbered_from_where_the_last_ended_is_not_missing_its_start`,
+  `every_season_says_what_its_files_cannot_show`,
+  `a_half_episode_is_not_a_second_copy_of_the_whole_one` and
+  `the_ffx_show_is_reported_as_it_was_found`.
