@@ -594,6 +594,15 @@ pub fn sort_key(relative_path: &Path) -> Option<EpisodeSortKey> {
     parse::sort_key(&to_forward_slashes(relative_path))
 }
 
+/// The marker a downloader leaves on a file it has not finished writing -
+/// `.f247`, `.temp`, `.part` - if `filename` carries one.
+///
+/// This is the rule [`parse`] refuses a name by, offered on its own for a caller
+/// that has only a filename, or a file that is not a media container at all.
+pub fn download_marker(filename: &str) -> Option<String> {
+    parse::download_marker(filename)
+}
+
 /// What should happen to a path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Assessment {

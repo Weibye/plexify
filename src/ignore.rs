@@ -194,8 +194,15 @@ impl IgnoreFilter {
     /// rather than walked and discarded. A part of the tree that cannot be read
     /// is a warning naming it, and the walk goes on without it.
     pub fn media_files(&self, scan_path: &Path) -> MediaFiles<'_> {
+        self.files_where(scan_path, is_media_file)
+    }
+
+    /// Walk `scan_path` as [`Self::media_files`] does, keeping the files `keep`
+    /// accepts instead of the media files.
+    pub fn files_where(&self, scan_path: &Path, keep: fn(&Path) -> bool) -> MediaFiles<'_> {
         MediaFiles {
             filter: self,
+            keep,
             walk: WalkDir::new(scan_path).follow_links(false).into_iter(),
             directories: 0,
             files: 0,
@@ -270,11 +277,12 @@ impl IgnoreFilter {
     }
 }
 
-/// The media files of one walk, and a count of what else it passed.
+/// The files one walk keeps, and a count of what else it passed.
 ///
 /// The counts are complete once the iterator is exhausted.
 pub struct MediaFiles<'a> {
     filter: &'a IgnoreFilter,
+    keep: fn(&Path) -> bool,
     walk: walkdir::IntoIter,
     /// Directories walked beneath the starting one.
     pub directories: usize,
@@ -327,7 +335,7 @@ impl Iterator for MediaFiles<'_> {
             }
 
             self.files += 1;
-            if is_media_file(path) {
+            if (self.keep)(path) {
                 return Some(entry.into_path());
             }
         }
@@ -355,7 +363,7 @@ pub fn is_media_extension(extension: &str) -> bool {
         .any(|known| extension.eq_ignore_ascii_case(known))
 }
 
-fn is_media_file(path: &Path) -> bool {
+pub fn is_media_file(path: &Path) -> bool {
     path.extension()
         .is_some_and(|extension| is_media_extension(&extension.to_string_lossy()))
 }
